@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package>
+  <name>rtt_opcua</name>
+  <version>0.1.0</version>
+  <description>Native OPC UA remote-object transport for Orocos RTT.</description>
+  <maintainer email="liufang-robot@users.noreply.github.com">liufang-robot</maintainer>
+  <license>LGPL-2.1-or-later</license>
+
+  <buildtool_depend>cmake</buildtool_depend>
+  <build_depend>rtt</build_depend>
+  <build_depend>open62541</build_depend>
+  <build_depend>open62541pp</build_depend>
+  <run_depend>rtt</run_depend>
+  <run_depend>open62541</run_depend>
+  <run_depend>open62541pp</run_depend>
+
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>

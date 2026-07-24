@@ -1,0 +1,11 @@
+<package>
+  <description brief="Native OPC UA transport for Orocos RTT">
+    Publishes and consumes the generic RTT object model over OPC UA.
+  </description>
+  <author>liufang-robot</author>
+  <license>LGPL-2.1-or-later</license>
+  <url>https://github.com/liufang-robot/rtt_opcua</url>
+  <depend package="rtt" />
+  <depend package="open62541" />
+  <depend package="open62541pp" />
+</package>
