@@ -22,6 +22,7 @@ orocos_library(
   src/node_id.cpp
   src/object_model.cpp
   src/operation_dispatcher.cpp
+  src/port_bridge.cpp
   src/server.cpp
   src/server_options.cpp
   src/type_descriptor.cpp

@@ -23,6 +23,7 @@ struct ComponentState;
 struct ObjectModelOptions {
   std::chrono::milliseconds reconcile_interval{std::chrono::milliseconds(100)};
   std::chrono::milliseconds operation_timeout{std::chrono::seconds(5)};
+  std::size_t port_buffer_size{64U};
 };
 
 class ComponentRegistration final {

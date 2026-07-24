@@ -2,6 +2,7 @@
 
 #include "component_state.hpp"
 #include "operation_dispatcher.hpp"
+#include "port_bridge.hpp"
 
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/type_protocol.hpp>
@@ -24,6 +25,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -464,6 +466,109 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
   return spec;
 }
 
+enum class PortMethodKind { read, write };
+
+NodeSpec portMethodSpec(const std::string &port_path,
+                        RTT::base::PortInterface &port,
+                        const std::shared_ptr<ComponentState> &state,
+                        std::size_t buffer_size, PortMethodKind method_kind) {
+  const bool reads = method_kind == PortMethodKind::read;
+  const std::string method_name = reads ? "read" : "write";
+  NodeSpec spec;
+  spec.kind = NodeKind::method;
+  spec.parent_path = port_path;
+  spec.path = appendNodeSegment(port_path, method_name);
+  spec.browse_name = method_name;
+  spec.fingerprint = "port-method|" + pointerFingerprint(&port) + "|" +
+                     method_name + "|" + std::to_string(buffer_size);
+  const auto bridge_slot = std::make_shared<std::shared_ptr<PortBridge>>();
+  spec.create = [path = spec.path, parent = spec.parent_path, method_name,
+                 port = &port,
+                 weak_state = std::weak_ptr<ComponentState>(state), buffer_size,
+                 reads, bridge_slot](::opcua::Server &server,
+                                     std::uint16_t namespace_index,
+                                     std::string *error) {
+    const auto current_state = weak_state.lock();
+    ComponentLease lease(current_state);
+    if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
+      assignError(error,
+                  "RTT port became unavailable while creating OPC UA method");
+      return false;
+    }
+    const TypeProtocol *protocol = protocolForTypeInfo(port->getTypeInfo());
+    if (protocol == nullptr || !protocol->hasValue()) {
+      assignError(error, "RTT port type has no OPC UA protocol");
+      return false;
+    }
+
+    std::string bridge_error;
+    const auto bridge = PortBridge::create(*port, buffer_size, &bridge_error);
+    if (!bridge) {
+      assignError(error, std::move(bridge_error));
+      return false;
+    }
+
+    std::vector<::opcua::Argument> inputs;
+    std::vector<::opcua::Argument> outputs;
+    const ::opcua::Argument status_argument(
+        "status", ::opcua::LocalizedText("en-US", "RTT port flow status."),
+        ::opcua::DataTypeId::String, ::opcua::ValueRank::Scalar);
+    const ::opcua::Argument value_argument(
+        "value", ::opcua::LocalizedText("en-US", "RTT port sample."),
+        protocol->dataTypeNodeId(), protocol->valueRank());
+    if (reads) {
+      outputs.push_back(status_argument);
+      outputs.push_back(value_argument);
+    } else {
+      inputs.push_back(value_argument);
+      outputs.push_back(status_argument);
+    }
+
+    ::opcua::MethodAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", method_name));
+    attributes.setDescription(::opcua::LocalizedText(
+        "en-US", reads ? "Read the next RTT output-port sample."
+                       : "Write a sample to the RTT input port."));
+    attributes.setExecutable(true);
+    attributes.setUserExecutable(true);
+
+    ::opcua::services::MethodCallback callback =
+        std::function<::opcua::StatusCode(
+            ::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
+            ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
+            const ::opcua::NodeId &)>(
+            [weak_bridge = std::weak_ptr<PortBridge>(bridge), weak_state,
+             reads](::opcua::Session &,
+                    ::opcua::Span<const ::opcua::Variant> method_inputs,
+                    ::opcua::Span<::opcua::Variant> method_outputs,
+                    const ::opcua::NodeId &, const ::opcua::NodeId &) {
+              ComponentLease callback_lease(weak_state.lock());
+              const auto current_bridge = weak_bridge.lock();
+              if (!callback_lease || !current_bridge) {
+                return ::opcua::StatusCode(UA_STATUSCODE_BADNOTCONNECTED);
+              }
+              return reads
+                         ? current_bridge->read(method_outputs)
+                         : current_bridge->write(method_inputs, method_outputs);
+            });
+
+    const auto result = ::opcua::services::addMethod(
+        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
+        method_name, std::move(callback), inputs, outputs, attributes,
+        ::opcua::ReferenceTypeId::HasComponent);
+    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
+      assignError(error, "failed to create RTT port method node '" + path +
+                             "': " + statusName(result.code()));
+      return false;
+    }
+    if (result) {
+      *bridge_slot = bridge;
+    }
+    return true;
+  };
+  return spec;
+}
+
 void insertNode(NodeMap &nodes, NodeSpec spec) {
   nodes.insert_or_assign(spec.path, std::move(spec));
 }
@@ -544,7 +649,9 @@ void appendConfigurationNodes(NodeMap &nodes,
 }
 
 void appendPortNodes(NodeMap &nodes, const RTT::Service::shared_ptr &service,
-                     const std::string &owner_path) {
+                     const std::string &owner_path,
+                     const std::shared_ptr<ComponentState> &state,
+                     std::size_t buffer_size) {
   const std::string ports_path = appendNodeSegment(owner_path, "ports");
   for (const std::string &name : service->getPortNames()) {
     RTT::base::PortInterface *port = service->getPort(name);
@@ -574,6 +681,15 @@ void appendPortNodes(NodeMap &nodes, const RTT::Service::shared_ptr &service,
                           appendNodeSegment(port_path, "description"),
                           port_path, "description", "RTT port description.",
                           port->getDescription()));
+
+    if (dynamic_cast<RTT::base::InputPortInterface *>(port) != nullptr) {
+      insertNode(nodes, portMethodSpec(port_path, *port, state, buffer_size,
+                                       PortMethodKind::write));
+    } else if (dynamic_cast<RTT::base::OutputPortInterface *>(port) !=
+               nullptr) {
+      insertNode(nodes, portMethodSpec(port_path, *port, state, buffer_size,
+                                       PortMethodKind::read));
+    }
   }
 }
 
@@ -582,7 +698,8 @@ void appendServiceContents(
     const std::string &service_path,
     const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
-    std::set<const RTT::Service *> &ancestry, std::size_t depth) {
+    std::size_t port_buffer_size, std::set<const RTT::Service *> &ancestry,
+    std::size_t depth) {
   if (!service || depth > kMaximumServiceDepth ||
       ancestry.contains(service.get())) {
     return;
@@ -592,7 +709,7 @@ void appendServiceContents(
   appendResourceFolders(nodes, service_path, service->doc());
   appendConfigurationNodes(nodes, service, service_path, state);
   appendOperationNodes(nodes, service, service_path, state, dispatcher);
-  appendPortNodes(nodes, service, service_path);
+  appendPortNodes(nodes, service, service_path, state, port_buffer_size);
 
   const std::string services_path = appendNodeSegment(service_path, "services");
   for (const std::string &name : service->getProviderNames()) {
@@ -606,8 +723,8 @@ void appendServiceContents(
     const std::string child_path = appendNodeSegment(services_path, name);
     insertNode(nodes,
                objectSpec(child_path, services_path, name, child->doc()));
-    appendServiceContents(nodes, child, child_path, state, dispatcher, ancestry,
-                          depth + 1U);
+    appendServiceContents(nodes, child, child_path, state, dispatcher,
+                          port_buffer_size, ancestry, depth + 1U);
   }
 
   ancestry.erase(service.get());
@@ -616,7 +733,8 @@ void appendServiceContents(
 NodeMap
 snapshotComponent(const std::shared_ptr<ComponentState> &state,
                   RTT::TaskContext &component,
-                  const std::shared_ptr<OperationDispatcher> &dispatcher) {
+                  const std::shared_ptr<OperationDispatcher> &dispatcher,
+                  std::size_t port_buffer_size) {
   NodeMap nodes;
   const std::string components_path = appendNodeSegment("rtt", "components");
   const std::string component_path =
@@ -628,7 +746,7 @@ snapshotComponent(const std::shared_ptr<ComponentState> &state,
 
   std::set<const RTT::Service *> ancestry;
   appendServiceContents(nodes, component.provides(), component_path, state,
-                        dispatcher, ancestry, 0U);
+                        dispatcher, port_buffer_size, ancestry, 0U);
   return nodes;
 }
 
@@ -694,6 +812,12 @@ public:
     }
     if (options.operation_timeout <= std::chrono::milliseconds::zero()) {
       assignError(error, "object model operation timeout must be positive");
+      return {};
+    }
+    if (options.port_buffer_size == 0U ||
+        options.port_buffer_size >
+            static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      assignError(error, "object model port buffer size is out of range");
       return {};
     }
 
@@ -796,7 +920,8 @@ public:
               continue;
             }
             const NodeMap expected =
-                snapshotComponent(state, *lease.get(), self->dispatcher);
+                snapshotComponent(state, *lease.get(), self->dispatcher,
+                                  self->options.port_buffer_size);
             bool component_changed = false;
             if (!self->reconcileComponent(native, *namespace_index, state.get(),
                                           expected, &component_changed,

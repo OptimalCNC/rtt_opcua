@@ -188,6 +188,14 @@ BOOST_FIXTURE_TEST_CASE(
   const auto command_direction_id =
       modelNodeId(namespace_index,
                   {"components", "arm/left", "ports", "Command", "direction"});
+  const auto feedback_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Feedback"});
+  const auto feedback_read_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Feedback", "read"});
+  const auto command_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Command"});
+  const auto command_write_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Command", "write"});
   const auto service_id = modelNodeId(
       namespace_index, {"components", "arm/left", "services", "motion/raw"});
   const auto revision_id = modelNodeId(namespace_index, {"model", "revision"});
@@ -224,6 +232,48 @@ BOOST_FIXTURE_TEST_CASE(
                  .to<std::string>() == "input");
   BOOST_REQUIRE(::opcua::services::readBrowseName(client, service_id));
 
+  const auto empty_feedback_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(empty_feedback_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(empty_feedback_result.outputArguments().size(), 2U);
+  BOOST_TEST(empty_feedback_result.outputArguments()[0].to<std::string>() ==
+             "NoData");
+
+  BOOST_TEST(feedback.write(4.25) == RTT::WriteSuccess);
+  const auto feedback_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(feedback_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(feedback_result.outputArguments().size(), 2U);
+  BOOST_TEST(feedback_result.outputArguments()[0].to<std::string>() ==
+             "NewData");
+  BOOST_TEST(feedback_result.outputArguments()[1].to<double>() == 4.25);
+
+  const auto feedback_old_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(feedback_old_result.statusCode().isGood());
+  BOOST_TEST(feedback_old_result.outputArguments()[0].to<std::string>() ==
+             "OldData");
+  BOOST_TEST(feedback_old_result.outputArguments()[1].to<double>() == 4.25);
+
+  const std::vector<::opcua::Variant> wrong_command_inputs{
+      ::opcua::Variant(std::string("not-an-integer"))};
+  const auto wrong_command_result = ::opcua::services::call(
+      client, command_id, command_write_id, wrong_command_inputs);
+  BOOST_TEST(wrong_command_result.statusCode().isBad());
+  std::uint16_t commanded_value = 0U;
+  BOOST_TEST(command.read(commanded_value) == RTT::NoData);
+
+  const std::vector<::opcua::Variant> command_inputs{
+      ::opcua::Variant(std::uint16_t{73})};
+  const auto command_result = ::opcua::services::call(
+      client, command_id, command_write_id, command_inputs);
+  BOOST_REQUIRE(command_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(command_result.outputArguments().size(), 1U);
+  BOOST_TEST(command_result.outputArguments()[0].to<std::string>() ==
+             "WriteSuccess");
+  BOOST_TEST(command.read(commanded_value) == RTT::NewData);
+  BOOST_TEST(commanded_value == 73U);
+
   const std::uint64_t first_revision =
       ::opcua::services::readValue(client, revision_id)
           .value()
@@ -251,6 +301,8 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(!registration->active());
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(!::opcua::services::readBrowseName(client, component_id));
+  BOOST_TEST(!feedback.connected());
+  BOOST_TEST(!command.connected());
 
   client.disconnect();
   server.stop();
