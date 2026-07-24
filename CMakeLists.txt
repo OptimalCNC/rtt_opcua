@@ -20,11 +20,14 @@ set(OROCOS_NO_AUTO_LINKING TRUE)
 orocos_library(
   orocos-rtt-opcua
   src/node_id.cpp
+  src/client_session.cpp
   src/object_model.cpp
   src/operation_dispatcher.cpp
   src/port_bridge.cpp
+  src/remote_operation.cpp
   src/server.cpp
   src/server_options.cpp
+  src/task_context_proxy.cpp
   src/type_descriptor.cpp
   src/type_protocol.cpp
 )
@@ -128,6 +131,25 @@ if(BUILD_TESTING)
     endif()
   endif()
   add_test(NAME rtt_opcua_object_model_test COMMAND rtt_opcua_object_model_test)
+
+  add_executable(rtt_opcua_task_context_proxy_test tests/task_context_proxy_test.cpp)
+  target_link_libraries(
+    rtt_opcua_task_context_proxy_test
+    PRIVATE
+      orocos-rtt-opcua
+      ${OROCOS-RTT_TYPEKIT_LIBRARIES}
+  )
+  target_compile_features(rtt_opcua_task_context_proxy_test PRIVATE cxx_std_20)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(rtt_opcua_task_context_proxy_test PRIVATE -Wall -Wextra -Wpedantic)
+    if(RTT_OPCUA_WARNINGS_AS_ERRORS)
+      target_compile_options(rtt_opcua_task_context_proxy_test PRIVATE -Werror)
+    endif()
+  endif()
+  add_test(
+    NAME rtt_opcua_task_context_proxy_test
+    COMMAND rtt_opcua_task_context_proxy_test
+  )
 endif()
 
 orocos_generate_package(VERSION ${PROJECT_VERSION} DEPENDS open62541)
