@@ -36,6 +36,16 @@ struct RemoteCallResult {
   std::string error;
 };
 
+enum class RemoteValueCategory { properties, attributes };
+
+struct RemoteValueDescription {
+  std::string name;
+  std::string description;
+  std::string type_name;
+  ::opcua::NodeId node_id;
+  bool writable{false};
+};
+
 class ClientSession final {
 public:
   ClientSession(std::string endpoint_url,
@@ -48,6 +58,12 @@ public:
   bool connect(std::string *error);
   std::vector<RemoteOperationDescription>
   discoverOperations(const std::string &component_name, std::string *error);
+  std::vector<RemoteValueDescription>
+  discoverValues(const std::string &component_name,
+                 RemoteValueCategory category, std::string *error);
+  bool readValue(const ::opcua::NodeId &node_id, ::opcua::Variant *value);
+  bool writeValue(const ::opcua::NodeId &node_id,
+                  const ::opcua::Variant &value);
   RemoteCallResult call(const ::opcua::NodeId &object_id,
                         const ::opcua::NodeId &method_id,
                         const std::vector<::opcua::Variant> &inputs);

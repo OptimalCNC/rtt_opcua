@@ -1,10 +1,15 @@
 #include <rtt/opcua/task_context_proxy.hpp>
+#include <rtt/opcua/type_protocol.hpp>
 
 #include "client_session.hpp"
 #include "remote_operation.hpp"
 
 #include <rtt/OperationInterfacePart.hpp>
 #include <rtt/Service.hpp>
+#include <rtt/base/AttributeBase.hpp>
+#include <rtt/base/PropertyBase.hpp>
+#include <rtt/types/TypeInfo.hpp>
+#include <rtt/types/Types.hpp>
 
 #include <cstdint>
 #include <limits>
@@ -101,8 +106,22 @@ TaskContextProxy::create(std::string endpoint_url, std::string component_name,
 
 bool TaskContextProxy::synchronize(std::string *error) {
   std::string discovery_error;
-  std::vector<detail::RemoteOperationDescription> descriptions =
+  std::vector<detail::RemoteOperationDescription> operation_descriptions =
       impl_->session->discoverOperations(getName(), &discovery_error);
+  if (!discovery_error.empty()) {
+    assignError(error, discovery_error);
+    return false;
+  }
+  std::vector<detail::RemoteValueDescription> property_descriptions =
+      impl_->session->discoverValues(
+          getName(), detail::RemoteValueCategory::properties, &discovery_error);
+  if (!discovery_error.empty()) {
+    assignError(error, discovery_error);
+    return false;
+  }
+  std::vector<detail::RemoteValueDescription> attribute_descriptions =
+      impl_->session->discoverValues(
+          getName(), detail::RemoteValueCategory::attributes, &discovery_error);
   if (!discovery_error.empty()) {
     assignError(error, discovery_error);
     return false;
@@ -110,13 +129,85 @@ bool TaskContextProxy::synchronize(std::string *error) {
 
   using OperationOwner = std::unique_ptr<RTT::OperationInterfacePart>;
   std::vector<std::pair<std::string, OperationOwner>> operations;
-  operations.reserve(descriptions.size());
+  using PropertyOwner = std::unique_ptr<RTT::base::PropertyBase>;
+  std::vector<PropertyOwner> properties;
+  using AttributeOwner = std::unique_ptr<RTT::base::AttributeBase>;
+  std::vector<AttributeOwner> attributes;
+  operations.reserve(operation_descriptions.size());
+  properties.reserve(property_descriptions.size());
+  attributes.reserve(attribute_descriptions.size());
   try {
-    for (auto &description : descriptions) {
+    for (auto &description : operation_descriptions) {
       const std::string name = description.name;
       operations.emplace_back(name,
                               OperationOwner(detail::makeRemoteOperation(
                                   impl_->session, std::move(description))));
+    }
+
+    const auto make_data_source =
+        [session = impl_->session](
+            const detail::RemoteValueDescription &description) {
+          RTT::types::TypeInfo *type_info =
+              RTT::types::Types()->type(description.type_name);
+          const TypeProtocol *protocol = protocolForTypeInfo(type_info);
+          if (type_info == nullptr || protocol == nullptr ||
+              !protocol->hasValue()) {
+            throw std::runtime_error("remote value '" + description.name +
+                                     "' uses unsupported RTT type '" +
+                                     description.type_name + "'");
+          }
+
+          const ::opcua::NodeId node_id = description.node_id;
+          TypeProtocol::VariantReader reader =
+              [session, node_id](::opcua::Variant *value) {
+                return session->readValue(node_id, value);
+              };
+          TypeProtocol::VariantWriter writer;
+          if (description.writable) {
+            writer = [session, node_id](const ::opcua::Variant &value) {
+              return session->writeValue(node_id, value);
+            };
+          }
+          RTT::base::DataSourceBase::shared_ptr source =
+              protocol->makeProxyDataSource(std::move(reader),
+                                            std::move(writer));
+          if (!source) {
+            throw std::runtime_error(
+                "failed to build remote data source for '" + description.name +
+                "'");
+          }
+          return std::pair{type_info, std::move(source)};
+        };
+
+    for (const detail::RemoteValueDescription &description :
+         property_descriptions) {
+      if (!description.writable) {
+        throw std::runtime_error("remote property '" + description.name +
+                                 "' is not writable for the current OPC UA "
+                                 "user");
+      }
+      auto [type_info, source] = make_data_source(description);
+      PropertyOwner property(type_info->buildProperty(
+          description.name, description.description, source));
+      if (!property || property->getDataSource().get() != source.get()) {
+        throw std::runtime_error("failed to construct remote property '" +
+                                 description.name + "'");
+      }
+      properties.push_back(std::move(property));
+    }
+
+    for (const detail::RemoteValueDescription &description :
+         attribute_descriptions) {
+      auto [type_info, source] = make_data_source(description);
+      AttributeOwner attribute(
+          description.writable
+              ? type_info->buildAttribute(description.name, source)
+              : type_info->buildAlias(description.name, source));
+      if (!attribute || attribute->getDataSource().get() != source.get()) {
+        throw std::runtime_error("failed to construct remote attribute '" +
+                                 description.name + "'");
+      }
+      attributes.push_back(std::move(attribute));
     }
   } catch (const std::exception &exception) {
     assignError(error,
@@ -125,10 +216,20 @@ bool TaskContextProxy::synchronize(std::string *error) {
     return false;
   }
 
-  clear();
   const RTT::Service::shared_ptr root = provides();
+  clear();
   for (auto &[name, operation] : operations) {
     root->add(name, operation.release());
+  }
+  for (auto &property : properties) {
+    if (root->properties()->ownProperty(property.get())) {
+      property.release();
+    }
+  }
+  for (auto &attribute : attributes) {
+    if (root->setValue(attribute.get())) {
+      attribute.release();
+    }
   }
   assignError(error, "");
   return true;

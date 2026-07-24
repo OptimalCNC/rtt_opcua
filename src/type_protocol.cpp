@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <map>
 #include <mutex>
 #include <string>
 #include <type_traits>
@@ -24,6 +25,150 @@ std::mutex &registrationMutex() {
   static std::mutex mutex;
   return mutex;
 }
+
+template <typename T, typename Wire>
+bool decodeScalar(const ::opcua::Variant &value,
+                  const ::opcua::NodeId &data_type, T *decoded) noexcept {
+  if (decoded == nullptr || !value.isScalar() || !value.isType(data_type)) {
+    return false;
+  }
+  try {
+    *decoded = static_cast<T>(value.to<Wire>());
+    return true;
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
+template <typename T, typename Wire>
+class ScalarProxyDataSource final : public RTT::internal::DataSource<T> {
+public:
+  ScalarProxyDataSource(TypeProtocol::VariantReader reader,
+                        ::opcua::NodeId data_type)
+      : reader_(std::move(reader)), data_type_(std::move(data_type)) {}
+
+  T get() const override {
+    refresh();
+    return last_value_;
+  }
+
+  T value() const override { return last_value_; }
+
+  typename RTT::internal::DataSource<T>::const_reference_t
+  rvalue() const override {
+    return last_value_;
+  }
+
+  bool evaluate() const override { return refresh(); }
+
+  ScalarProxyDataSource *clone() const override {
+    return new ScalarProxyDataSource(reader_, data_type_);
+  }
+
+  ScalarProxyDataSource *
+  copy(std::map<const RTT::base::DataSourceBase *, RTT::base::DataSourceBase *>
+           &already_cloned) const override {
+    auto *self = const_cast<ScalarProxyDataSource *>(this);
+    already_cloned[this] = self;
+    return self;
+  }
+
+private:
+  bool refresh() const {
+    ::opcua::Variant value;
+    T decoded{};
+    try {
+      if (!reader_ || !reader_(&value) ||
+          !decodeScalar<T, Wire>(value, data_type_, &decoded)) {
+        return false;
+      }
+      last_value_ = std::move(decoded);
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  TypeProtocol::VariantReader reader_;
+  ::opcua::NodeId data_type_;
+  mutable T last_value_{};
+};
+
+template <typename T, typename Wire>
+class ScalarAssignableProxyDataSource final
+    : public RTT::internal::AssignableDataSource<T> {
+public:
+  ScalarAssignableProxyDataSource(TypeProtocol::VariantReader reader,
+                                  TypeProtocol::VariantWriter writer,
+                                  ::opcua::NodeId data_type)
+      : reader_(std::move(reader)), writer_(std::move(writer)),
+        data_type_(std::move(data_type)) {}
+
+  T get() const override {
+    refresh();
+    return last_value_;
+  }
+
+  T value() const override { return last_value_; }
+
+  typename RTT::internal::AssignableDataSource<T>::const_reference_t
+  rvalue() const override {
+    return last_value_;
+  }
+
+  bool evaluate() const override { return refresh(); }
+
+  void
+  set(typename RTT::internal::AssignableDataSource<T>::param_t value) override {
+    try {
+      const ::opcua::Variant encoded(static_cast<Wire>(value));
+      if (writer_ && writer_(encoded)) {
+        last_value_ = value;
+      }
+    } catch (const std::exception &) {
+    }
+  }
+
+  typename RTT::internal::AssignableDataSource<T>::reference_t set() override {
+    refresh();
+    return last_value_;
+  }
+
+  void updated() override { set(last_value_); }
+
+  ScalarAssignableProxyDataSource *clone() const override {
+    return new ScalarAssignableProxyDataSource(reader_, writer_, data_type_);
+  }
+
+  ScalarAssignableProxyDataSource *
+  copy(std::map<const RTT::base::DataSourceBase *, RTT::base::DataSourceBase *>
+           &already_cloned) const override {
+    auto *self = const_cast<ScalarAssignableProxyDataSource *>(this);
+    already_cloned[this] = self;
+    return self;
+  }
+
+private:
+  bool refresh() const {
+    ::opcua::Variant value;
+    T decoded{};
+    try {
+      if (!reader_ || !reader_(&value) ||
+          !decodeScalar<T, Wire>(value, data_type_, &decoded)) {
+        return false;
+      }
+      last_value_ = std::move(decoded);
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  TypeProtocol::VariantReader reader_;
+  TypeProtocol::VariantWriter writer_;
+  ::opcua::NodeId data_type_;
+  mutable T last_value_{};
+};
 
 template <typename T, typename Wire = T>
 class ScalarTypeProtocol final : public TypeProtocol {
@@ -73,6 +218,19 @@ public:
     }
   }
 
+  RTT::base::DataSourceBase::shared_ptr
+  makeProxyDataSource(VariantReader reader,
+                      VariantWriter writer) const override {
+    if (!reader) {
+      return {};
+    }
+    if (writer) {
+      return new ScalarAssignableProxyDataSource<T, Wire>(
+          std::move(reader), std::move(writer), data_type_);
+    }
+    return new ScalarProxyDataSource<T, Wire>(std::move(reader), data_type_);
+  }
+
   bool portValue(const RTT::base::OutputPortInterface *port,
                  ::opcua::Variant *value) const override {
     const auto *typed = dynamic_cast<const RTT::OutputPort<T> *>(port);
@@ -114,6 +272,11 @@ public:
 
   RTT::base::DataSourceBase::shared_ptr
   makeDataSource(const ::opcua::Variant &) const override {
+    return {};
+  }
+
+  RTT::base::DataSourceBase::shared_ptr
+  makeProxyDataSource(VariantReader, VariantWriter) const override {
     return {};
   }
 

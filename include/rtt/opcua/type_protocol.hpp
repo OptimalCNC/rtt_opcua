@@ -5,6 +5,7 @@
 #include <rtt/base/DataSourceBase.hpp>
 #include <rtt/types/TypeTransporter.hpp>
 
+#include <functional>
 #include <memory>
 #include <string_view>
 
@@ -23,6 +24,9 @@ inline constexpr int kTransportProtocolId = 1042;
 
 class TypeProtocol : public RTT::types::TypeTransporter {
 public:
+  using VariantReader = std::function<bool(::opcua::Variant *)>;
+  using VariantWriter = std::function<bool(const ::opcua::Variant &)>;
+
   ~TypeProtocol() override = default;
 
   RTT::base::ChannelElementBase::shared_ptr
@@ -36,6 +40,9 @@ public:
       const RTT::base::DataSourceBase::shared_ptr &destination) const = 0;
   virtual RTT::base::DataSourceBase::shared_ptr
   makeDataSource(const ::opcua::Variant &value) const = 0;
+  virtual RTT::base::DataSourceBase::shared_ptr
+  makeProxyDataSource(VariantReader reader,
+                      VariantWriter writer = {}) const = 0;
   virtual bool portValue(const RTT::base::OutputPortInterface *port,
                          ::opcua::Variant *value) const = 0;
   virtual ::opcua::NodeId dataTypeNodeId() const = 0;

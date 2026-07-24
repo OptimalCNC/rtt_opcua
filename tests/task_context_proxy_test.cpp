@@ -8,7 +8,10 @@
 
 #include <rtt/FactoryExceptions.hpp>
 #include <rtt/OperationInterfacePart.hpp>
+#include <rtt/Property.hpp>
 #include <rtt/TaskContext.hpp>
+#include <rtt/base/AttributeBase.hpp>
+#include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
 #include <rtt/internal/GlobalEngine.hpp>
 #include <rtt/internal/OperationCallerC.hpp>
@@ -68,6 +71,8 @@ struct CanonicalTypesFixture {
 class ProxyTarget final : public RTT::TaskContext {
 public:
   ProxyTarget() : RTT::TaskContext("remote/calculator") {
+    addProperty("Gain", gain).doc("Controller gain.");
+    addAttribute("Status", status);
     addOperation("add", &ProxyTarget::add, this, RTT::OwnThread)
         .doc("Add two signed values.")
         .arg("left", "Left operand.")
@@ -91,6 +96,9 @@ public:
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return left + right;
   }
+
+  std::int32_t gain{7};
+  std::string status{"idle"};
 };
 
 } // namespace
@@ -119,6 +127,26 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(proxy->getName() == target.getName());
   BOOST_TEST(proxy->connectionState() ==
              RTT::opcua::ProxyConnectionState::connected);
+
+  auto *gain = dynamic_cast<RTT::Property<std::int32_t> *>(
+      proxy->provides()->getProperty("Gain"));
+  BOOST_REQUIRE(gain != nullptr);
+  BOOST_TEST(gain->getDescription() == "Controller gain.");
+  BOOST_TEST(gain->get() == 7);
+  target.gain = 9;
+  BOOST_TEST(gain->get() == 9);
+  gain->set(11);
+  BOOST_TEST(target.gain == 11);
+
+  RTT::base::AttributeBase *status = proxy->provides()->getAttribute("Status");
+  BOOST_REQUIRE(status != nullptr);
+  BOOST_TEST(!status->getDataSource()->isAssignable());
+  auto *status_source = RTT::internal::DataSource<std::string>::narrow(
+      status->getDataSource().get());
+  BOOST_REQUIRE(status_source != nullptr);
+  BOOST_TEST(status_source->get() == "idle");
+  target.status = "running";
+  BOOST_TEST(status_source->get() == "running");
 
   RTT::OperationInterfacePart *add = proxy->provides()->getOperation("add");
   BOOST_REQUIRE(add != nullptr);

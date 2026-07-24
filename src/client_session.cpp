@@ -40,6 +40,16 @@ std::string modelPath(std::string_view component,
   return makeNodePath(segments);
 }
 
+std::string_view categorySegment(RemoteValueCategory category) noexcept {
+  switch (category) {
+  case RemoteValueCategory::properties:
+    return "properties";
+  case RemoteValueCategory::attributes:
+    return "attributes";
+  }
+  return {};
+}
+
 template <typename T>
 bool readOptionalArray(::opcua::Client &client, const ::opcua::NodeId &node_id,
                        std::vector<T> *values, std::string *error) {
@@ -319,6 +329,200 @@ ClientSession::discoverOperations(const std::string &component_name,
     assignError(error, last_error_);
     operations.clear();
     return operations;
+  }
+}
+
+std::vector<RemoteValueDescription>
+ClientSession::discoverValues(const std::string &component_name,
+                              RemoteValueCategory category,
+                              std::string *error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<RemoteValueDescription> values;
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    assignError(error, last_error_);
+    return values;
+  }
+
+  const std::string_view category_name = categorySegment(category);
+  if (category_name.empty()) {
+    last_error_ = "invalid remote RTT value category";
+    assignError(error, last_error_);
+    return values;
+  }
+
+  try {
+    const std::vector<std::string_view> folder_segments{category_name};
+    const ::opcua::NodeId folder_id(namespace_index_,
+                                    modelPath(component_name, folder_segments));
+    const ::opcua::BrowseDescription browse(
+        folder_id, ::opcua::BrowseDirection::Forward,
+        ::opcua::ReferenceTypeId::HasComponent, false,
+        ::opcua::NodeClass::Variable, ::opcua::BrowseResultMask::All);
+    const auto browse_result = ::opcua::services::browseAll(*client_, browse);
+    if (!browse_result) {
+      last_error_ = statusMessage("failed to discover remote RTT " +
+                                      std::string(category_name),
+                                  browse_result.code());
+      assignError(error, last_error_);
+      return values;
+    }
+
+    for (const ::opcua::ReferenceDescription &reference :
+         browse_result.value()) {
+      if (!reference.nodeId().isLocal()) {
+        continue;
+      }
+
+      RemoteValueDescription value;
+      value.name = std::string(reference.browseName().name());
+      value.node_id = reference.nodeId().nodeId();
+      if (value.name.empty()) {
+        continue;
+      }
+
+      const std::vector<std::string_view> type_segments{category_name,
+                                                        value.name, "rttType"};
+      const auto type_result = ::opcua::services::readValue(
+          *client_, ::opcua::NodeId(namespace_index_,
+                                    modelPath(component_name, type_segments)));
+      if (!type_result) {
+        last_error_ = statusMessage("failed to read RTT type metadata for '" +
+                                        value.name + "'",
+                                    type_result.code());
+        assignError(error, last_error_);
+        values.clear();
+        return values;
+      }
+      try {
+        value.type_name = type_result.value().to<std::string>();
+      } catch (const std::exception &exception) {
+        last_error_ = "invalid RTT type metadata for '" + value.name +
+                      "': " + exception.what();
+        assignError(error, last_error_);
+        values.clear();
+        return values;
+      }
+
+      const auto description =
+          ::opcua::services::readDescription(*client_, value.node_id);
+      if (!description) {
+        last_error_ = statusMessage("failed to read description for remote " +
+                                        std::string(category_name) + " '" +
+                                        value.name + "'",
+                                    description.code());
+        assignError(error, last_error_);
+        values.clear();
+        return values;
+      }
+      value.description = std::string(description.value().text());
+
+      const auto access =
+          ::opcua::services::readUserAccessLevel(*client_, value.node_id);
+      if (!access) {
+        last_error_ = statusMessage("failed to read access level for remote " +
+                                        std::string(category_name) + " '" +
+                                        value.name + "'",
+                                    access.code());
+        assignError(error, last_error_);
+        values.clear();
+        return values;
+      }
+      value.writable = access.value().anyOf(::opcua::AccessLevel::CurrentWrite);
+      values.push_back(std::move(value));
+    }
+
+    std::sort(values.begin(), values.end(),
+              [](const auto &left, const auto &right) {
+                return left.name < right.name;
+              });
+    if (std::adjacent_find(values.begin(), values.end(),
+                           [](const auto &left, const auto &right) {
+                             return left.name == right.name;
+                           }) != values.end()) {
+      last_error_ = "remote component exposes duplicate " +
+                    std::string(category_name) + " names";
+      assignError(error, last_error_);
+      values.clear();
+      return values;
+    }
+    last_error_.clear();
+    assignError(error, "");
+    return values;
+  } catch (const std::exception &exception) {
+    last_error_ = "failed to discover remote RTT " +
+                  std::string(category_name) + ": " + exception.what();
+    if (!client_->isConnected()) {
+      state_.store(ProxyConnectionState::stale);
+    }
+    assignError(error, last_error_);
+    values.clear();
+    return values;
+  }
+}
+
+bool ClientSession::readValue(const ::opcua::NodeId &node_id,
+                              ::opcua::Variant *value) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (value == nullptr) {
+    last_error_ = "remote RTT value destination must not be null";
+    return false;
+  }
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    return false;
+  }
+
+  try {
+    const auto result = ::opcua::services::readValue(*client_, node_id);
+    if (!result) {
+      last_error_ =
+          statusMessage("failed to read remote RTT value", result.code());
+      if (!client_->isConnected()) {
+        state_.store(ProxyConnectionState::stale);
+      }
+      return false;
+    }
+    *value = result.value();
+    last_error_.clear();
+    return true;
+  } catch (const std::exception &exception) {
+    last_error_ =
+        std::string("failed to read remote RTT value: ") + exception.what();
+    if (!client_->isConnected()) {
+      state_.store(ProxyConnectionState::stale);
+    }
+    return false;
+  }
+}
+
+bool ClientSession::writeValue(const ::opcua::NodeId &node_id,
+                               const ::opcua::Variant &value) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    return false;
+  }
+
+  try {
+    const ::opcua::StatusCode status =
+        ::opcua::services::writeValue(*client_, node_id, value);
+    if (!status.isGood()) {
+      last_error_ = statusMessage("failed to write remote RTT value", status);
+      if (!client_->isConnected()) {
+        state_.store(ProxyConnectionState::stale);
+      }
+      return false;
+    }
+    last_error_.clear();
+    return true;
+  } catch (const std::exception &exception) {
+    last_error_ =
+        std::string("failed to write remote RTT value: ") + exception.what();
+    if (!client_->isConnected()) {
+      state_.store(ProxyConnectionState::stale);
+    }
+    return false;
   }
 }
 
