@@ -20,6 +20,7 @@ set(OROCOS_NO_AUTO_LINKING TRUE)
 orocos_library(
   orocos-rtt-opcua
   src/node_id.cpp
+  src/object_model.cpp
   src/server.cpp
   src/server_options.cpp
   src/type_descriptor.cpp
@@ -109,6 +110,22 @@ if(BUILD_TESTING)
     endif()
   endif()
   add_test(NAME rtt_opcua_type_protocol_test COMMAND rtt_opcua_type_protocol_test)
+
+  add_executable(rtt_opcua_object_model_test tests/object_model_test.cpp)
+  target_link_libraries(
+    rtt_opcua_object_model_test
+    PRIVATE
+      orocos-rtt-opcua
+      ${OROCOS-RTT_TYPEKIT_LIBRARIES}
+  )
+  target_compile_features(rtt_opcua_object_model_test PRIVATE cxx_std_20)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(rtt_opcua_object_model_test PRIVATE -Wall -Wextra -Wpedantic)
+    if(RTT_OPCUA_WARNINGS_AS_ERRORS)
+      target_compile_options(rtt_opcua_object_model_test PRIVATE -Werror)
+    endif()
+  endif()
+  add_test(NAME rtt_opcua_object_model_test COMMAND rtt_opcua_object_model_test)
 endif()
 
 orocos_generate_package(VERSION ${PROJECT_VERSION} DEPENDS open62541)
