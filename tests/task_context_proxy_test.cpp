@@ -9,6 +9,7 @@
 #include <rtt/FactoryExceptions.hpp>
 #include <rtt/OperationInterfacePart.hpp>
 #include <rtt/Property.hpp>
+#include <rtt/Service.hpp>
 #include <rtt/TaskContext.hpp>
 #include <rtt/base/AttributeBase.hpp>
 #include <rtt/internal/DataSource.hpp>
@@ -71,6 +72,7 @@ struct CanonicalTypesFixture {
 class ProxyTarget final : public RTT::TaskContext {
 public:
   ProxyTarget() : RTT::TaskContext("remote/calculator") {
+    provides()->doc("Remote calculator.");
     addProperty("Gain", gain).doc("Controller gain.");
     addAttribute("Status", status);
     addOperation("add", &ProxyTarget::add, this, RTT::OwnThread)
@@ -84,6 +86,26 @@ public:
         .doc("Add two values after a short delay.")
         .arg("left", "Left operand.")
         .arg("right", "Right operand.");
+
+    RTT::Service::shared_ptr math = RTT::Service::Create("math");
+    math->doc("Math utilities.");
+    math->addProperty("Offset", offset).doc("Scale offset.");
+    math->addOperation("scale", &ProxyTarget::scale, this, RTT::OwnThread)
+        .doc("Scale a value and add the configured offset.")
+        .arg("value", "Value to scale.")
+        .arg("factor", "Scale factor.");
+    RTT::Service::shared_ptr advanced = RTT::Service::Create("advanced");
+    advanced->addOperation("negate", &ProxyTarget::negate, this, RTT::OwnThread)
+        .doc("Negate a signed value.")
+        .arg("value", "Value to negate.");
+    BOOST_REQUIRE(math->addService(advanced));
+    BOOST_REQUIRE(provides()->addService(math));
+  }
+
+  ~ProxyTarget() override {
+    if (RTT::Service::shared_ptr math = provides()->getService("math")) {
+      math->clear();
+    }
   }
 
   std::int32_t add(std::int32_t left, std::int32_t right) {
@@ -97,7 +119,14 @@ public:
     return left + right;
   }
 
+  std::int32_t scale(std::int32_t value, std::int32_t factor) {
+    return value * factor + offset;
+  }
+
+  std::int32_t negate(std::int32_t value) { return -value; }
+
   std::int32_t gain{7};
+  std::int32_t offset{2};
   std::string status{"idle"};
 };
 
@@ -125,6 +154,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
   BOOST_TEST(proxy->ready());
   BOOST_TEST(proxy->getName() == target.getName());
+  BOOST_TEST(proxy->provides()->doc() == "Remote calculator.");
   BOOST_TEST(proxy->connectionState() ==
              RTT::opcua::ProxyConnectionState::connected);
 
@@ -147,6 +177,39 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(status_source->get() == "idle");
   target.status = "running";
   BOOST_TEST(status_source->get() == "running");
+
+  RTT::Service::shared_ptr math = proxy->provides()->getService("math");
+  BOOST_REQUIRE(math);
+  BOOST_TEST(math->doc() == "Math utilities.");
+  auto *offset =
+      dynamic_cast<RTT::Property<std::int32_t> *>(math->getProperty("Offset"));
+  BOOST_REQUIRE(offset != nullptr);
+  BOOST_TEST(offset->getDescription() == "Scale offset.");
+  BOOST_TEST(offset->get() == 2);
+  offset->set(3);
+  BOOST_TEST(target.offset == 3);
+
+  std::int32_t scaled = 0;
+  RTT::OperationInterfacePart *scale = math->getOperation("scale");
+  BOOST_REQUIRE(scale != nullptr);
+  RTT::internal::OperationCallerC scale_caller(
+      scale, "scale", RTT::internal::GlobalEngine::Instance());
+  scale_caller.argC(std::int32_t{4}).argC(std::int32_t{5}).ret(scaled);
+  scale_caller.check();
+  BOOST_TEST(scale_caller.call());
+  BOOST_TEST(scaled == 23);
+
+  RTT::Service::shared_ptr advanced = math->getService("advanced");
+  BOOST_REQUIRE(advanced);
+  std::int32_t negated = 0;
+  RTT::OperationInterfacePart *negate = advanced->getOperation("negate");
+  BOOST_REQUIRE(negate != nullptr);
+  RTT::internal::OperationCallerC negate_caller(
+      negate, "negate", RTT::internal::GlobalEngine::Instance());
+  negate_caller.argC(std::int32_t{9}).ret(negated);
+  negate_caller.check();
+  BOOST_TEST(negate_caller.call());
+  BOOST_TEST(negated == -9);
 
   RTT::OperationInterfacePart *add = proxy->provides()->getOperation("add");
   BOOST_REQUIRE(add != nullptr);

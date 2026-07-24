@@ -33,8 +33,15 @@ std::string statusMessage(std::string_view operation,
 }
 
 std::string modelPath(std::string_view component,
+                      const RemoteServicePath &service_path,
                       std::span<const std::string_view> trailing_segments) {
   std::vector<std::string_view> segments{"components", component};
+  segments.reserve(segments.size() + service_path.size() * 2U +
+                   trailing_segments.size());
+  for (const std::string &service_name : service_path) {
+    segments.push_back("services");
+    segments.push_back(service_name);
+  }
   segments.insert(segments.end(), trailing_segments.begin(),
                   trailing_segments.end());
   return makeNodePath(segments);
@@ -190,6 +197,7 @@ bool ClientSession::connect(std::string *error) {
 
 std::vector<RemoteOperationDescription>
 ClientSession::discoverOperations(const std::string &component_name,
+                                  const RemoteServicePath &service_path,
                                   std::string *error) {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<RemoteOperationDescription> operations;
@@ -216,7 +224,8 @@ ClientSession::discoverOperations(const std::string &component_name,
 
     const std::vector<std::string_view> operation_folder_segment{"operations"};
     const ::opcua::NodeId operations_id(
-        namespace_index_, modelPath(component_name, operation_folder_segment));
+        namespace_index_,
+        modelPath(component_name, service_path, operation_folder_segment));
     const ::opcua::BrowseDescription browse(
         operations_id, ::opcua::BrowseDirection::Forward,
         ::opcua::ReferenceTypeId::HasComponent, false,
@@ -251,21 +260,21 @@ ClientSession::discoverOperations(const std::string &component_name,
           "operations", operation.name, "rttOutputSources"};
       if (!readOptionalArray(
               *client_,
-              ::opcua::NodeId(
-                  namespace_index_,
-                  modelPath(component_name, input_metadata_segments)),
+              ::opcua::NodeId(namespace_index_,
+                              modelPath(component_name, service_path,
+                                        input_metadata_segments)),
               &operation.input_types, &last_error_) ||
           !readOptionalArray(
               *client_,
-              ::opcua::NodeId(
-                  namespace_index_,
-                  modelPath(component_name, output_metadata_segments)),
+              ::opcua::NodeId(namespace_index_,
+                              modelPath(component_name, service_path,
+                                        output_metadata_segments)),
               &operation.output_types, &last_error_) ||
           !readOptionalArray(
               *client_,
-              ::opcua::NodeId(
-                  namespace_index_,
-                  modelPath(component_name, source_metadata_segments)),
+              ::opcua::NodeId(namespace_index_,
+                              modelPath(component_name, service_path,
+                                        source_metadata_segments)),
               &operation.output_sources, &last_error_)) {
         assignError(error, last_error_);
         operations.clear();
@@ -332,10 +341,9 @@ ClientSession::discoverOperations(const std::string &component_name,
   }
 }
 
-std::vector<RemoteValueDescription>
-ClientSession::discoverValues(const std::string &component_name,
-                              RemoteValueCategory category,
-                              std::string *error) {
+std::vector<RemoteValueDescription> ClientSession::discoverValues(
+    const std::string &component_name, const RemoteServicePath &service_path,
+    RemoteValueCategory category, std::string *error) {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<RemoteValueDescription> values;
   if (!client_ || state_.load() != ProxyConnectionState::connected) {
@@ -353,8 +361,9 @@ ClientSession::discoverValues(const std::string &component_name,
 
   try {
     const std::vector<std::string_view> folder_segments{category_name};
-    const ::opcua::NodeId folder_id(namespace_index_,
-                                    modelPath(component_name, folder_segments));
+    const ::opcua::NodeId folder_id(
+        namespace_index_,
+        modelPath(component_name, service_path, folder_segments));
     const ::opcua::BrowseDescription browse(
         folder_id, ::opcua::BrowseDirection::Forward,
         ::opcua::ReferenceTypeId::HasComponent, false,
@@ -385,7 +394,8 @@ ClientSession::discoverValues(const std::string &component_name,
                                                         value.name, "rttType"};
       const auto type_result = ::opcua::services::readValue(
           *client_, ::opcua::NodeId(namespace_index_,
-                                    modelPath(component_name, type_segments)));
+                                    modelPath(component_name, service_path,
+                                              type_segments)));
       if (!type_result) {
         last_error_ = statusMessage("failed to read RTT type metadata for '" +
                                         value.name + "'",
@@ -458,6 +468,132 @@ ClientSession::discoverValues(const std::string &component_name,
     assignError(error, last_error_);
     values.clear();
     return values;
+  }
+}
+
+bool ClientSession::readServiceDescription(
+    const std::string &component_name, const RemoteServicePath &service_path,
+    std::string *description, std::string *error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (description == nullptr) {
+    last_error_ = "remote RTT service description destination must not be null";
+    assignError(error, last_error_);
+    return false;
+  }
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    assignError(error, last_error_);
+    return false;
+  }
+
+  try {
+    const std::vector<std::string_view> no_trailing_segments;
+    const ::opcua::NodeId service_id(
+        namespace_index_,
+        modelPath(component_name, service_path, no_trailing_segments));
+    const auto result =
+        ::opcua::services::readDescription(*client_, service_id);
+    if (!result) {
+      last_error_ = statusMessage(
+          "failed to read remote RTT service description", result.code());
+      assignError(error, last_error_);
+      return false;
+    }
+    *description = std::string(result.value().text());
+    last_error_.clear();
+    assignError(error, "");
+    return true;
+  } catch (const std::exception &exception) {
+    last_error_ =
+        std::string("failed to read remote RTT service description: ") +
+        exception.what();
+    if (!client_->isConnected()) {
+      state_.store(ProxyConnectionState::stale);
+    }
+    assignError(error, last_error_);
+    return false;
+  }
+}
+
+std::vector<RemoteServiceDescription>
+ClientSession::discoverServices(const std::string &component_name,
+                                const RemoteServicePath &service_path,
+                                std::string *error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<RemoteServiceDescription> services;
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    assignError(error, last_error_);
+    return services;
+  }
+
+  try {
+    const std::vector<std::string_view> folder_segments{"services"};
+    const ::opcua::NodeId folder_id(
+        namespace_index_,
+        modelPath(component_name, service_path, folder_segments));
+    const ::opcua::BrowseDescription browse(
+        folder_id, ::opcua::BrowseDirection::Forward,
+        ::opcua::ReferenceTypeId::HasComponent, false,
+        ::opcua::NodeClass::Object, ::opcua::BrowseResultMask::All);
+    const auto browse_result = ::opcua::services::browseAll(*client_, browse);
+    if (!browse_result) {
+      last_error_ = statusMessage("failed to discover remote RTT services",
+                                  browse_result.code());
+      assignError(error, last_error_);
+      return services;
+    }
+
+    for (const ::opcua::ReferenceDescription &reference :
+         browse_result.value()) {
+      if (!reference.nodeId().isLocal()) {
+        continue;
+      }
+      RemoteServiceDescription service;
+      service.name = std::string(reference.browseName().name());
+      if (service.name.empty() || service.name == "this") {
+        continue;
+      }
+      const auto description = ::opcua::services::readDescription(
+          *client_, reference.nodeId().nodeId());
+      if (!description) {
+        last_error_ =
+            statusMessage("failed to read description for remote service '" +
+                              service.name + "'",
+                          description.code());
+        assignError(error, last_error_);
+        services.clear();
+        return services;
+      }
+      service.description = std::string(description.value().text());
+      services.push_back(std::move(service));
+    }
+
+    std::sort(services.begin(), services.end(),
+              [](const auto &left, const auto &right) {
+                return left.name < right.name;
+              });
+    if (std::adjacent_find(services.begin(), services.end(),
+                           [](const auto &left, const auto &right) {
+                             return left.name == right.name;
+                           }) != services.end()) {
+      last_error_ = "remote component exposes duplicate service names";
+      assignError(error, last_error_);
+      services.clear();
+      return services;
+    }
+    last_error_.clear();
+    assignError(error, "");
+    return services;
+  } catch (const std::exception &exception) {
+    last_error_ = std::string("failed to discover remote RTT services: ") +
+                  exception.what();
+    if (!client_->isConnected()) {
+      state_.store(ProxyConnectionState::stale);
+    }
+    assignError(error, last_error_);
+    services.clear();
+    return services;
   }
 }
 

@@ -46,6 +46,13 @@ struct RemoteValueDescription {
   bool writable{false};
 };
 
+using RemoteServicePath = std::vector<std::string>;
+
+struct RemoteServiceDescription {
+  std::string name;
+  std::string description;
+};
+
 class ClientSession final {
 public:
   ClientSession(std::string endpoint_url,
@@ -57,10 +64,18 @@ public:
 
   bool connect(std::string *error);
   std::vector<RemoteOperationDescription>
-  discoverOperations(const std::string &component_name, std::string *error);
+  discoverOperations(const std::string &component_name,
+                     const RemoteServicePath &service_path, std::string *error);
   std::vector<RemoteValueDescription>
   discoverValues(const std::string &component_name,
+                 const RemoteServicePath &service_path,
                  RemoteValueCategory category, std::string *error);
+  std::vector<RemoteServiceDescription>
+  discoverServices(const std::string &component_name,
+                   const RemoteServicePath &service_path, std::string *error);
+  bool readServiceDescription(const std::string &component_name,
+                              const RemoteServicePath &service_path,
+                              std::string *description, std::string *error);
   bool readValue(const ::opcua::NodeId &node_id, ::opcua::Variant *value);
   bool writeValue(const ::opcua::NodeId &node_id,
                   const ::opcua::Variant &value);

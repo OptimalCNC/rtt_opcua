@@ -11,6 +11,7 @@
 #include <rtt/types/TypeInfo.hpp>
 #include <rtt/types/Types.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -26,6 +27,189 @@ namespace {
 void assignError(std::string *output, const std::string &message) {
   if (output != nullptr) {
     *output = message;
+  }
+}
+
+constexpr std::size_t kMaximumServiceDepth = 32U;
+
+using OperationOwner = std::unique_ptr<RTT::OperationInterfacePart>;
+using PropertyOwner = std::unique_ptr<RTT::base::PropertyBase>;
+using AttributeOwner = std::unique_ptr<RTT::base::AttributeBase>;
+
+struct StagedService {
+  std::string name;
+  std::string description;
+  std::vector<std::pair<std::string, OperationOwner>> operations;
+  std::vector<PropertyOwner> properties;
+  std::vector<AttributeOwner> attributes;
+  std::vector<std::unique_ptr<StagedService>> children;
+};
+
+std::pair<RTT::types::TypeInfo *, RTT::base::DataSourceBase::shared_ptr>
+makeRemoteDataSource(const std::shared_ptr<detail::ClientSession> &session,
+                     const detail::RemoteValueDescription &description) {
+  RTT::types::TypeInfo *type_info =
+      RTT::types::Types()->type(description.type_name);
+  const TypeProtocol *protocol = protocolForTypeInfo(type_info);
+  if (type_info == nullptr || protocol == nullptr || !protocol->hasValue()) {
+    throw std::runtime_error("remote value '" + description.name +
+                             "' uses unsupported RTT type '" +
+                             description.type_name + "'");
+  }
+
+  const ::opcua::NodeId node_id = description.node_id;
+  TypeProtocol::VariantReader reader = [session,
+                                        node_id](::opcua::Variant *value) {
+    return session->readValue(node_id, value);
+  };
+  TypeProtocol::VariantWriter writer;
+  if (description.writable) {
+    writer = [session, node_id](const ::opcua::Variant &value) {
+      return session->writeValue(node_id, value);
+    };
+  }
+  RTT::base::DataSourceBase::shared_ptr source =
+      protocol->makeProxyDataSource(std::move(reader), std::move(writer));
+  if (!source) {
+    throw std::runtime_error("failed to build remote data source for '" +
+                             description.name + "'");
+  }
+  return {type_info, std::move(source)};
+}
+
+StagedService
+stageRemoteService(const std::shared_ptr<detail::ClientSession> &session,
+                   const std::string &component_name,
+                   const detail::RemoteServicePath &service_path,
+                   std::string service_name, std::string service_description) {
+  if (service_path.size() > kMaximumServiceDepth) {
+    throw std::runtime_error("remote RTT service hierarchy exceeds the "
+                             "supported depth");
+  }
+
+  std::string discovery_error;
+  std::vector<detail::RemoteOperationDescription> operation_descriptions =
+      session->discoverOperations(component_name, service_path,
+                                  &discovery_error);
+  if (!discovery_error.empty()) {
+    throw std::runtime_error(discovery_error);
+  }
+  std::vector<detail::RemoteValueDescription> property_descriptions =
+      session->discoverValues(component_name, service_path,
+                              detail::RemoteValueCategory::properties,
+                              &discovery_error);
+  if (!discovery_error.empty()) {
+    throw std::runtime_error(discovery_error);
+  }
+  std::vector<detail::RemoteValueDescription> attribute_descriptions =
+      session->discoverValues(component_name, service_path,
+                              detail::RemoteValueCategory::attributes,
+                              &discovery_error);
+  if (!discovery_error.empty()) {
+    throw std::runtime_error(discovery_error);
+  }
+  std::vector<detail::RemoteServiceDescription> service_descriptions =
+      session->discoverServices(component_name, service_path, &discovery_error);
+  if (!discovery_error.empty()) {
+    throw std::runtime_error(discovery_error);
+  }
+
+  StagedService staged;
+  staged.name = std::move(service_name);
+  staged.description = std::move(service_description);
+  staged.operations.reserve(operation_descriptions.size());
+  staged.properties.reserve(property_descriptions.size());
+  staged.attributes.reserve(attribute_descriptions.size());
+  staged.children.reserve(service_descriptions.size());
+
+  for (auto &description : operation_descriptions) {
+    const std::string name = description.name;
+    staged.operations.emplace_back(name,
+                                   OperationOwner(detail::makeRemoteOperation(
+                                       session, std::move(description))));
+  }
+
+  for (const detail::RemoteValueDescription &description :
+       property_descriptions) {
+    if (!description.writable) {
+      throw std::runtime_error("remote property '" + description.name +
+                               "' is not writable for the current OPC UA "
+                               "user");
+    }
+    auto [type_info, source] = makeRemoteDataSource(session, description);
+    PropertyOwner property(type_info->buildProperty(
+        description.name, description.description, source));
+    if (!property || property->getDataSource().get() != source.get()) {
+      throw std::runtime_error("failed to construct remote property '" +
+                               description.name + "'");
+    }
+    staged.properties.push_back(std::move(property));
+  }
+
+  for (const detail::RemoteValueDescription &description :
+       attribute_descriptions) {
+    auto [type_info, source] = makeRemoteDataSource(session, description);
+    AttributeOwner attribute(
+        description.writable
+            ? type_info->buildAttribute(description.name, source)
+            : type_info->buildAlias(description.name, source));
+    if (!attribute || attribute->getDataSource().get() != source.get()) {
+      throw std::runtime_error("failed to construct remote attribute '" +
+                               description.name + "'");
+    }
+    staged.attributes.push_back(std::move(attribute));
+  }
+
+  for (detail::RemoteServiceDescription &description : service_descriptions) {
+    detail::RemoteServicePath child_path = service_path;
+    child_path.push_back(description.name);
+    staged.children.push_back(std::make_unique<StagedService>(
+        stageRemoteService(session, component_name, child_path,
+                           std::move(description.name),
+                           std::move(description.description))));
+  }
+  return staged;
+}
+
+void installStagedService(const RTT::Service::shared_ptr &target,
+                          StagedService &staged) {
+  target->doc(staged.description);
+  for (auto &[name, operation] : staged.operations) {
+    target->add(name, operation.release());
+  }
+  for (auto &property : staged.properties) {
+    if (!target->properties()->ownProperty(property.get())) {
+      throw std::logic_error("failed to install staged RTT property");
+    }
+    property.release();
+  }
+  for (auto &attribute : staged.attributes) {
+    if (!target->setValue(attribute.get())) {
+      throw std::logic_error("failed to install staged RTT attribute");
+    }
+    attribute.release();
+  }
+  for (auto &child_staged : staged.children) {
+    RTT::Service::shared_ptr child = RTT::Service::Create(child_staged->name);
+    installStagedService(child, *child_staged);
+    if (!target->addService(child)) {
+      throw std::logic_error("failed to install staged RTT service '" +
+                             child_staged->name + "'");
+    }
+  }
+}
+
+void clearNestedServices(const RTT::Service::shared_ptr &service) {
+  for (const std::string &name : service->getProviderNames()) {
+    if (name == "this") {
+      continue;
+    }
+    RTT::Service::shared_ptr child = service->getService(name);
+    if (!child) {
+      continue;
+    }
+    clearNestedServices(child);
+    child->clear();
   }
 }
 
@@ -67,6 +251,7 @@ TaskContextProxy::TaskContextProxy(std::string endpoint_url,
 }
 
 TaskContextProxy::~TaskContextProxy() {
+  clearNestedServices(provides());
   clear();
   impl_.reset();
 }
@@ -105,131 +290,33 @@ TaskContextProxy::create(std::string endpoint_url, std::string component_name,
 }
 
 bool TaskContextProxy::synchronize(std::string *error) {
-  std::string discovery_error;
-  std::vector<detail::RemoteOperationDescription> operation_descriptions =
-      impl_->session->discoverOperations(getName(), &discovery_error);
-  if (!discovery_error.empty()) {
-    assignError(error, discovery_error);
-    return false;
-  }
-  std::vector<detail::RemoteValueDescription> property_descriptions =
-      impl_->session->discoverValues(
-          getName(), detail::RemoteValueCategory::properties, &discovery_error);
-  if (!discovery_error.empty()) {
-    assignError(error, discovery_error);
-    return false;
-  }
-  std::vector<detail::RemoteValueDescription> attribute_descriptions =
-      impl_->session->discoverValues(
-          getName(), detail::RemoteValueCategory::attributes, &discovery_error);
-  if (!discovery_error.empty()) {
-    assignError(error, discovery_error);
-    return false;
-  }
-
-  using OperationOwner = std::unique_ptr<RTT::OperationInterfacePart>;
-  std::vector<std::pair<std::string, OperationOwner>> operations;
-  using PropertyOwner = std::unique_ptr<RTT::base::PropertyBase>;
-  std::vector<PropertyOwner> properties;
-  using AttributeOwner = std::unique_ptr<RTT::base::AttributeBase>;
-  std::vector<AttributeOwner> attributes;
-  operations.reserve(operation_descriptions.size());
-  properties.reserve(property_descriptions.size());
-  attributes.reserve(attribute_descriptions.size());
+  StagedService staged;
   try {
-    for (auto &description : operation_descriptions) {
-      const std::string name = description.name;
-      operations.emplace_back(name,
-                              OperationOwner(detail::makeRemoteOperation(
-                                  impl_->session, std::move(description))));
+    std::string root_description;
+    std::string discovery_error;
+    if (!impl_->session->readServiceDescription(
+            getName(), {}, &root_description, &discovery_error)) {
+      throw std::runtime_error(discovery_error);
     }
-
-    const auto make_data_source =
-        [session = impl_->session](
-            const detail::RemoteValueDescription &description) {
-          RTT::types::TypeInfo *type_info =
-              RTT::types::Types()->type(description.type_name);
-          const TypeProtocol *protocol = protocolForTypeInfo(type_info);
-          if (type_info == nullptr || protocol == nullptr ||
-              !protocol->hasValue()) {
-            throw std::runtime_error("remote value '" + description.name +
-                                     "' uses unsupported RTT type '" +
-                                     description.type_name + "'");
-          }
-
-          const ::opcua::NodeId node_id = description.node_id;
-          TypeProtocol::VariantReader reader =
-              [session, node_id](::opcua::Variant *value) {
-                return session->readValue(node_id, value);
-              };
-          TypeProtocol::VariantWriter writer;
-          if (description.writable) {
-            writer = [session, node_id](const ::opcua::Variant &value) {
-              return session->writeValue(node_id, value);
-            };
-          }
-          RTT::base::DataSourceBase::shared_ptr source =
-              protocol->makeProxyDataSource(std::move(reader),
-                                            std::move(writer));
-          if (!source) {
-            throw std::runtime_error(
-                "failed to build remote data source for '" + description.name +
-                "'");
-          }
-          return std::pair{type_info, std::move(source)};
-        };
-
-    for (const detail::RemoteValueDescription &description :
-         property_descriptions) {
-      if (!description.writable) {
-        throw std::runtime_error("remote property '" + description.name +
-                                 "' is not writable for the current OPC UA "
-                                 "user");
-      }
-      auto [type_info, source] = make_data_source(description);
-      PropertyOwner property(type_info->buildProperty(
-          description.name, description.description, source));
-      if (!property || property->getDataSource().get() != source.get()) {
-        throw std::runtime_error("failed to construct remote property '" +
-                                 description.name + "'");
-      }
-      properties.push_back(std::move(property));
-    }
-
-    for (const detail::RemoteValueDescription &description :
-         attribute_descriptions) {
-      auto [type_info, source] = make_data_source(description);
-      AttributeOwner attribute(
-          description.writable
-              ? type_info->buildAttribute(description.name, source)
-              : type_info->buildAlias(description.name, source));
-      if (!attribute || attribute->getDataSource().get() != source.get()) {
-        throw std::runtime_error("failed to construct remote attribute '" +
-                                 description.name + "'");
-      }
-      attributes.push_back(std::move(attribute));
-    }
+    staged = stageRemoteService(impl_->session, getName(), {}, {},
+                                std::move(root_description));
   } catch (const std::exception &exception) {
-    assignError(error,
-                std::string("failed to construct remote RTT interface: ") +
-                    exception.what());
+    assignError(error, std::string("failed to stage remote RTT interface: ") +
+                           exception.what());
     return false;
   }
 
   const RTT::Service::shared_ptr root = provides();
+  clearNestedServices(root);
   clear();
-  for (auto &[name, operation] : operations) {
-    root->add(name, operation.release());
-  }
-  for (auto &property : properties) {
-    if (root->properties()->ownProperty(property.get())) {
-      property.release();
-    }
-  }
-  for (auto &attribute : attributes) {
-    if (root->setValue(attribute.get())) {
-      attribute.release();
-    }
+  try {
+    installStagedService(root, staged);
+  } catch (const std::exception &exception) {
+    clearNestedServices(root);
+    clear();
+    assignError(error, std::string("failed to install remote RTT interface: ") +
+                           exception.what());
+    return false;
   }
   assignError(error, "");
   return true;
