@@ -1,6 +1,7 @@
 #include "client_session.hpp"
 
 #include <rtt/opcua/node_id.hpp>
+#include <rtt/opcua/type_protocol.hpp>
 
 #include <open62541pp/client.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
@@ -80,11 +81,32 @@ bool readOptionalArray(::opcua::Client &client, const ::opcua::NodeId &node_id,
   }
 }
 
-bool readInputDescriptions(::opcua::Client &client,
-                           const ::opcua::NodeId &method_id,
-                           std::vector<std::string> *names,
-                           std::vector<std::string> *descriptions,
-                           std::string *error) {
+bool readStringValue(::opcua::Client &client, const ::opcua::NodeId &node_id,
+                     std::string_view label, std::string *value,
+                     std::string *error) {
+  const auto result = ::opcua::services::readValue(client, node_id);
+  if (!result) {
+    assignError(error, statusMessage("failed to read " + std::string(label),
+                                     result.code()));
+    return false;
+  }
+  try {
+    *value = result.value().to<std::string>();
+    return true;
+  } catch (const std::exception &exception) {
+    assignError(error,
+                "invalid " + std::string(label) + ": " + exception.what());
+    return false;
+  }
+}
+
+bool readMethodArguments(::opcua::Client &client,
+                         const ::opcua::NodeId &method_id,
+                         std::vector<::opcua::Argument> *inputs,
+                         std::vector<::opcua::Argument> *outputs,
+                         std::string *error) {
+  inputs->clear();
+  outputs->clear();
   const ::opcua::BrowseDescription browse(
       method_id, ::opcua::BrowseDirection::Forward,
       ::opcua::ReferenceTypeId::HasProperty, true, ::opcua::NodeClass::Variable,
@@ -96,38 +118,123 @@ bool readInputDescriptions(::opcua::Client &client,
     return false;
   }
 
+  bool found_inputs = false;
+  bool found_outputs = false;
   for (const ::opcua::ReferenceDescription &reference : browse_result.value()) {
-    if (reference.browseName().name() != "InputArguments" ||
-        !reference.nodeId().isLocal()) {
+    if (!reference.nodeId().isLocal()) {
       continue;
+    }
+    const std::string_view name = reference.browseName().name();
+    std::vector<::opcua::Argument> *destination = nullptr;
+    bool *found = nullptr;
+    if (name == "InputArguments") {
+      destination = inputs;
+      found = &found_inputs;
+    } else if (name == "OutputArguments") {
+      destination = outputs;
+      found = &found_outputs;
+    } else {
+      continue;
+    }
+    if (*found) {
+      assignError(error, "RTT method exposes duplicate " + std::string(name) +
+                             " metadata");
+      return false;
     }
     const auto value =
         ::opcua::services::readValue(client, reference.nodeId().nodeId());
     if (!value) {
-      assignError(error, statusMessage("failed to read RTT input arguments",
+      assignError(error, statusMessage("failed to read RTT method arguments",
                                        value.code()));
       return false;
     }
     try {
-      const auto arguments = value.value().to<std::vector<::opcua::Argument>>();
-      names->clear();
-      descriptions->clear();
-      names->reserve(arguments.size());
-      descriptions->reserve(arguments.size());
-      for (const ::opcua::Argument &argument : arguments) {
-        names->emplace_back(std::string_view(argument.name()));
-        descriptions->emplace_back(argument.description().text());
-      }
-      return true;
+      *destination = value.value().to<std::vector<::opcua::Argument>>();
+      *found = true;
     } catch (const std::exception &exception) {
-      assignError(error, std::string("invalid RTT input argument metadata: ") +
+      assignError(error, std::string("invalid RTT method argument metadata: ") +
                              exception.what());
       return false;
     }
   }
+  return true;
+}
+
+bool readInputDescriptions(::opcua::Client &client,
+                           const ::opcua::NodeId &method_id,
+                           std::vector<std::string> *names,
+                           std::vector<std::string> *descriptions,
+                           std::string *error) {
+  std::vector<::opcua::Argument> inputs;
+  std::vector<::opcua::Argument> outputs;
+  if (!readMethodArguments(client, method_id, &inputs, &outputs, error)) {
+    return false;
+  }
 
   names->clear();
   descriptions->clear();
+  names->reserve(inputs.size());
+  descriptions->reserve(inputs.size());
+  for (const ::opcua::Argument &argument : inputs) {
+    names->emplace_back(std::string_view(argument.name()));
+    descriptions->emplace_back(argument.description().text());
+  }
+  return true;
+}
+
+bool argumentMatches(const ::opcua::Argument &argument,
+                     const ::opcua::NodeId &data_type,
+                     ::opcua::ValueRank value_rank) {
+  return argument.dataType() == data_type && argument.valueRank() == value_rank;
+}
+
+bool validatePortMethod(::opcua::Client &client,
+                        const RemotePortDescription &port, std::string *error) {
+  const TypeProtocol *protocol = protocolForTypeName(port.type_name);
+  if (protocol == nullptr || !protocol->hasValue()) {
+    assignError(error, "remote port '" + port.name +
+                           "' uses unsupported RTT type '" + port.type_name +
+                           "'");
+    return false;
+  }
+
+  const auto executable =
+      ::opcua::services::readExecutable(client, port.method_id);
+  const auto user_executable =
+      ::opcua::services::readUserExecutable(client, port.method_id);
+  if (!executable || !user_executable) {
+    assignError(error, "failed to read execution metadata for remote port '" +
+                           port.name + "'");
+    return false;
+  }
+  if (!executable.value() || !user_executable.value()) {
+    assignError(error, "remote port '" + port.name +
+                           "' method is not executable for the current user");
+    return false;
+  }
+
+  std::vector<::opcua::Argument> inputs;
+  std::vector<::opcua::Argument> outputs;
+  if (!readMethodArguments(client, port.method_id, &inputs, &outputs, error)) {
+    return false;
+  }
+  const ::opcua::NodeId status_type(::opcua::DataTypeId::String);
+  const bool status_output =
+      !outputs.empty() &&
+      argumentMatches(outputs.front(), status_type, ::opcua::ValueRank::Scalar);
+  const bool valid =
+      port.direction == RemotePortDirection::input
+          ? inputs.size() == 1U && outputs.size() == 1U && status_output &&
+                argumentMatches(inputs.front(), protocol->dataTypeNodeId(),
+                                protocol->valueRank())
+          : inputs.empty() && outputs.size() == 2U && status_output &&
+                argumentMatches(outputs[1], protocol->dataTypeNodeId(),
+                                protocol->valueRank());
+  if (!valid) {
+    assignError(error, "remote port '" + port.name +
+                           "' exposes an incompatible method signature");
+    return false;
+  }
   return true;
 }
 
@@ -594,6 +701,168 @@ ClientSession::discoverServices(const std::string &component_name,
     assignError(error, last_error_);
     services.clear();
     return services;
+  }
+}
+
+std::vector<RemotePortDescription>
+ClientSession::discoverPorts(const std::string &component_name,
+                             const RemoteServicePath &service_path,
+                             std::string *error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<RemotePortDescription> ports;
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    assignError(error, last_error_);
+    return ports;
+  }
+
+  try {
+    const std::vector<std::string_view> folder_segments{"ports"};
+    const ::opcua::NodeId folder_id(
+        namespace_index_,
+        modelPath(component_name, service_path, folder_segments));
+    const ::opcua::BrowseDescription browse(
+        folder_id, ::opcua::BrowseDirection::Forward,
+        ::opcua::ReferenceTypeId::HasComponent, false,
+        ::opcua::NodeClass::Object, ::opcua::BrowseResultMask::All);
+    const auto browse_result = ::opcua::services::browseAll(*client_, browse);
+    if (!browse_result) {
+      last_error_ = statusMessage("failed to discover remote RTT ports",
+                                  browse_result.code());
+      assignError(error, last_error_);
+      return ports;
+    }
+
+    for (const ::opcua::ReferenceDescription &reference :
+         browse_result.value()) {
+      if (!reference.nodeId().isLocal()) {
+        continue;
+      }
+      RemotePortDescription port;
+      port.name = std::string(reference.browseName().name());
+      port.service_path = service_path;
+      port.object_id = reference.nodeId().nodeId();
+      if (port.name.empty()) {
+        continue;
+      }
+
+      const std::vector<std::string_view> type_segments{"ports", port.name,
+                                                        "type"};
+      const std::vector<std::string_view> direction_segments{"ports", port.name,
+                                                             "direction"};
+      std::string direction;
+      if (!readStringValue(
+              *client_,
+              ::opcua::NodeId(
+                  namespace_index_,
+                  modelPath(component_name, service_path, type_segments)),
+              "RTT port type metadata", &port.type_name, &last_error_) ||
+          !readStringValue(
+              *client_,
+              ::opcua::NodeId(
+                  namespace_index_,
+                  modelPath(component_name, service_path, direction_segments)),
+              "RTT port direction metadata", &direction, &last_error_)) {
+        assignError(error, last_error_);
+        ports.clear();
+        return ports;
+      }
+      if (direction == "input") {
+        port.direction = RemotePortDirection::input;
+      } else if (direction == "output") {
+        port.direction = RemotePortDirection::output;
+      } else {
+        last_error_ = "remote port '" + port.name +
+                      "' has invalid direction metadata '" + direction + "'";
+        assignError(error, last_error_);
+        ports.clear();
+        return ports;
+      }
+
+      const auto description =
+          ::opcua::services::readDescription(*client_, port.object_id);
+      if (!description) {
+        last_error_ = statusMessage(
+            "failed to read description for remote port '" + port.name + "'",
+            description.code());
+        assignError(error, last_error_);
+        ports.clear();
+        return ports;
+      }
+      port.description = std::string(description.value().text());
+
+      const std::string_view method_name =
+          port.direction == RemotePortDirection::input ? "write" : "read";
+      const ::opcua::BrowseDescription method_browse(
+          port.object_id, ::opcua::BrowseDirection::Forward,
+          ::opcua::ReferenceTypeId::HasComponent, false,
+          ::opcua::NodeClass::Method, ::opcua::BrowseResultMask::All);
+      const auto method_result =
+          ::opcua::services::browseAll(*client_, method_browse);
+      if (!method_result) {
+        last_error_ = statusMessage("failed to browse remote port methods",
+                                    method_result.code());
+        assignError(error, last_error_);
+        ports.clear();
+        return ports;
+      }
+      bool found_method = false;
+      for (const ::opcua::ReferenceDescription &method_reference :
+           method_result.value()) {
+        if (!method_reference.nodeId().isLocal() ||
+            method_reference.browseName().name() != method_name) {
+          continue;
+        }
+        if (found_method) {
+          last_error_ = "remote port '" + port.name + "' exposes duplicate " +
+                        std::string(method_name) + " methods";
+          assignError(error, last_error_);
+          ports.clear();
+          return ports;
+        }
+        port.method_id = method_reference.nodeId().nodeId();
+        found_method = true;
+      }
+      if (!found_method) {
+        last_error_ = "remote port '" + port.name + "' does not expose its " +
+                      std::string(method_name) + " method";
+        assignError(error, last_error_);
+        ports.clear();
+        return ports;
+      }
+      if (!validatePortMethod(*client_, port, &last_error_)) {
+        assignError(error, last_error_);
+        ports.clear();
+        return ports;
+      }
+      ports.push_back(std::move(port));
+    }
+
+    std::sort(ports.begin(), ports.end(),
+              [](const auto &left, const auto &right) {
+                return left.name < right.name;
+              });
+    if (std::adjacent_find(ports.begin(), ports.end(),
+                           [](const auto &left, const auto &right) {
+                             return left.name == right.name;
+                           }) != ports.end()) {
+      last_error_ = "remote component exposes duplicate port names";
+      assignError(error, last_error_);
+      ports.clear();
+      return ports;
+    }
+    last_error_.clear();
+    assignError(error, "");
+    return ports;
+  } catch (const std::exception &exception) {
+    last_error_ =
+        std::string("failed to discover remote RTT ports: ") + exception.what();
+    if (!client_->isConnected()) {
+      state_.store(ProxyConnectionState::stale);
+    }
+    assignError(error, last_error_);
+    ports.clear();
+    return ports;
   }
 }
 

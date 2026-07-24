@@ -1,13 +1,16 @@
 #define BOOST_TEST_MODULE rtt_opcua_task_context_proxy
 #include <boost/test/included/unit_test.hpp>
 
+#include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/object_model.hpp>
 #include <rtt/opcua/server.hpp>
 #include <rtt/opcua/task_context_proxy.hpp>
 #include <rtt/opcua/type_protocol.hpp>
 
 #include <rtt/FactoryExceptions.hpp>
+#include <rtt/InputPort.hpp>
 #include <rtt/OperationInterfacePart.hpp>
+#include <rtt/OutputPort.hpp>
 #include <rtt/Property.hpp>
 #include <rtt/Service.hpp>
 #include <rtt/TaskContext.hpp>
@@ -20,16 +23,21 @@
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/Types.hpp>
 
+#include <open62541pp/services/nodemanagement.hpp>
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -69,10 +77,25 @@ struct CanonicalTypesFixture {
   }
 };
 
+template <typename Predicate>
+bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout =
+                                        std::chrono::milliseconds(1000)) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return predicate();
+}
+
 class ProxyTarget final : public RTT::TaskContext {
 public:
   ProxyTarget() : RTT::TaskContext("remote/calculator") {
     provides()->doc("Remote calculator.");
+    addPort(feedback).doc("Calculated feedback.");
+    addPort(command).doc("Requested command.");
     addProperty("Gain", gain).doc("Controller gain.");
     addAttribute("Status", status);
     addOperation("add", &ProxyTarget::add, this, RTT::OwnThread)
@@ -89,6 +112,7 @@ public:
 
     RTT::Service::shared_ptr math = RTT::Service::Create("math");
     math->doc("Math utilities.");
+    math->addLocalPort(math_feedback).doc("Nested calculation feedback.");
     math->addProperty("Offset", offset).doc("Scale offset.");
     math->addOperation("scale", &ProxyTarget::scale, this, RTT::OwnThread)
         .doc("Scale a value and add the configured offset.")
@@ -104,6 +128,7 @@ public:
 
   ~ProxyTarget() override {
     if (RTT::Service::shared_ptr math = provides()->getService("math")) {
+      math->removeLocalPort(math_feedback.getName());
       math->clear();
     }
   }
@@ -128,6 +153,9 @@ public:
   std::int32_t gain{7};
   std::int32_t offset{2};
   std::string status{"idle"};
+  RTT::OutputPort<std::int32_t> feedback{"Feedback"};
+  RTT::InputPort<std::int32_t> command{"Command"};
+  RTT::OutputPort<std::int32_t> math_feedback{"MathFeedback"};
 };
 
 } // namespace
@@ -178,9 +206,104 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   target.status = "running";
   BOOST_TEST(status_source->get() == "running");
 
+  auto *remote_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
+      proxy->ports()->getPort("Feedback"));
+  BOOST_REQUIRE(remote_feedback != nullptr);
+  BOOST_TEST(remote_feedback->getTypeInfo()->getTypeName() == "Int32");
+  BOOST_TEST(remote_feedback->getDescription() == "Calculated feedback.");
+  RTT::InputPort<std::int32_t> feedback_sink("FeedbackSink");
+  RTT::ConnPolicy feedback_policy =
+      RTT::ConnPolicy::buffer(1, RTT::ConnPolicy::LOCK_FREE, false);
+  feedback_policy.mandatory = true;
+  BOOST_REQUIRE(
+      remote_feedback->createConnection(feedback_sink, feedback_policy));
+  const RTT::base::DataSourceBase::shared_ptr filler =
+      new RTT::internal::ConstantDataSource<std::int32_t>(40);
+  BOOST_REQUIRE(remote_feedback->write(filler) == RTT::WriteSuccess);
+  BOOST_TEST(target.feedback.write(std::int32_t{41}) == RTT::WriteSuccess);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  std::int32_t feedback_value = 0;
+  BOOST_REQUIRE(feedback_sink.read(feedback_value) == RTT::NewData);
+  BOOST_TEST(feedback_value == 40);
+  BOOST_REQUIRE(waitUntil(
+      [&] { return feedback_sink.read(feedback_value) == RTT::NewData; }));
+  BOOST_TEST(feedback_value == 41);
+  RTT::InputPort<std::int32_t> initialized_feedback_sink(
+      "InitializedFeedbackSink");
+  BOOST_REQUIRE(remote_feedback->createConnection(
+      initialized_feedback_sink,
+      RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, true)));
+  std::int32_t initialized_feedback_value = 0;
+  BOOST_REQUIRE(initialized_feedback_sink.read(initialized_feedback_value) ==
+                RTT::NewData);
+  BOOST_TEST(initialized_feedback_value == 41);
+  initialized_feedback_sink.disconnect();
+  feedback_sink.disconnect();
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  BOOST_REQUIRE(
+      remote_feedback->createConnection(feedback_sink, feedback_policy));
+  BOOST_REQUIRE(waitUntil(
+      [&] { return feedback_sink.read(feedback_value) == RTT::NewData; }));
+  BOOST_TEST(feedback_value == 41);
+
+  auto *remote_command = dynamic_cast<RTT::base::InputPortInterface *>(
+      proxy->ports()->getPort("Command"));
+  BOOST_REQUIRE(remote_command != nullptr);
+  BOOST_TEST(remote_command->getTypeInfo()->getTypeName() == "Int32");
+  BOOST_TEST(remote_command->getDescription() == "Requested command.");
+  RTT::OutputPort<std::int32_t> command_source("CommandSource");
+  BOOST_REQUIRE(command_source.createConnection(
+      *remote_command,
+      RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  BOOST_TEST(command_source.write(std::int32_t{73}) == RTT::WriteSuccess);
+  std::int32_t command_value = 0;
+  BOOST_REQUIRE(waitUntil(
+      [&] { return target.command.read(command_value) == RTT::NewData; }));
+  BOOST_TEST(command_value == 73);
+
+  BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
+  BOOST_TEST(!feedback_sink.connected());
+  BOOST_TEST(!command_source.connected());
+
+  remote_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
+      proxy->ports()->getPort("Feedback"));
+  BOOST_REQUIRE(remote_feedback != nullptr);
+  BOOST_REQUIRE(remote_feedback->createConnection(
+      feedback_sink, RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  BOOST_TEST(target.feedback.write(std::int32_t{42}) == RTT::WriteSuccess);
+  BOOST_REQUIRE(waitUntil(
+      [&] { return feedback_sink.read(feedback_value) == RTT::NewData; }));
+  BOOST_TEST(feedback_value == 42);
+
+  remote_command = dynamic_cast<RTT::base::InputPortInterface *>(
+      proxy->ports()->getPort("Command"));
+  BOOST_REQUIRE(remote_command != nullptr);
+  BOOST_REQUIRE(command_source.createConnection(
+      *remote_command,
+      RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  BOOST_TEST(command_source.write(std::int32_t{74}) == RTT::WriteSuccess);
+  BOOST_REQUIRE(waitUntil(
+      [&] { return target.command.read(command_value) == RTT::NewData; }));
+  BOOST_TEST(command_value == 74);
+
   RTT::Service::shared_ptr math = proxy->provides()->getService("math");
   BOOST_REQUIRE(math);
   BOOST_TEST(math->doc() == "Math utilities.");
+  auto *remote_math_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
+      math->getPort("MathFeedback"));
+  BOOST_REQUIRE(remote_math_feedback != nullptr);
+  BOOST_TEST(remote_math_feedback->getDescription() ==
+             "Nested calculation feedback.");
+  RTT::InputPort<std::int32_t> math_feedback_sink("MathFeedbackSink");
+  BOOST_REQUIRE(remote_math_feedback->createConnection(
+      math_feedback_sink,
+      RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  BOOST_TEST(target.math_feedback.write(std::int32_t{84}) == RTT::WriteSuccess);
+  std::int32_t math_feedback_value = 0;
+  BOOST_REQUIRE(waitUntil([&] {
+    return math_feedback_sink.read(math_feedback_value) == RTT::NewData;
+  }));
+  BOOST_TEST(math_feedback_value == 84);
   auto *offset =
       dynamic_cast<RTT::Property<std::int32_t> *>(math->getProperty("Offset"));
   BOOST_REQUIRE(offset != nullptr);
@@ -295,6 +418,48 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(delayed_handle.collect() == RTT::SendSuccess);
   BOOST_TEST(delayed_sum == 21);
 
+  target.command.disconnect();
+  BOOST_TEST(command_source.write(std::int32_t{75}) == RTT::WriteSuccess);
+  BOOST_REQUIRE(waitUntil([&] {
+    return proxy->lastError().find("NotConnected") != std::string::npos;
+  }));
+  registration->reset();
+  target.ports()->removePort("Command");
+  registration = model.registerComponent(target, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  BOOST_TEST(!proxy->synchronize(&error));
+  BOOST_TEST(error.find("unacknowledged sample") != std::string::npos);
+  BOOST_TEST(proxy->ports()->getPort("Command") == remote_command);
+
+  registration->reset();
+  target.addPort(target.command).doc("Requested command.");
+  registration = model.registerComponent(target, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
+  BOOST_REQUIRE(waitUntil(
+      [&] { return target.command.read(command_value) == RTT::NewData; }));
+  BOOST_TEST(command_value == 75);
+
+  constexpr std::size_t synchronize_count = 4U;
+  std::barrier synchronize_start(
+      static_cast<std::ptrdiff_t>(synchronize_count));
+  std::array<bool, synchronize_count> synchronized{};
+  std::array<std::string, synchronize_count> synchronize_errors;
+  std::vector<std::jthread> synchronizers;
+  synchronizers.reserve(synchronize_count);
+  for (std::size_t index = 0; index < synchronize_count; ++index) {
+    synchronizers.emplace_back([&, index] {
+      synchronize_start.arrive_and_wait();
+      synchronized[index] = proxy->synchronize(&synchronize_errors[index]);
+    });
+  }
+  synchronizers.clear();
+  for (std::size_t index = 0; index < synchronize_count; ++index) {
+    BOOST_TEST(synchronized[index], synchronize_errors[index]);
+  }
+  BOOST_TEST(proxy->ready());
+  BOOST_REQUIRE(proxy->ports()->getPort("Feedback") != nullptr);
+
   proxy.reset();
   registration->reset();
   server.stop();
@@ -316,5 +481,81 @@ BOOST_FIXTURE_TEST_CASE(proxy_creation_rejects_a_missing_component,
   BOOST_TEST(proxy == nullptr);
   BOOST_TEST(!error.empty());
 
+  server.stop();
+}
+
+BOOST_AUTO_TEST_CASE(proxy_creation_rejects_an_invalid_port_poll_interval) {
+  RTT::opcua::TaskContextProxyOptions options;
+  options.port_poll_interval = std::chrono::milliseconds::zero();
+  std::string error;
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      "opc.tcp://127.0.0.1:4840", "remote/component", options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error ==
+             "OPC UA port poll interval is outside the supported range");
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_incompatible_port_method_signature,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::hours(1);
+  RTT::opcua::ObjectModel model(server, model_options);
+  ProxyTarget target;
+  auto registration = model.registerComponent(target, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  const std::uint16_t namespace_index = server.namespaceIndex().value();
+  const std::vector<std::string_view> port_segments{
+      "components", target.getName(), "ports", "Feedback"};
+  const std::vector<std::string_view> method_segments{
+      "components", target.getName(), "ports", "Feedback", "read"};
+  const ::opcua::NodeId port_id(namespace_index,
+                                RTT::opcua::makeNodePath(port_segments));
+  const ::opcua::NodeId method_id(namespace_index,
+                                  RTT::opcua::makeNodePath(method_segments));
+  bool replaced = false;
+  BOOST_REQUIRE(server.invoke(
+      [&](::opcua::Server &native) {
+        const ::opcua::StatusCode deleted =
+            ::opcua::services::deleteNode(native, method_id, true);
+        if (!deleted.isGood()) {
+          return;
+        }
+        ::opcua::MethodAttributes attributes;
+        attributes.setDisplayName(::opcua::LocalizedText("en-US", "read"));
+        attributes.setExecutable(true);
+        attributes.setUserExecutable(true);
+        ::opcua::services::MethodCallback callback =
+            std::function<::opcua::StatusCode(
+                ::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
+                ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
+                const ::opcua::NodeId &)>(
+                [](::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
+                   ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
+                   const ::opcua::NodeId &) {
+                  return ::opcua::StatusCode(UA_STATUSCODE_GOOD);
+                });
+        replaced =
+            ::opcua::services::addMethod(
+                native, port_id, method_id, "read", std::move(callback), {}, {},
+                attributes, ::opcua::ReferenceTypeId::HasComponent)
+                .hasValue();
+      },
+      std::chrono::seconds(1), &error));
+  BOOST_REQUIRE_MESSAGE(replaced, error);
+
+  RTT::opcua::TaskContextProxyOptions proxy_options;
+  proxy_options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), proxy_options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("incompatible method signature") != std::string::npos);
+
+  registration->reset();
   server.stop();
 }

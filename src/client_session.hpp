@@ -53,6 +53,18 @@ struct RemoteServiceDescription {
   std::string description;
 };
 
+enum class RemotePortDirection { input, output };
+
+struct RemotePortDescription {
+  std::string name;
+  std::string description;
+  std::string type_name;
+  RemoteServicePath service_path;
+  RemotePortDirection direction{RemotePortDirection::input};
+  ::opcua::NodeId object_id;
+  ::opcua::NodeId method_id;
+};
+
 class ClientSession final {
 public:
   ClientSession(std::string endpoint_url,
@@ -73,6 +85,9 @@ public:
   std::vector<RemoteServiceDescription>
   discoverServices(const std::string &component_name,
                    const RemoteServicePath &service_path, std::string *error);
+  std::vector<RemotePortDescription>
+  discoverPorts(const std::string &component_name,
+                const RemoteServicePath &service_path, std::string *error);
   bool readServiceDescription(const std::string &component_name,
                               const RemoteServicePath &service_path,
                               std::string *description, std::string *error);

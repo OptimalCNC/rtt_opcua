@@ -25,6 +25,7 @@ orocos_library(
   src/operation_dispatcher.cpp
   src/port_bridge.cpp
   src/remote_operation.cpp
+  src/remote_port.cpp
   src/server.cpp
   src/server_options.cpp
   src/task_context_proxy.cpp

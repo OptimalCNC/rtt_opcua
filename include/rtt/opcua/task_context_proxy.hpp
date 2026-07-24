@@ -22,6 +22,9 @@ std::ostream &operator<<(std::ostream &stream, ProxyConnectionState state);
 
 struct TaskContextProxyOptions {
   std::chrono::milliseconds request_timeout{std::chrono::seconds(2)};
+  // Output connection transitions are observed at this cadence. RTT clients
+  // that require a per-connection initial value should use ConnPolicy::init.
+  std::chrono::milliseconds port_poll_interval{std::chrono::milliseconds(10)};
 };
 
 class TaskContextProxy final : public RTT::TaskContext {
@@ -35,6 +38,8 @@ public:
   TaskContextProxy(const TaskContextProxy &) = delete;
   TaskContextProxy &operator=(const TaskContextProxy &) = delete;
 
+  // Rebuilds the mirrored RTT interface. Previously returned interface pointers
+  // and existing port connections are invalidated when this succeeds.
   bool synchronize(std::string *error = nullptr);
   bool ready() override;
 
