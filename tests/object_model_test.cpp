@@ -178,6 +178,9 @@ BOOST_FIXTURE_TEST_CASE(
       modelNodeId(namespace_index, {"components", "arm/left"});
   const auto gain_id = modelNodeId(
       namespace_index, {"components", "arm/left", "properties", "Gain"});
+  const auto gain_type_id =
+      modelNodeId(namespace_index,
+                  {"components", "arm/left", "properties", "Gain", "rttType"});
   const auto status_id = modelNodeId(
       namespace_index, {"components", "arm/left", "attributes", "Status"});
   const auto feedback_type_id = modelNodeId(
@@ -208,6 +211,9 @@ BOOST_FIXTURE_TEST_CASE(
   const auto gain_value = ::opcua::services::readValue(client, gain_id);
   BOOST_REQUIRE(gain_value);
   BOOST_TEST(gain_value.value().to<std::int32_t>() == 7);
+  const auto gain_type = ::opcua::services::readValue(client, gain_type_id);
+  BOOST_REQUIRE(gain_type);
+  BOOST_TEST(gain_type.value().to<std::string>() == "Int32");
   BOOST_CHECK(::opcua::services::writeValue(client, gain_id,
                                             ::opcua::Variant(std::int32_t{11}))
                   .isGood());
@@ -338,6 +344,18 @@ BOOST_FIXTURE_TEST_CASE(
       namespace_index, {"components", "calculator", "operations", "add"});
   const auto increment_id = modelNodeId(
       namespace_index, {"components", "calculator", "operations", "increment"});
+  const auto add_input_types_id =
+      modelNodeId(namespace_index, {"components", "calculator", "operations",
+                                    "add", "rttInputTypes"});
+  const auto add_output_types_id =
+      modelNodeId(namespace_index, {"components", "calculator", "operations",
+                                    "add", "rttOutputTypes"});
+  const auto add_output_sources_id =
+      modelNodeId(namespace_index, {"components", "calculator", "operations",
+                                    "add", "rttOutputSources"});
+  const auto increment_output_sources_id =
+      modelNodeId(namespace_index, {"components", "calculator", "operations",
+                                    "increment", "rttOutputSources"});
   const auto owner_thread_id =
       modelNodeId(namespace_index,
                   {"components", "calculator", "operations", "onOwnerThread"});
@@ -349,6 +367,22 @@ BOOST_FIXTURE_TEST_CASE(
 
   const std::vector<::opcua::Variant> add_inputs{
       ::opcua::Variant(std::int32_t{20}), ::opcua::Variant(std::int32_t{22})};
+  BOOST_TEST(::opcua::services::readValue(client, add_input_types_id)
+                 .value()
+                 .to<std::vector<std::string>>() ==
+             std::vector<std::string>({"Int32", "Int32"}));
+  BOOST_TEST(::opcua::services::readValue(client, add_output_types_id)
+                 .value()
+                 .to<std::vector<std::string>>() ==
+             std::vector<std::string>({"Int32"}));
+  BOOST_TEST(::opcua::services::readValue(client, add_output_sources_id)
+                 .value()
+                 .to<std::vector<std::int32_t>>() ==
+             std::vector<std::int32_t>({-1}));
+  BOOST_TEST(::opcua::services::readValue(client, increment_output_sources_id)
+                 .value()
+                 .to<std::vector<std::int32_t>>() ==
+             std::vector<std::int32_t>({0}));
   const auto add_result =
       ::opcua::services::call(client, operations_id, add_id, add_inputs);
   BOOST_REQUIRE(add_result.statusCode().isGood());

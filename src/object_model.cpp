@@ -249,13 +249,11 @@ NodeSpec objectSpec(std::string path, std::string parent_path,
   return spec;
 }
 
-bool addStaticStringVariable(::opcua::Server &server,
-                             std::uint16_t namespace_index,
-                             const std::string &parent_path,
-                             const std::string &path,
-                             const std::string &browse_name,
-                             const std::string &description,
-                             const std::string &value, std::string *error) {
+bool addStaticStringVariable(
+    ::opcua::Server &server, std::uint16_t namespace_index,
+    const std::string &parent_path, const std::string &path,
+    const std::string &browse_name, const std::string &description,
+    const std::string &value, bool property, std::string *error) {
   ::opcua::VariableAttributes attributes;
   attributes.setDisplayName(::opcua::LocalizedText("en-US", browse_name));
   if (!description.empty()) {
@@ -270,7 +268,8 @@ bool addStaticStringVariable(::opcua::Server &server,
       server, nodeId(namespace_index, parent_path),
       nodeId(namespace_index, path), browse_name, attributes,
       ::opcua::VariableTypeId::BaseDataVariableType,
-      ::opcua::ReferenceTypeId::HasComponent);
+      property ? ::opcua::ReferenceTypeId::HasProperty
+               : ::opcua::ReferenceTypeId::HasComponent);
   if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
     assignError(error, "failed to create OPC UA variable node '" + path +
                            "': " + statusName(result.code()));
@@ -281,21 +280,73 @@ bool addStaticStringVariable(::opcua::Server &server,
 
 NodeSpec staticStringSpec(std::string path, std::string parent_path,
                           std::string browse_name, std::string description,
-                          std::string value) {
+                          std::string value, bool property = false) {
   NodeSpec spec;
   spec.kind = NodeKind::variable;
   spec.path = std::move(path);
   spec.parent_path = std::move(parent_path);
   spec.browse_name = std::move(browse_name);
   spec.fingerprint = "string|" + spec.parent_path + "|" + spec.browse_name +
-                     "|" + description + "|" + value;
+                     "|" + description + "|" + value +
+                     (property ? "|property" : "|component");
   spec.create = [path = spec.path, parent = spec.parent_path,
                  name = spec.browse_name, description = std::move(description),
-                 value = std::move(value)](::opcua::Server &server,
-                                           std::uint16_t namespace_index,
-                                           std::string *error) {
+                 value = std::move(value),
+                 property](::opcua::Server &server,
+                           std::uint16_t namespace_index, std::string *error) {
     return addStaticStringVariable(server, namespace_index, parent, path, name,
-                                   description, value, error);
+                                   description, value, property, error);
+  };
+  return spec;
+}
+
+template <typename T>
+NodeSpec staticArrayPropertySpec(std::string path, std::string parent_path,
+                                 std::string browse_name,
+                                 std::string description, std::vector<T> values,
+                                 ::opcua::NodeId data_type) {
+  NodeSpec spec;
+  spec.kind = NodeKind::variable;
+  spec.path = std::move(path);
+  spec.parent_path = std::move(parent_path);
+  spec.browse_name = std::move(browse_name);
+  std::ostringstream fingerprint;
+  fingerprint << "array-property|" << spec.parent_path << '|'
+              << spec.browse_name << '|' << description;
+  for (const auto &value : values) {
+    fingerprint << '|' << value;
+  }
+  spec.fingerprint = fingerprint.str();
+  spec.create = [path = spec.path, parent = spec.parent_path,
+                 name = spec.browse_name, description = std::move(description),
+                 values = std::move(values), data_type = std::move(data_type)](
+                    ::opcua::Server &server, std::uint16_t namespace_index,
+                    std::string *error) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", name));
+    attributes.setDescription(::opcua::LocalizedText("en-US", description));
+    ::opcua::Variant encoded(values);
+    if (!encoded.isType(data_type)) {
+      assignError(error,
+                  "RTT metadata Variant type mismatch for '" + path + "'");
+      return false;
+    }
+    attributes.setValue(std::move(encoded));
+    attributes.setDataType(data_type);
+    attributes.setValueRank(::opcua::ValueRank::OneDimension);
+    attributes.setArrayDimensions({0U});
+    attributes.setAccessLevel(readOnlyAccess());
+    attributes.setUserAccessLevel(readOnlyAccess());
+    const auto result = ::opcua::services::addVariable(
+        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
+        name, attributes, ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::HasProperty);
+    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
+      assignError(error, "failed to create RTT metadata node '" + path +
+                             "': " + statusName(result.code()));
+      return false;
+    }
+    return true;
   };
   return spec;
 }
@@ -588,6 +639,30 @@ void appendOperationNodes(
     if (!schema.supported) {
       continue;
     }
+    const std::string operation_path = appendNodeSegment(operations_path, name);
+    if (!schema.input_type_names.empty()) {
+      insertNode(nodes,
+                 staticArrayPropertySpec(
+                     appendNodeSegment(operation_path, "rttInputTypes"),
+                     operation_path, "rttInputTypes",
+                     "Canonical RTT input argument types.",
+                     schema.input_type_names, ::opcua::DataTypeId::String));
+    }
+    if (!schema.output_type_names.empty()) {
+      insertNode(nodes,
+                 staticArrayPropertySpec(
+                     appendNodeSegment(operation_path, "rttOutputTypes"),
+                     operation_path, "rttOutputTypes",
+                     "Canonical RTT output argument types.",
+                     schema.output_type_names, ::opcua::DataTypeId::String));
+      insertNode(
+          nodes,
+          staticArrayPropertySpec(
+              appendNodeSegment(operation_path, "rttOutputSources"),
+              operation_path, "rttOutputSources",
+              "Return value (-1) or mutable input index for each output.",
+              schema.output_sources, ::opcua::DataTypeId::Int32));
+    }
     insertNode(nodes,
                operationSpec(operations_path, name, operation->description(),
                              service, *operation, state, dispatcher,
@@ -629,6 +704,11 @@ void appendConfigurationNodes(NodeMap &nodes,
     insertNode(nodes,
                dataSourceSpec(properties_path, name, property->getDescription(),
                               source, state, true));
+    const std::string property_path = appendNodeSegment(properties_path, name);
+    insertNode(nodes, staticStringSpec(
+                          appendNodeSegment(property_path, "rttType"),
+                          property_path, "rttType", "Canonical RTT value type.",
+                          source->getTypeInfo()->getTypeName(), true));
   }
 
   const std::string attributes_path =
@@ -645,6 +725,12 @@ void appendConfigurationNodes(NodeMap &nodes,
     }
     insertNode(nodes,
                dataSourceSpec(attributes_path, name, {}, source, state, false));
+    const std::string attribute_path = appendNodeSegment(attributes_path, name);
+    insertNode(nodes,
+               staticStringSpec(appendNodeSegment(attribute_path, "rttType"),
+                                attribute_path, "rttType",
+                                "Canonical RTT value type.",
+                                source->getTypeInfo()->getTypeName(), true));
   }
 }
 

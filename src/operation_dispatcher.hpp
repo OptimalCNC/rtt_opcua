@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,6 +22,9 @@ struct OperationSchema {
   std::string fingerprint;
   std::vector<::opcua::Argument> inputs;
   std::vector<::opcua::Argument> outputs;
+  std::vector<std::string> input_type_names;
+  std::vector<std::string> output_type_names;
+  std::vector<std::int32_t> output_sources;
 };
 
 class OperationDispatcher final {

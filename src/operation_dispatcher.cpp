@@ -165,6 +165,7 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
       schema.inputs.emplace_back(
           name, ::opcua::LocalizedText("en-US", description),
           protocol->dataTypeNodeId(), protocol->valueRank());
+      schema.input_type_names.push_back(type->getTypeName());
       fingerprint << "|in:" << name << ':' << description << ':'
                   << type->getTypeName();
     }
@@ -197,17 +198,21 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
       if (index == 0U && has_return_value) {
         name = "result";
         description = operation.description();
+        schema.output_sources.push_back(-1);
       } else if (mutable_index < mutable_arguments.size()) {
         const std::size_t argument_index = mutable_arguments[mutable_index++];
         name = argumentName(arguments, argument_index);
         description = argumentDescription(arguments, argument_index);
+        schema.output_sources.push_back(
+            static_cast<std::int32_t>(argument_index));
       } else {
-        name = "output" + std::to_string(index + 1U);
+        return OperationSchema{};
       }
 
       schema.outputs.emplace_back(
           name, ::opcua::LocalizedText("en-US", description),
           protocol->dataTypeNodeId(), protocol->valueRank());
+      schema.output_type_names.push_back(type->getTypeName());
       fingerprint << "|out:" << name << ':' << description << ':'
                   << type->getTypeName();
     }
