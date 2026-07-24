@@ -1,5 +1,8 @@
 #include <rtt/opcua/object_model.hpp>
 
+#include "component_state.hpp"
+#include "operation_dispatcher.hpp"
+
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/type_protocol.hpp>
 
@@ -8,6 +11,7 @@
 #include <open62541pp/services/nodemanagement.hpp>
 #include <open62541pp/ua/nodeids.hpp>
 
+#include <rtt/OperationInterfacePart.hpp>
 #include <rtt/Service.hpp>
 #include <rtt/TaskContext.hpp>
 #include <rtt/base/AttributeBase.hpp>
@@ -33,83 +37,9 @@
 
 namespace RTT::opcua {
 namespace detail {
-
-struct ComponentState {
-  explicit ComponentState(RTT::TaskContext &value)
-      : component(&value), component_name(value.getName()) {}
-
-  mutable std::mutex mutex;
-  std::condition_variable condition;
-  RTT::TaskContext *component;
-  const std::string component_name;
-  bool is_active{true};
-  std::size_t users{0U};
-};
-
 namespace {
 
 constexpr std::size_t kMaximumServiceDepth = 32U;
-
-class ComponentLease final {
-public:
-  explicit ComponentLease(const std::shared_ptr<ComponentState> &state)
-      : state_(state) {
-    if (!state_) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    if (!state_->is_active || state_->component == nullptr) {
-      state_.reset();
-      return;
-    }
-    ++state_->users;
-    component_ = state_->component;
-  }
-
-  ~ComponentLease() { release(); }
-
-  ComponentLease(const ComponentLease &) = delete;
-  ComponentLease &operator=(const ComponentLease &) = delete;
-
-  explicit operator bool() const noexcept { return component_ != nullptr; }
-
-  RTT::TaskContext *get() const noexcept { return component_; }
-
-private:
-  void release() noexcept {
-    if (!state_) {
-      return;
-    }
-    {
-      std::lock_guard<std::mutex> lock(state_->mutex);
-      --state_->users;
-    }
-    state_->condition.notify_all();
-    state_.reset();
-    component_ = nullptr;
-  }
-
-  std::shared_ptr<ComponentState> state_;
-  RTT::TaskContext *component_{nullptr};
-};
-
-void deactivate(const std::shared_ptr<ComponentState> &state) noexcept {
-  if (!state) {
-    return;
-  }
-  std::unique_lock<std::mutex> lock(state->mutex);
-  state->is_active = false;
-  state->condition.wait(lock, [&state] { return state->users == 0U; });
-  state->component = nullptr;
-}
-
-bool isActive(const std::shared_ptr<ComponentState> &state) noexcept {
-  if (!state) {
-    return false;
-  }
-  std::lock_guard<std::mutex> lock(state->mutex);
-  return state->is_active && state->component != nullptr;
-}
 
 std::string appendNodeSegment(std::string path, std::string_view segment) {
   path += '/';
@@ -263,7 +193,7 @@ private:
   std::weak_ptr<ComponentState> state_;
 };
 
-enum class NodeKind { object, variable };
+enum class NodeKind { object, variable, method };
 
 struct NodeSpec {
   NodeKind kind;
@@ -473,8 +403,91 @@ NodeSpec dataSourceSpec(const std::string &parent_path, const std::string &name,
   return spec;
 }
 
+NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
+                       const std::string &description,
+                       const RTT::Service::shared_ptr &service,
+                       RTT::OperationInterfacePart &operation,
+                       const std::shared_ptr<ComponentState> &state,
+                       const std::shared_ptr<OperationDispatcher> &dispatcher,
+                       OperationSchema schema) {
+  NodeSpec spec;
+  spec.kind = NodeKind::method;
+  spec.parent_path = parent_path;
+  spec.path = appendNodeSegment(parent_path, name);
+  spec.browse_name = name;
+  spec.fingerprint = "method|" + spec.parent_path + "|" + spec.browse_name +
+                     "|" + description + "|" + schema.fingerprint;
+  spec.create = [path = spec.path, parent = spec.parent_path, name, description,
+                 service, operation = &operation,
+                 weak_state = std::weak_ptr<ComponentState>(state), dispatcher,
+                 schema = std::move(schema)](::opcua::Server &server,
+                                             std::uint16_t namespace_index,
+                                             std::string *error) {
+    ::opcua::MethodAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", name));
+    if (!description.empty()) {
+      attributes.setDescription(::opcua::LocalizedText("en-US", description));
+    }
+    attributes.setExecutable(true);
+    attributes.setUserExecutable(true);
+
+    ::opcua::services::MethodCallback callback =
+        std::function<::opcua::StatusCode(
+            ::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
+            ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
+            const ::opcua::NodeId &)>(
+            [service, operation, weak_state,
+             dispatcher](::opcua::Session &,
+                         ::opcua::Span<const ::opcua::Variant> inputs,
+                         ::opcua::Span<::opcua::Variant> outputs,
+                         const ::opcua::NodeId &, const ::opcua::NodeId &) {
+              static_cast<void>(service);
+              const auto current_state = weak_state.lock();
+              if (!current_state || operation == nullptr) {
+                return ::opcua::StatusCode(UA_STATUSCODE_BADNOTCONNECTED);
+              }
+              return dispatcher->invoke(current_state, *operation, inputs,
+                                        outputs);
+            });
+
+    const auto result = ::opcua::services::addMethod(
+        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
+        name, std::move(callback), schema.inputs, schema.outputs, attributes,
+        ::opcua::ReferenceTypeId::HasComponent);
+    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
+      assignError(error, "failed to create RTT operation node '" + path +
+                             "': " + statusName(result.code()));
+      return false;
+    }
+    return true;
+  };
+  return spec;
+}
+
 void insertNode(NodeMap &nodes, NodeSpec spec) {
   nodes.insert_or_assign(spec.path, std::move(spec));
+}
+
+void appendOperationNodes(
+    NodeMap &nodes, const RTT::Service::shared_ptr &service,
+    const std::string &owner_path, const std::shared_ptr<ComponentState> &state,
+    const std::shared_ptr<OperationDispatcher> &dispatcher) {
+  const std::string operations_path =
+      appendNodeSegment(owner_path, "operations");
+  for (const std::string &name : service->getOperationNames()) {
+    RTT::OperationInterfacePart *operation = service->getOperation(name);
+    if (operation == nullptr) {
+      continue;
+    }
+    OperationSchema schema = dispatcher->describe(*operation);
+    if (!schema.supported) {
+      continue;
+    }
+    insertNode(nodes,
+               operationSpec(operations_path, name, operation->description(),
+                             service, *operation, state, dispatcher,
+                             std::move(schema)));
+  }
 }
 
 void appendResourceFolders(NodeMap &nodes, const std::string &owner_path,
@@ -564,12 +577,12 @@ void appendPortNodes(NodeMap &nodes, const RTT::Service::shared_ptr &service,
   }
 }
 
-void appendServiceContents(NodeMap &nodes,
-                           const RTT::Service::shared_ptr &service,
-                           const std::string &service_path,
-                           const std::shared_ptr<ComponentState> &state,
-                           std::set<const RTT::Service *> &ancestry,
-                           std::size_t depth) {
+void appendServiceContents(
+    NodeMap &nodes, const RTT::Service::shared_ptr &service,
+    const std::string &service_path,
+    const std::shared_ptr<ComponentState> &state,
+    const std::shared_ptr<OperationDispatcher> &dispatcher,
+    std::set<const RTT::Service *> &ancestry, std::size_t depth) {
   if (!service || depth > kMaximumServiceDepth ||
       ancestry.contains(service.get())) {
     return;
@@ -578,6 +591,7 @@ void appendServiceContents(NodeMap &nodes,
 
   appendResourceFolders(nodes, service_path, service->doc());
   appendConfigurationNodes(nodes, service, service_path, state);
+  appendOperationNodes(nodes, service, service_path, state, dispatcher);
   appendPortNodes(nodes, service, service_path);
 
   const std::string services_path = appendNodeSegment(service_path, "services");
@@ -592,15 +606,17 @@ void appendServiceContents(NodeMap &nodes,
     const std::string child_path = appendNodeSegment(services_path, name);
     insertNode(nodes,
                objectSpec(child_path, services_path, name, child->doc()));
-    appendServiceContents(nodes, child, child_path, state, ancestry,
+    appendServiceContents(nodes, child, child_path, state, dispatcher, ancestry,
                           depth + 1U);
   }
 
   ancestry.erase(service.get());
 }
 
-NodeMap snapshotComponent(const std::shared_ptr<ComponentState> &state,
-                          RTT::TaskContext &component) {
+NodeMap
+snapshotComponent(const std::shared_ptr<ComponentState> &state,
+                  RTT::TaskContext &component,
+                  const std::shared_ptr<OperationDispatcher> &dispatcher) {
   NodeMap nodes;
   const std::string components_path = appendNodeSegment("rtt", "components");
   const std::string component_path =
@@ -612,7 +628,7 @@ NodeMap snapshotComponent(const std::shared_ptr<ComponentState> &state,
 
   std::set<const RTT::Service *> ancestry;
   appendServiceContents(nodes, component.provides(), component_path, state,
-                        ancestry, 0U);
+                        dispatcher, ancestry, 0U);
   return nodes;
 }
 
@@ -636,7 +652,9 @@ class ObjectModelImpl final
     : public std::enable_shared_from_this<ObjectModelImpl> {
 public:
   ObjectModelImpl(Server &model_server, ObjectModelOptions model_options)
-      : server(model_server), options(std::move(model_options)) {}
+      : server(model_server), options(std::move(model_options)),
+        dispatcher(
+            std::make_shared<OperationDispatcher>(options.operation_timeout)) {}
 
   ~ObjectModelImpl() { shutdown(); }
 
@@ -656,6 +674,7 @@ public:
         if (stop.stop_requested() || self->shutdown_started.load()) {
           return;
         }
+        self->dispatcher->reapPending();
         self->reconcile(nullptr);
       }
     });
@@ -671,6 +690,10 @@ public:
     }
     if (options.reconcile_interval <= std::chrono::milliseconds::zero()) {
       assignError(error, "object model reconcile interval must be positive");
+      return {};
+    }
+    if (options.operation_timeout <= std::chrono::milliseconds::zero()) {
+      assignError(error, "object model operation timeout must be positive");
       return {};
     }
 
@@ -772,7 +795,8 @@ public:
             if (!lease) {
               continue;
             }
-            const NodeMap expected = snapshotComponent(state, *lease.get());
+            const NodeMap expected =
+                snapshotComponent(state, *lease.get(), self->dispatcher);
             bool component_changed = false;
             if (!self->reconcileComponent(native, *namespace_index, state.get(),
                                           expected, &component_changed,
@@ -809,6 +833,10 @@ public:
     return components.size();
   }
 
+  std::size_t pendingOperationCount() const noexcept {
+    return dispatcher->pendingCount();
+  }
+
   std::string lastError() const {
     std::lock_guard<std::mutex> lock(error_mutex);
     return last_error;
@@ -824,6 +852,7 @@ public:
     if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {
       worker.join();
     }
+    dispatcher->drainPending();
 
     std::vector<std::shared_ptr<ComponentState>> states;
     {
@@ -1026,6 +1055,7 @@ private:
 
   Server &server;
   ObjectModelOptions options;
+  std::shared_ptr<OperationDispatcher> dispatcher;
   mutable std::mutex registry_mutex;
   std::map<std::string, std::shared_ptr<ComponentState>> components;
   mutable std::mutex model_mutex;
@@ -1114,6 +1144,10 @@ std::uint64_t ObjectModel::revision() const noexcept {
 
 std::size_t ObjectModel::componentCount() const noexcept {
   return impl_->componentCount();
+}
+
+std::size_t ObjectModel::pendingOperationCount() const noexcept {
+  return impl_->pendingOperationCount();
 }
 
 std::string ObjectModel::lastError() const { return impl_->lastError(); }

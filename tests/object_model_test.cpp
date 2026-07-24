@@ -8,11 +8,13 @@
 
 #include <open62541pp/client.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
+#include <open62541pp/services/method.hpp>
 
 #include <rtt/InputPort.hpp>
 #include <rtt/OutputPort.hpp>
 #include <rtt/Service.hpp>
 #include <rtt/TaskContext.hpp>
+#include <rtt/internal/GlobalEngine.hpp>
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/Types.hpp>
 
@@ -21,6 +23,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -84,6 +87,49 @@ struct CanonicalTypesFixture {
     }
     BOOST_REQUIRE(RTT::opcua::registerCanonicalTypeProtocols());
   }
+};
+
+class OperationComponent final : public RTT::TaskContext {
+public:
+  OperationComponent() : RTT::TaskContext("calculator") {
+    addOperation("add", &OperationComponent::add, this, RTT::OwnThread)
+        .doc("Add two signed values.")
+        .arg("left", "Left operand.")
+        .arg("right", "Right operand.");
+    addOperation("increment", &OperationComponent::increment, this,
+                 RTT::OwnThread)
+        .doc("Increment a value in place.")
+        .arg("value", "Value to increment.");
+    addOperation("onOwnerThread", &OperationComponent::onOwnerThread, this,
+                 RTT::OwnThread)
+        .doc("Report whether RTT dispatched to the component engine.");
+    addOperation("onGlobalEngine", &OperationComponent::onGlobalEngine, this,
+                 RTT::ClientThread)
+        .doc("Report whether RTT dispatched to the global engine.");
+    addOperation("slow", &OperationComponent::slow, this, RTT::OwnThread)
+        .doc("Sleep for the requested duration.")
+        .arg("milliseconds", "Sleep duration in milliseconds.");
+  }
+
+  std::int32_t add(std::int32_t left, std::int32_t right) {
+    return left + right;
+  }
+
+  void increment(std::int32_t &value) { ++value; }
+
+  bool onOwnerThread() const { return engine()->isSelf(); }
+
+  bool onGlobalEngine() const {
+    return RTT::internal::GlobalEngine::Instance()->isSelf();
+  }
+
+  bool slow(std::uint32_t milliseconds) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+    slow_completed.store(true);
+    return true;
+  }
+
+  std::atomic_bool slow_completed{false};
 };
 
 } // namespace
@@ -206,6 +252,99 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(!::opcua::services::readBrowseName(client, component_id));
 
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    operations_dispatch_on_rtt_engines_and_retain_timed_out_calls,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::milliseconds(10);
+  model_options.operation_timeout = std::chrono::milliseconds(30);
+  RTT::opcua::ObjectModel model(server, model_options);
+
+  OperationComponent component;
+  auto registration = model.registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  ::opcua::ClientConfig client_config;
+  client_config.setTimeout(2000U);
+  ::opcua::Client client(std::move(client_config));
+  client.connect(server.endpointUrl());
+
+  const auto operations_id =
+      modelNodeId(namespace_index, {"components", "calculator", "operations"});
+  const auto add_id = modelNodeId(
+      namespace_index, {"components", "calculator", "operations", "add"});
+  const auto increment_id = modelNodeId(
+      namespace_index, {"components", "calculator", "operations", "increment"});
+  const auto owner_thread_id =
+      modelNodeId(namespace_index,
+                  {"components", "calculator", "operations", "onOwnerThread"});
+  const auto global_engine_id =
+      modelNodeId(namespace_index,
+                  {"components", "calculator", "operations", "onGlobalEngine"});
+  const auto slow_id = modelNodeId(
+      namespace_index, {"components", "calculator", "operations", "slow"});
+
+  const std::vector<::opcua::Variant> add_inputs{
+      ::opcua::Variant(std::int32_t{20}), ::opcua::Variant(std::int32_t{22})};
+  const auto add_result =
+      ::opcua::services::call(client, operations_id, add_id, add_inputs);
+  BOOST_REQUIRE(add_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(add_result.outputArguments().size(), 1U);
+  BOOST_TEST(add_result.outputArguments()[0].to<std::int32_t>() == 42);
+
+  const std::vector<::opcua::Variant> increment_inputs{
+      ::opcua::Variant(std::int32_t{4})};
+  const auto increment_result = ::opcua::services::call(
+      client, operations_id, increment_id, increment_inputs);
+  BOOST_REQUIRE(increment_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(increment_result.outputArguments().size(), 1U);
+  BOOST_TEST(increment_result.outputArguments()[0].to<std::int32_t>() == 5);
+
+  const auto owner_thread_result =
+      ::opcua::services::call(client, operations_id, owner_thread_id, {});
+  BOOST_REQUIRE(owner_thread_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(owner_thread_result.outputArguments().size(), 1U);
+  BOOST_TEST(owner_thread_result.outputArguments()[0].to<bool>());
+
+  const auto global_engine_result =
+      ::opcua::services::call(client, operations_id, global_engine_id, {});
+  BOOST_REQUIRE(global_engine_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(global_engine_result.outputArguments().size(), 1U);
+  BOOST_TEST(global_engine_result.outputArguments()[0].to<bool>());
+
+  const std::vector<::opcua::Variant> wrong_inputs{
+      ::opcua::Variant(std::string("not-an-integer")),
+      ::opcua::Variant(std::int32_t{2})};
+  const auto wrong_result =
+      ::opcua::services::call(client, operations_id, add_id, wrong_inputs);
+  BOOST_TEST(wrong_result.statusCode() == UA_STATUSCODE_BADINVALIDARGUMENT);
+
+  const std::vector<::opcua::Variant> slow_inputs{
+      ::opcua::Variant(std::uint32_t{120})};
+  const auto started_at = std::chrono::steady_clock::now();
+  const auto slow_result =
+      ::opcua::services::call(client, operations_id, slow_id, slow_inputs);
+  const auto elapsed = std::chrono::steady_clock::now() - started_at;
+  BOOST_TEST(slow_result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
+  BOOST_TEST(elapsed < std::chrono::milliseconds(100));
+  BOOST_TEST(model.pendingOperationCount() == 1U);
+  BOOST_REQUIRE(waitUntil([&] {
+    return component.slow_completed.load() &&
+           model.pendingOperationCount() == 0U;
+  }));
+
+  registration->reset();
   client.disconnect();
   server.stop();
 }

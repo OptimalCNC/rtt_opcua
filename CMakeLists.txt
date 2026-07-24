@@ -21,6 +21,7 @@ orocos_library(
   orocos-rtt-opcua
   src/node_id.cpp
   src/object_model.cpp
+  src/operation_dispatcher.cpp
   src/server.cpp
   src/server_options.cpp
   src/type_descriptor.cpp

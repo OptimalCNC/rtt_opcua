@@ -66,6 +66,7 @@ public:
 
   std::uint64_t revision() const noexcept;
   std::size_t componentCount() const noexcept;
+  std::size_t pendingOperationCount() const noexcept;
   std::string lastError() const;
 
 private:
