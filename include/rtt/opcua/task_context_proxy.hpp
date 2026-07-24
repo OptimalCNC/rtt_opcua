@@ -43,6 +43,28 @@ public:
   bool synchronize(std::string *error = nullptr);
   bool ready() override;
 
+  bool configure() override;
+  bool activate() override;
+  bool start() override;
+  bool stop() override;
+  bool cleanup() override;
+  bool recover() override;
+  bool isConfigured() const override;
+  bool isActive() const override;
+  bool isRunning() const override;
+  bool inFatalError() const override;
+  bool inException() const override;
+  bool inRunTimeError() const override;
+  TaskState getTaskState() const override;
+  TaskState getTargetState() const override;
+  Seconds getPeriod() const override;
+  bool setPeriod(Seconds period) override;
+  unsigned getCpuAffinity() const override;
+  bool setCpuAffinity(unsigned cpu) override;
+  bool update() override;
+  bool trigger() override;
+  void error() override;
+
   ProxyConnectionState connectionState() const noexcept;
   std::string endpointUrl() const;
   std::string lastError() const;

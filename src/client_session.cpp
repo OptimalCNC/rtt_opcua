@@ -33,6 +33,28 @@ std::string statusMessage(std::string_view operation,
   return message;
 }
 
+bool invalidatesInterface(::opcua::StatusCode status) noexcept {
+  const UA_StatusCode code = status.get();
+  return code == UA_STATUSCODE_BADNODEIDINVALID ||
+         code == UA_STATUSCODE_BADNODEIDUNKNOWN ||
+         code == UA_STATUSCODE_BADNOTFOUND ||
+         code == UA_STATUSCODE_BADMETHODINVALID ||
+         code == UA_STATUSCODE_BADSESSIONIDINVALID ||
+         code == UA_STATUSCODE_BADSESSIONCLOSED ||
+         code == UA_STATUSCODE_BADSESSIONNOTACTIVATED ||
+         code == UA_STATUSCODE_BADSECURECHANNELIDINVALID ||
+         code == UA_STATUSCODE_BADSECURECHANNELCLOSED ||
+         code == UA_STATUSCODE_BADSECURECHANNELTOKENUNKNOWN ||
+         code == UA_STATUSCODE_BADCONNECTIONREJECTED ||
+         code == UA_STATUSCODE_BADCONNECTIONCLOSED ||
+         code == UA_STATUSCODE_BADSERVERNOTCONNECTED ||
+         code == UA_STATUSCODE_BADNOTCONNECTED ||
+         code == UA_STATUSCODE_BADCOMMUNICATIONERROR ||
+         code == UA_STATUSCODE_BADTIMEOUT ||
+         code == UA_STATUSCODE_BADTYPEMISMATCH ||
+         code == UA_STATUSCODE_BADINVALIDARGUMENT;
+}
+
 std::string modelPath(std::string_view component,
                       const RemoteServicePath &service_path,
                       std::span<const std::string_view> trailing_segments) {
@@ -622,6 +644,48 @@ bool ClientSession::readServiceDescription(
   }
 }
 
+bool ClientSession::readLifecycleState(const std::string &component_name,
+                                       std::string *lifecycle_state,
+                                       std::string *error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (lifecycle_state == nullptr) {
+    last_error_ = "remote RTT lifecycle state destination must not be null";
+    assignError(error, last_error_);
+    return false;
+  }
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    assignError(error, last_error_);
+    return false;
+  }
+
+  try {
+    const std::vector<std::string_view> state_segment{"lifecycleState"};
+    const ::opcua::NodeId state_id(
+        namespace_index_, modelPath(component_name, {}, state_segment));
+    if (!readStringValue(*client_, state_id, "remote RTT lifecycle state",
+                         lifecycle_state, &last_error_)) {
+      if (!client_->isConnected()) {
+        state_.store(ProxyConnectionState::stale);
+      }
+      assignError(error, last_error_);
+      return false;
+    }
+    last_error_.clear();
+    assignError(error, "");
+    return true;
+  } catch (const std::exception &exception) {
+    last_error_ =
+        std::string("failed to read remote RTT lifecycle state: ") +
+        exception.what();
+    if (!client_->isConnected()) {
+      state_.store(ProxyConnectionState::stale);
+    }
+    assignError(error, last_error_);
+    return false;
+  }
+}
+
 std::vector<RemoteServiceDescription>
 ClientSession::discoverServices(const std::string &component_name,
                                 const RemoteServicePath &service_path,
@@ -873,6 +937,11 @@ bool ClientSession::readValue(const ::opcua::NodeId &node_id,
     last_error_ = "remote RTT value destination must not be null";
     return false;
   }
+  if (!interface_access_enabled_.load()) {
+    last_error_ =
+        "remote RTT interface is stale; synchronize it before reading values";
+    return false;
+  }
   if (!client_ || state_.load() != ProxyConnectionState::connected) {
     last_error_ = "OPC UA client is not connected";
     return false;
@@ -881,10 +950,10 @@ bool ClientSession::readValue(const ::opcua::NodeId &node_id,
   try {
     const auto result = ::opcua::services::readValue(*client_, node_id);
     if (!result) {
-      last_error_ =
-          statusMessage("failed to read remote RTT value", result.code());
-      if (!client_->isConnected()) {
-        state_.store(ProxyConnectionState::stale);
+      const ::opcua::StatusCode status = result.code();
+      last_error_ = statusMessage("failed to read remote RTT value", status);
+      if (invalidatesInterface(status) || !client_->isConnected()) {
+        invalidateInterfaceLocked();
       }
       return false;
     }
@@ -894,9 +963,7 @@ bool ClientSession::readValue(const ::opcua::NodeId &node_id,
   } catch (const std::exception &exception) {
     last_error_ =
         std::string("failed to read remote RTT value: ") + exception.what();
-    if (!client_->isConnected()) {
-      state_.store(ProxyConnectionState::stale);
-    }
+    invalidateInterfaceLocked();
     return false;
   }
 }
@@ -904,6 +971,11 @@ bool ClientSession::readValue(const ::opcua::NodeId &node_id,
 bool ClientSession::writeValue(const ::opcua::NodeId &node_id,
                                const ::opcua::Variant &value) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!interface_access_enabled_.load()) {
+    last_error_ =
+        "remote RTT interface is stale; synchronize it before writing values";
+    return false;
+  }
   if (!client_ || state_.load() != ProxyConnectionState::connected) {
     last_error_ = "OPC UA client is not connected";
     return false;
@@ -914,8 +986,8 @@ bool ClientSession::writeValue(const ::opcua::NodeId &node_id,
         ::opcua::services::writeValue(*client_, node_id, value);
     if (!status.isGood()) {
       last_error_ = statusMessage("failed to write remote RTT value", status);
-      if (!client_->isConnected()) {
-        state_.store(ProxyConnectionState::stale);
+      if (invalidatesInterface(status) || !client_->isConnected()) {
+        invalidateInterfaceLocked();
       }
       return false;
     }
@@ -924,9 +996,7 @@ bool ClientSession::writeValue(const ::opcua::NodeId &node_id,
   } catch (const std::exception &exception) {
     last_error_ =
         std::string("failed to write remote RTT value: ") + exception.what();
-    if (!client_->isConnected()) {
-      state_.store(ProxyConnectionState::stale);
-    }
+    invalidateInterfaceLocked();
     return false;
   }
 }
@@ -936,7 +1006,63 @@ ClientSession::call(const ::opcua::NodeId &object_id,
                     const ::opcua::NodeId &method_id,
                     const std::vector<::opcua::Variant> &inputs) {
   std::lock_guard<std::mutex> lock(mutex_);
+  return callLocked(object_id, method_id, inputs, true, false);
+}
+
+RemoteCallResult
+ClientSession::callPort(const ::opcua::NodeId &object_id,
+                        const ::opcua::NodeId &method_id,
+                        const std::vector<::opcua::Variant> &inputs) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return callLocked(object_id, method_id, inputs, true, true);
+}
+
+RemoteCallResult ClientSession::callOperation(
+    const std::string &component_name,
+    const RemoteServicePath &service_path, const std::string &operation_name,
+    const std::vector<::opcua::Variant> &inputs) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::vector<std::string_view> operation_folder{"operations"};
+  const std::vector<std::string_view> operation_method{"operations",
+                                                        operation_name};
+  return callLocked(
+      ::opcua::NodeId(
+          namespace_index_,
+          modelPath(component_name, service_path, operation_folder)),
+      ::opcua::NodeId(
+          namespace_index_,
+          modelPath(component_name, service_path, operation_method)),
+      inputs, false, false);
+}
+
+void ClientSession::setInterfaceAccessEnabled(bool enabled) {
+  if (!enabled) {
+    interface_access_enabled_.store(false);
+  }
+  const std::lock_guard<std::mutex> lock(mutex_);
+  interface_access_enabled_.store(enabled);
+  if (enabled) {
+    last_error_.clear();
+  }
+}
+
+void ClientSession::invalidateInterfaceLocked() noexcept {
+  interface_access_enabled_.store(false);
+  state_.store(ProxyConnectionState::stale);
+}
+
+RemoteCallResult ClientSession::callLocked(
+    const ::opcua::NodeId &object_id, const ::opcua::NodeId &method_id,
+    const std::vector<::opcua::Variant> &inputs,
+    bool require_interface_access, bool tolerate_not_connected) {
   RemoteCallResult call_result;
+  if (require_interface_access && !interface_access_enabled_.load()) {
+    call_result.error =
+        "remote RTT interface is stale; synchronize it before calling "
+        "operations";
+    last_error_ = call_result.error;
+    return call_result;
+  }
   if (!client_ || state_.load() != ProxyConnectionState::connected) {
     call_result.error = "OPC UA client is not connected";
     last_error_ = call_result.error;
@@ -947,11 +1073,16 @@ ClientSession::call(const ::opcua::NodeId &object_id,
     const auto result =
         ::opcua::services::call(*client_, object_id, method_id, inputs);
     if (!result.statusCode().isGood()) {
+      const ::opcua::StatusCode status = result.statusCode();
       call_result.error =
-          statusMessage("remote RTT operation failed", result.statusCode());
+          statusMessage("remote RTT operation failed", status);
       last_error_ = call_result.error;
-      if (!client_->isConnected()) {
-        state_.store(ProxyConnectionState::stale);
+      const bool expected_port_disconnect =
+          tolerate_not_connected &&
+          status.get() == UA_STATUSCODE_BADNOTCONNECTED;
+      if ((!expected_port_disconnect && invalidatesInterface(status)) ||
+          !client_->isConnected()) {
+        invalidateInterfaceLocked();
       }
       return call_result;
     }
@@ -964,7 +1095,7 @@ ClientSession::call(const ::opcua::NodeId &object_id,
     call_result.error =
         std::string("remote RTT operation call failed: ") + exception.what();
     last_error_ = call_result.error;
-    state_.store(ProxyConnectionState::stale);
+    invalidateInterfaceLocked();
     return call_result;
   }
 }

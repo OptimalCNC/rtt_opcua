@@ -39,6 +39,31 @@ void assignError(std::string *output, const std::string &message) {
 
 constexpr std::size_t kMaximumServiceDepth = 32U;
 
+bool parseTaskState(std::string_view name,
+                    RTT::base::TaskCore::TaskState *state) {
+  if (state == nullptr) {
+    return false;
+  }
+  if (name == "Init") {
+    *state = RTT::base::TaskCore::Init;
+  } else if (name == "PreOperational") {
+    *state = RTT::base::TaskCore::PreOperational;
+  } else if (name == "FatalError") {
+    *state = RTT::base::TaskCore::FatalError;
+  } else if (name == "Exception") {
+    *state = RTT::base::TaskCore::Exception;
+  } else if (name == "Stopped") {
+    *state = RTT::base::TaskCore::Stopped;
+  } else if (name == "Running") {
+    *state = RTT::base::TaskCore::Running;
+  } else if (name == "RunTimeError") {
+    *state = RTT::base::TaskCore::RunTimeError;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 template <typename Callback> class ScopeExit final {
 public:
   explicit ScopeExit(Callback callback) : callback_(std::move(callback)) {}
@@ -299,13 +324,148 @@ std::ostream &operator<<(std::ostream &stream, ProxyConnectionState state) {
 
 class TaskContextProxy::Impl final {
 public:
-  Impl(std::string endpoint_url, TaskContextProxyOptions options)
+  Impl(std::string endpoint_url, std::string component_name,
+       TaskContextProxyOptions options)
       : session(std::make_shared<detail::ClientSession>(
             std::move(endpoint_url), options.request_timeout)),
+        component_name(std::move(component_name)),
         port_poll_interval(options.port_poll_interval),
         port_thread([this](std::stop_token stop) { pumpPorts(stop); }) {}
 
   ~Impl() { stopPortPump(); }
+
+  template <typename Result, typename... Arguments>
+  Result invokeOperation(std::string_view operation_name, Result fallback,
+                         Arguments... arguments) {
+    const std::lock_guard<std::mutex> lock(synchronize_mutex);
+    if (!interface_ready.load()) {
+      setControlError("remote RTT interface is not ready");
+      return fallback;
+    }
+    if (interface_stale.load()) {
+      setControlError("remote RTT interface is stale; synchronize it before "
+                      "calling operations");
+      return fallback;
+    }
+
+    std::vector<::opcua::Variant> inputs;
+    inputs.reserve(sizeof...(Arguments));
+    (inputs.emplace_back(arguments), ...);
+    detail::RemoteCallResult result = session->callOperation(
+        component_name, {}, std::string(operation_name), inputs);
+    if (!result.success) {
+      markInterfaceStale(result.error.empty()
+                             ? "remote RTT operation call failed"
+                             : std::move(result.error));
+      return fallback;
+    }
+    if (result.outputs.size() != 1U) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' returned an invalid result count");
+      return fallback;
+    }
+    try {
+      Result value = result.outputs.front().template to<Result>();
+      clearControlError();
+      return value;
+    } catch (const std::exception &exception) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' returned an incompatible result: " +
+                         exception.what());
+    } catch (...) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' returned an incompatible result");
+    }
+    return fallback;
+  }
+
+  void invokeVoidOperation(std::string_view operation_name) {
+    const std::lock_guard<std::mutex> lock(synchronize_mutex);
+    if (!interface_ready.load()) {
+      setControlError("remote RTT interface is not ready");
+      return;
+    }
+    if (interface_stale.load()) {
+      setControlError("remote RTT interface is stale; synchronize it before "
+                      "calling operations");
+      return;
+    }
+
+    detail::RemoteCallResult result = session->callOperation(
+        component_name, {}, std::string(operation_name), {});
+    if (!result.success) {
+      markInterfaceStale(result.error.empty()
+                             ? "remote RTT operation call failed"
+                             : std::move(result.error));
+      return;
+    }
+    if (!result.outputs.empty()) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' returned unexpected results");
+      return;
+    }
+    clearControlError();
+  }
+
+  RTT::base::TaskCore::TaskState
+  readTaskState(const std::string &component_name) {
+    const std::lock_guard<std::mutex> lock(synchronize_mutex);
+    if (!interface_ready.load()) {
+      setControlError("remote RTT interface is not ready");
+      return RTT::base::TaskCore::Init;
+    }
+    if (interface_stale.load()) {
+      return RTT::base::TaskCore::Init;
+    }
+
+    clearControlError();
+    std::string state_name;
+    std::string state_error;
+    if (!session->readLifecycleState(component_name, &state_name,
+                                     &state_error)) {
+      markInterfaceStale(std::move(state_error));
+      return RTT::base::TaskCore::Init;
+    }
+    RTT::base::TaskCore::TaskState state = RTT::base::TaskCore::Init;
+    if (!parseTaskState(state_name, &state)) {
+      markInterfaceStale(
+          "remote RTT component returned unknown lifecycle state '" +
+          state_name + "'");
+      return RTT::base::TaskCore::Init;
+    }
+    return state;
+  }
+
+  std::string lastControlError() const {
+    const std::lock_guard<std::mutex> lock(control_error_mutex);
+    return control_error;
+  }
+
+  ProxyConnectionState connectionState() const noexcept {
+    const ProxyConnectionState session_state = session->state();
+    return interface_stale.load() &&
+                   session_state == ProxyConnectionState::connected
+               ? ProxyConnectionState::stale
+               : session_state;
+  }
+
+  void markInterfaceStale(std::string error) {
+    interface_stale.store(true);
+    setControlError(std::move(error));
+    session->setInterfaceAccessEnabled(false);
+    pausePortPump();
+    discardPendingPortState();
+  }
+
+  void markInterfaceFresh() {
+    session->setInterfaceAccessEnabled(true);
+    interface_stale.store(false);
+    clearControlError();
+  }
 
   void pausePortPump() {
     std::unique_lock<std::mutex> lock(port_mutex);
@@ -388,15 +548,16 @@ public:
       }
       previous = std::move(port_adapters);
       port_adapters = std::move(adapters);
-      ports_paused = false;
     }
     previous.clear();
-    port_condition.notify_all();
   }
 
   void resumePortPump() {
     {
       const std::lock_guard<std::mutex> lock(port_mutex);
+      if (interface_stale.load()) {
+        return;
+      }
       ports_paused = false;
     }
     port_condition.notify_all();
@@ -427,10 +588,35 @@ public:
   }
 
   std::shared_ptr<detail::ClientSession> session;
-  std::mutex synchronize_mutex;
+  const std::string component_name;
+  mutable std::mutex synchronize_mutex;
   std::atomic<bool> interface_ready{false};
+  std::atomic<bool> interface_stale{false};
 
 private:
+  void discardPendingPortState() noexcept {
+    std::vector<std::shared_ptr<detail::RemotePortAdapter>> adapters;
+    try {
+      const std::lock_guard<std::mutex> lock(port_mutex);
+      adapters = port_adapters;
+    } catch (...) {
+      return;
+    }
+    for (const auto &adapter : adapters) {
+      adapter->discardPendingState();
+    }
+  }
+
+  void setControlError(std::string message) const {
+    const std::lock_guard<std::mutex> lock(control_error_mutex);
+    control_error = std::move(message);
+  }
+
+  void clearControlError() const {
+    const std::lock_guard<std::mutex> lock(control_error_mutex);
+    control_error.clear();
+  }
+
   void pumpPorts(std::stop_token stop) {
     std::unique_lock<std::mutex> lock(port_mutex);
     while (!stop.stop_requested()) {
@@ -469,13 +655,16 @@ private:
   bool ports_paused{true};
   bool ports_pumping{false};
   std::jthread port_thread;
+  mutable std::mutex control_error_mutex;
+  mutable std::string control_error;
 };
 
 TaskContextProxy::TaskContextProxy(std::string endpoint_url,
                                    std::string component_name,
                                    TaskContextProxyOptions options)
     : RTT::TaskContext(component_name),
-      impl_(std::make_unique<Impl>(std::move(endpoint_url), options)) {
+      impl_(std::make_unique<Impl>(std::move(endpoint_url), component_name,
+                                   options)) {
   clear();
 }
 
@@ -484,6 +673,10 @@ TaskContextProxy::~TaskContextProxy() {
     return;
   }
   impl_->interface_ready.store(false);
+  try {
+    impl_->session->setInterfaceAccessEnabled(false);
+  } catch (...) {
+  }
   impl_->stopPortPump();
   try {
     clearMirroredInterface(provides());
@@ -540,6 +733,29 @@ TaskContextProxy::create(std::string endpoint_url, std::string component_name,
 
 bool TaskContextProxy::synchronize(std::string *error) {
   const std::lock_guard<std::mutex> synchronize_lock(impl_->synchronize_mutex);
+  impl_->session->setInterfaceAccessEnabled(false);
+  impl_->pausePortPump();
+  ScopeExit resume_pump([this] { impl_->resumePortPump(); });
+  const ProxyConnectionState entry_session_state = impl_->session->state();
+  if (impl_->interface_ready.load() &&
+      entry_session_state != ProxyConnectionState::connected &&
+      !impl_->interface_stale.load()) {
+    std::string stale_error = impl_->session->lastError();
+    if (stale_error.empty()) {
+      stale_error = "remote RTT interface became stale before synchronization";
+    }
+    impl_->markInterfaceStale(std::move(stale_error));
+  }
+  const bool can_restore_existing_interface =
+      impl_->interface_ready.load() && !impl_->interface_stale.load() &&
+      entry_session_state == ProxyConnectionState::connected;
+  if (entry_session_state != ProxyConnectionState::connected) {
+    if (!impl_->session->connect(error)) {
+      impl_->markInterfaceStale(error == nullptr ? impl_->session->lastError()
+                                                  : *error);
+      return false;
+    }
+  }
   StagedService staged;
   try {
     std::string root_description;
@@ -551,18 +767,23 @@ bool TaskContextProxy::synchronize(std::string *error) {
     staged = stageRemoteService(impl_->session, getName(), {}, {},
                                 std::move(root_description));
   } catch (const std::exception &exception) {
-    assignError(error, std::string("failed to stage remote RTT interface: ") +
-                           exception.what());
+    const std::string message =
+        std::string("failed to stage remote RTT interface: ") +
+        exception.what();
+    impl_->markInterfaceStale(message);
+    assignError(error, message);
     return false;
   }
 
   const RTT::Service::shared_ptr root = provides();
-  impl_->pausePortPump();
-  ScopeExit resume_pump([this] { impl_->resumePortPump(); });
   std::vector<std::shared_ptr<detail::RemotePortAdapter>> replacement_ports;
   collectStagedPorts(staged, &replacement_ports);
   std::string replacement_error;
   if (!impl_->canReplacePortAdapters(replacement_ports, &replacement_error)) {
+    if (can_restore_existing_interface &&
+        impl_->session->state() == ProxyConnectionState::connected) {
+      impl_->session->setInterfaceAccessEnabled(true);
+    }
     assignError(error, replacement_error);
     return false;
   }
@@ -589,8 +810,11 @@ bool TaskContextProxy::synchronize(std::string *error) {
       impl_->quarantinePortAdapters(std::move(replacement_ports));
     }
     installed_ports.clear();
-    assignError(error, std::string("failed to install remote RTT interface: ") +
-                           exception.what() + cleanup_error);
+    const std::string message =
+        std::string("failed to install remote RTT interface: ") +
+        exception.what() + cleanup_error;
+    impl_->markInterfaceStale(message);
+    assignError(error, message);
     return false;
   } catch (...) {
     bool cleanup_failed = false;
@@ -604,23 +828,119 @@ bool TaskContextProxy::synchronize(std::string *error) {
       impl_->quarantinePortAdapters(std::move(replacement_ports));
     }
     installed_ports.clear();
-    assignError(error, "failed to install remote RTT interface: unknown error");
+    const std::string message =
+        "failed to install remote RTT interface: unknown error";
+    impl_->markInterfaceStale(message);
+    assignError(error, message);
     return false;
   }
   impl_->replacePortAdapters(std::move(installed_ports));
-  resume_pump.release();
   impl_->interface_ready.store(true);
+  impl_->markInterfaceFresh();
+  impl_->resumePortPump();
+  resume_pump.release();
   assignError(error, "");
   return true;
 }
 
 bool TaskContextProxy::ready() {
-  return impl_ != nullptr && impl_->interface_ready.load() &&
-         impl_->session->state() == ProxyConnectionState::connected;
+  if (impl_ == nullptr || !impl_->interface_ready.load()) {
+    return false;
+  }
+  static_cast<void>(impl_->readTaskState(getName()));
+  return impl_->connectionState() == ProxyConnectionState::connected;
+}
+
+bool TaskContextProxy::configure() {
+  return impl_ && impl_->invokeOperation<bool>("configure", false);
+}
+
+bool TaskContextProxy::activate() {
+  return impl_ && impl_->invokeOperation<bool>("activate", false);
+}
+
+bool TaskContextProxy::start() {
+  return impl_ && impl_->invokeOperation<bool>("start", false);
+}
+
+bool TaskContextProxy::stop() {
+  return impl_ && impl_->invokeOperation<bool>("stop", false);
+}
+
+bool TaskContextProxy::cleanup() {
+  return impl_ && impl_->invokeOperation<bool>("cleanup", false);
+}
+
+bool TaskContextProxy::recover() {
+  return impl_ && impl_->invokeOperation<bool>("recover", false);
+}
+
+bool TaskContextProxy::isConfigured() const {
+  return getTaskState() >= RTT::base::TaskCore::Stopped;
+}
+
+bool TaskContextProxy::isActive() const {
+  return impl_ && impl_->invokeOperation<bool>("isActive", false);
+}
+
+bool TaskContextProxy::isRunning() const {
+  return getTaskState() >= RTT::base::TaskCore::Running;
+}
+
+bool TaskContextProxy::inFatalError() const {
+  return getTaskState() == RTT::base::TaskCore::FatalError;
+}
+
+bool TaskContextProxy::inException() const {
+  return getTaskState() == RTT::base::TaskCore::Exception;
+}
+
+bool TaskContextProxy::inRunTimeError() const {
+  return getTaskState() == RTT::base::TaskCore::RunTimeError;
+}
+
+TaskContextProxy::TaskState TaskContextProxy::getTaskState() const {
+  return impl_ ? impl_->readTaskState(getName()) : RTT::base::TaskCore::Init;
+}
+
+TaskContextProxy::TaskState TaskContextProxy::getTargetState() const {
+  return getTaskState();
+}
+
+Seconds TaskContextProxy::getPeriod() const {
+  return impl_ ? impl_->invokeOperation<Seconds>("getPeriod", -1.0) : -1.0;
+}
+
+bool TaskContextProxy::setPeriod(Seconds period) {
+  return impl_ &&
+         impl_->invokeOperation<bool>("setPeriod", false, period);
+}
+
+unsigned TaskContextProxy::getCpuAffinity() const {
+  return impl_ ? impl_->invokeOperation<unsigned>("getCpuAffinity", ~0U) : ~0U;
+}
+
+bool TaskContextProxy::setCpuAffinity(unsigned cpu) {
+  return impl_ &&
+         impl_->invokeOperation<bool>("setCpuAffinity", false, cpu);
+}
+
+bool TaskContextProxy::update() {
+  return impl_ && impl_->invokeOperation<bool>("update", false);
+}
+
+bool TaskContextProxy::trigger() {
+  return impl_ && impl_->invokeOperation<bool>("trigger", false);
+}
+
+void TaskContextProxy::error() {
+  if (impl_) {
+    impl_->invokeVoidOperation("error");
+  }
 }
 
 ProxyConnectionState TaskContextProxy::connectionState() const noexcept {
-  return impl_ ? impl_->session->state() : ProxyConnectionState::disconnected;
+  return impl_ ? impl_->connectionState() : ProxyConnectionState::disconnected;
 }
 
 std::string TaskContextProxy::endpointUrl() const {
@@ -630,6 +950,10 @@ std::string TaskContextProxy::endpointUrl() const {
 std::string TaskContextProxy::lastError() const {
   if (!impl_) {
     return {};
+  }
+  std::string control_error = impl_->lastControlError();
+  if (!control_error.empty()) {
+    return control_error;
   }
   std::string port_error = impl_->lastPortError();
   return port_error.empty() ? impl_->session->lastError()

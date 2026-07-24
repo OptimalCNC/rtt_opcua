@@ -40,6 +40,7 @@ public:
   bool hasPendingState() const noexcept;
   bool canTransferStateTo(const RemotePortAdapter &replacement) const noexcept;
   bool transferPendingStateTo(RemotePortAdapter &replacement);
+  void discardPendingState() noexcept;
   const std::string &name() const noexcept;
   std::string lastError() const;
 

@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <barrier>
 #include <chrono>
 #include <cstdint>
@@ -92,7 +93,8 @@ bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout =
 
 class ProxyTarget final : public RTT::TaskContext {
 public:
-  ProxyTarget() : RTT::TaskContext("remote/calculator") {
+  ProxyTarget()
+      : RTT::TaskContext("remote/calculator", RTT::TaskContext::PreOperational) {
     provides()->doc("Remote calculator.");
     addPort(feedback).doc("Calculated feedback.");
     addPort(command).doc("Requested command.");
@@ -185,6 +187,41 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(proxy->provides()->doc() == "Remote calculator.");
   BOOST_TEST(proxy->connectionState() ==
              RTT::opcua::ProxyConnectionState::connected);
+
+  BOOST_TEST(proxy->isActive());
+  BOOST_TEST(proxy->activate());
+  BOOST_TEST(proxy->getPeriod() == target.getPeriod());
+  BOOST_TEST(proxy->setPeriod(0.0));
+  BOOST_TEST(proxy->setPeriod(0.01));
+  BOOST_TEST(proxy->getPeriod() == 0.01, boost::test_tools::tolerance(0.001));
+  BOOST_TEST(target.getPeriod() == 0.01,
+             boost::test_tools::tolerance(0.001));
+  BOOST_TEST(proxy->setPeriod(0.0));
+  BOOST_TEST(proxy->getCpuAffinity() == target.getCpuAffinity());
+  BOOST_TEST(!proxy->update());
+  BOOST_TEST(proxy->trigger());
+
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::PreOperational);
+  BOOST_TEST(!proxy->isConfigured());
+  BOOST_TEST(!proxy->isRunning());
+  BOOST_TEST(proxy->configure());
+  BOOST_TEST(target.getTaskState() == RTT::TaskContext::Stopped);
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::Stopped);
+  BOOST_TEST(proxy->isConfigured());
+  BOOST_TEST(proxy->start());
+  BOOST_TEST(target.getTaskState() == RTT::TaskContext::Running);
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::Running);
+  BOOST_TEST(proxy->getTargetState() == RTT::TaskContext::Running);
+  BOOST_TEST(proxy->isRunning());
+  proxy->error();
+  BOOST_TEST(target.getTaskState() == RTT::TaskContext::RunTimeError);
+  BOOST_TEST(proxy->inRunTimeError());
+  BOOST_TEST(proxy->recover());
+  BOOST_TEST(target.getTaskState() == RTT::TaskContext::Running);
+  BOOST_TEST(proxy->stop());
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::Stopped);
+  BOOST_TEST(proxy->cleanup());
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::PreOperational);
 
   auto *gain = dynamic_cast<RTT::Property<std::int32_t> *>(
       proxy->provides()->getProperty("Gain"));
@@ -307,6 +344,12 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   auto *offset =
       dynamic_cast<RTT::Property<std::int32_t> *>(math->getProperty("Offset"));
   BOOST_REQUIRE(offset != nullptr);
+  RTT::base::DataSourceBase::shared_ptr cached_offset_source =
+      offset->getDataSource();
+  auto *cached_offset =
+      RTT::internal::AssignableDataSource<std::int32_t>::narrow(
+          cached_offset_source.get());
+  BOOST_REQUIRE(cached_offset != nullptr);
   BOOST_TEST(offset->getDescription() == "Scale offset.");
   BOOST_TEST(offset->get() == 2);
   offset->set(3);
@@ -366,6 +409,14 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(add_caller.call());
   BOOST_TEST(sum == 42);
 
+  const std::vector<RTT::base::DataSourceBase::shared_ptr>
+      cached_add_arguments{
+          new RTT::internal::ConstantDataSource<std::int32_t>(30),
+          new RTT::internal::ConstantDataSource<std::int32_t>(12)};
+  RTT::base::DataSourceBase::shared_ptr cached_add_call = add->produce(
+      cached_add_arguments, RTT::internal::GlobalEngine::Instance());
+  BOOST_REQUIRE(cached_add_call);
+
   RTT::OperationInterfacePart *increment =
       proxy->provides()->getOperation("increment");
   BOOST_REQUIRE(increment != nullptr);
@@ -423,22 +474,17 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_REQUIRE(waitUntil([&] {
     return proxy->lastError().find("NotConnected") != std::string::npos;
   }));
-  registration->reset();
-  target.ports()->removePort("Command");
-  registration = model.registerComponent(target, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  BOOST_TEST(!proxy->synchronize(&error));
-  BOOST_TEST(error.find("unacknowledged sample") != std::string::npos);
-  BOOST_TEST(proxy->ports()->getPort("Command") == remote_command);
+  BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
+  BOOST_TEST(proxy->lastError().find("NotConnected") != std::string::npos);
 
   registration->reset();
-  target.addPort(target.command).doc("Requested command.");
+  BOOST_TEST(!proxy->ready());
   registration = model.registerComponent(target, &error);
   BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
   BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
-  BOOST_REQUIRE(waitUntil(
-      [&] { return target.command.read(command_value) == RTT::NewData; }));
-  BOOST_TEST(command_value == 75);
+  BOOST_TEST(!waitUntil(
+      [&] { return target.command.read(command_value) == RTT::NewData; },
+      std::chrono::milliseconds(100)));
 
   constexpr std::size_t synchronize_count = 4U;
   std::barrier synchronize_start(
@@ -447,6 +493,16 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   std::array<std::string, synchronize_count> synchronize_errors;
   std::vector<std::jthread> synchronizers;
   synchronizers.reserve(synchronize_count);
+  std::atomic<bool> control_calls_succeeded{true};
+  std::jthread control_caller([&] {
+    for (std::size_t call = 0U; call < 20U; ++call) {
+      if (!proxy->isActive() ||
+          proxy->getTaskState() != RTT::TaskContext::PreOperational) {
+        control_calls_succeeded.store(false);
+        return;
+      }
+    }
+  });
   for (std::size_t index = 0; index < synchronize_count; ++index) {
     synchronizers.emplace_back([&, index] {
       synchronize_start.arrive_and_wait();
@@ -454,14 +510,59 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
     });
   }
   synchronizers.clear();
+  control_caller.join();
   for (std::size_t index = 0; index < synchronize_count; ++index) {
     BOOST_TEST(synchronized[index], synchronize_errors[index]);
   }
+  BOOST_TEST(control_calls_succeeded.load());
   BOOST_TEST(proxy->ready());
   BOOST_REQUIRE(proxy->ports()->getPort("Feedback") != nullptr);
 
-  proxy.reset();
+  remote_command = dynamic_cast<RTT::base::InputPortInterface *>(
+      proxy->ports()->getPort("Command"));
+  BOOST_REQUIRE(remote_command != nullptr);
+  BOOST_REQUIRE(command_source.createConnection(
+      *remote_command,
+      RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  target.command.disconnect();
+  BOOST_TEST(command_source.write(std::int32_t{76}) == RTT::WriteSuccess);
+  BOOST_REQUIRE(waitUntil([&] {
+    return proxy->lastError().find("NotConnected") != std::string::npos;
+  }));
+
   registration->reset();
+  BOOST_TEST(!cached_add_call->evaluate());
+  BOOST_TEST(proxy->connectionState() ==
+             RTT::opcua::ProxyConnectionState::stale);
+
+  registration = model.registerComponent(target, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  BOOST_TEST(!cached_add_call->evaluate());
+  target.offset = 3;
+  cached_offset->set(99);
+  BOOST_TEST(target.offset == 3);
+
+  BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
+  BOOST_TEST(proxy->connectionState() ==
+             RTT::opcua::ProxyConnectionState::connected);
+  BOOST_TEST(proxy->ready());
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::PreOperational);
+  BOOST_TEST(!waitUntil(
+      [&] { return target.command.read(command_value) == RTT::NewData; },
+      std::chrono::milliseconds(100)));
+
+  registration->reset();
+  BOOST_TEST(!proxy->ready());
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::Init);
+  BOOST_TEST(proxy->getTargetState() == RTT::TaskContext::Init);
+  BOOST_TEST(proxy->connectionState() ==
+             RTT::opcua::ProxyConnectionState::stale);
+  BOOST_TEST(!proxy->ready());
+  BOOST_TEST(!proxy->lastError().empty());
+  BOOST_TEST(!proxy->configure());
+  BOOST_TEST(proxy->getPeriod() == -1.0);
+  BOOST_TEST(proxy->getCpuAffinity() == ~0U);
+  proxy.reset();
   server.stop();
 }
 

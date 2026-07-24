@@ -122,6 +122,18 @@ bool RemotePortAdapter::transferPendingStateTo(RemotePortAdapter &replacement) {
   return true;
 }
 
+void RemotePortAdapter::discardPendingState() noexcept {
+  pending_input_source_.reset();
+  pending_input_.reset();
+  pending_output_.reset();
+  output_was_connected_ = false;
+  try {
+    const std::lock_guard<std::mutex> lock(error_mutex_);
+    last_error_.clear();
+  } catch (...) {
+  }
+}
+
 const std::string &RemotePortAdapter::name() const noexcept {
   return description_.name;
 }
@@ -161,7 +173,8 @@ void RemotePortAdapter::pumpInput() {
 
   const std::vector<::opcua::Variant> inputs{*pending_input_};
   const RemoteCallResult result =
-      session_->call(description_.object_id, description_.method_id, inputs);
+      session_->callPort(description_.object_id, description_.method_id,
+                         inputs);
   if (!result.success) {
     setError(result.error);
     return;
@@ -207,7 +220,7 @@ void RemotePortAdapter::pumpOutput() {
 
   const bool first_connected_poll = !output_was_connected_;
   const RemoteCallResult result =
-      session_->call(description_.object_id, description_.method_id, {});
+      session_->callPort(description_.object_id, description_.method_id, {});
   if (!result.success) {
     setError(result.error);
     return;
