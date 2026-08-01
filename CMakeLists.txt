@@ -58,7 +58,6 @@ endif()
 orocos_plugin(
   rtt-transport-opcua
   src/type_transport_plugin.cpp
-  INSTALL lib/orocos${OROCOS_SUFFIX}/plugins
 )
 target_compile_features(rtt-transport-opcua PRIVATE cxx_std_20)
 target_include_directories(rtt-transport-opcua PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -70,7 +69,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   endif()
 endif()
 
-install(DIRECTORY include/rtt DESTINATION include)
+install(DIRECTORY include/rtt DESTINATION include/orocos)
 install(FILES package.xml DESTINATION share/rtt_opcua)
 
 if(BUILD_TESTING)
