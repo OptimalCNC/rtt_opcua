@@ -403,14 +403,14 @@ NodeSpec lifecycleSpec(const std::string &component_path,
 NodeSpec dataSourceSpec(const std::string &parent_path, const std::string &name,
                         const std::string &description,
                         const RTT::base::DataSourceBase::shared_ptr &source,
-                        const std::shared_ptr<ComponentState> &state,
-                        bool writable) {
+                        const std::shared_ptr<ComponentState> &state) {
   NodeSpec spec;
   spec.kind = NodeKind::variable;
   spec.parent_path = parent_path;
   spec.path = appendNodeSegment(parent_path, name);
   spec.browse_name = name;
   const TypeProtocol *protocol = protocolForDataSource(source);
+  const bool writable = source->isAssignable();
   spec.fingerprint = "rtt-value|" + pointerFingerprint(source.get()) + "|" +
                      (writable ? "rw|" : "ro|") + description;
   spec.create = [path = spec.path, parent = spec.parent_path, name, description,
@@ -703,7 +703,7 @@ void appendConfigurationNodes(NodeMap &nodes,
     }
     insertNode(nodes,
                dataSourceSpec(properties_path, name, property->getDescription(),
-                              source, state, true));
+                              source, state));
     const std::string property_path = appendNodeSegment(properties_path, name);
     insertNode(nodes, staticStringSpec(
                           appendNodeSegment(property_path, "rttType"),
@@ -724,7 +724,7 @@ void appendConfigurationNodes(NodeMap &nodes,
       continue;
     }
     insertNode(nodes,
-               dataSourceSpec(attributes_path, name, {}, source, state, false));
+               dataSourceSpec(attributes_path, name, {}, source, state));
     const std::string attribute_path = appendNodeSegment(attributes_path, name);
     insertNode(nodes,
                staticStringSpec(appendNodeSegment(attribute_path, "rttType"),

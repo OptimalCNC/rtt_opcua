@@ -151,8 +151,10 @@ BOOST_FIXTURE_TEST_CASE(
   RTT::TaskContext component("arm/left");
   std::int32_t gain = 7;
   std::string status = "idle";
+  std::string model_name = "arm-v1";
   component.addProperty("Gain", gain).doc("Controller gain");
   component.addAttribute("Status", status);
+  component.addConstant("ModelName", model_name);
 
   RTT::OutputPort<double> feedback("Feedback");
   RTT::InputPort<std::uint16_t> command("Command");
@@ -183,6 +185,9 @@ BOOST_FIXTURE_TEST_CASE(
                   {"components", "arm/left", "properties", "Gain", "rttType"});
   const auto status_id = modelNodeId(
       namespace_index, {"components", "arm/left", "attributes", "Status"});
+  const auto model_name_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "attributes", "ModelName"});
   const auto feedback_type_id = modelNodeId(
       namespace_index, {"components", "arm/left", "ports", "Feedback", "type"});
   const auto feedback_direction_id =
@@ -222,10 +227,24 @@ BOOST_FIXTURE_TEST_CASE(
   const auto status_value = ::opcua::services::readValue(client, status_id);
   BOOST_REQUIRE(status_value);
   BOOST_TEST(status_value.value().to<std::string>() == "idle");
-  BOOST_TEST(!::opcua::services::writeValue(
-                  client, status_id, ::opcua::Variant(std::string("unsafe")))
+  BOOST_CHECK(::opcua::services::writeValue(
+                  client, status_id, ::opcua::Variant(std::string("active")))
                   .isGood());
-  BOOST_TEST(status == "idle");
+  BOOST_TEST(status == "active");
+
+  const auto wrong_status_write = ::opcua::services::writeValue(
+      client, status_id, ::opcua::Variant(std::int32_t{42}));
+  BOOST_TEST(wrong_status_write.get() == UA_STATUSCODE_BADTYPEMISMATCH);
+  BOOST_TEST(status == "active");
+
+  const auto model_name_value =
+      ::opcua::services::readValue(client, model_name_id);
+  BOOST_REQUIRE(model_name_value);
+  BOOST_TEST(model_name_value.value().to<std::string>() == "arm-v1");
+  const auto model_name_write = ::opcua::services::writeValue(
+      client, model_name_id, ::opcua::Variant(std::string("unsafe")));
+  BOOST_TEST(model_name_write.get() == UA_STATUSCODE_BADNOTWRITABLE);
+  BOOST_TEST(model_name == "arm-v1");
 
   BOOST_TEST(::opcua::services::readValue(client, feedback_type_id)
                  .value()

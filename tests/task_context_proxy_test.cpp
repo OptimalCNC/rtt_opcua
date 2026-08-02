@@ -100,6 +100,7 @@ public:
     addPort(command).doc("Requested command.");
     addProperty("Gain", gain).doc("Controller gain.");
     addAttribute("Status", status);
+    addConstant("ModelName", model_name);
     addOperation("add", &ProxyTarget::add, this, RTT::OwnThread)
         .doc("Add two signed values.")
         .arg("left", "Left operand.")
@@ -116,6 +117,8 @@ public:
     math->doc("Math utilities.");
     math->addLocalPort(math_feedback).doc("Nested calculation feedback.");
     math->addProperty("Offset", offset).doc("Scale offset.");
+    math->addAttribute("Mode", mode);
+    math->addConstant("Unit", unit);
     math->addOperation("scale", &ProxyTarget::scale, this, RTT::OwnThread)
         .doc("Scale a value and add the configured offset.")
         .arg("value", "Value to scale.")
@@ -155,6 +158,9 @@ public:
   std::int32_t gain{7};
   std::int32_t offset{2};
   std::string status{"idle"};
+  std::string model_name{"calculator-v1"};
+  std::string mode{"manual"};
+  std::string unit{"counts"};
   RTT::OutputPort<std::int32_t> feedback{"Feedback"};
   RTT::InputPort<std::int32_t> command{"Command"};
   RTT::OutputPort<std::int32_t> math_feedback{"MathFeedback"};
@@ -235,13 +241,27 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
 
   RTT::base::AttributeBase *status = proxy->provides()->getAttribute("Status");
   BOOST_REQUIRE(status != nullptr);
-  BOOST_TEST(!status->getDataSource()->isAssignable());
-  auto *status_source = RTT::internal::DataSource<std::string>::narrow(
+  auto *status_source = RTT::internal::AssignableDataSource<std::string>::narrow(
       status->getDataSource().get());
   BOOST_REQUIRE(status_source != nullptr);
   BOOST_TEST(status_source->get() == "idle");
-  target.status = "running";
-  BOOST_TEST(status_source->get() == "running");
+  BOOST_REQUIRE(proxy->configure());
+  BOOST_REQUIRE(proxy->start());
+  status_source->set("remote-running");
+  BOOST_TEST(target.status == "remote-running");
+  BOOST_REQUIRE(proxy->stop());
+  BOOST_REQUIRE(proxy->cleanup());
+  target.status = "controller-update";
+  BOOST_TEST(status_source->get() == "controller-update");
+
+  RTT::base::AttributeBase *model_name =
+      proxy->provides()->getAttribute("ModelName");
+  BOOST_REQUIRE(model_name != nullptr);
+  BOOST_TEST(!model_name->getDataSource()->isAssignable());
+  auto *model_name_source = RTT::internal::DataSource<std::string>::narrow(
+      model_name->getDataSource().get());
+  BOOST_REQUIRE(model_name_source != nullptr);
+  BOOST_TEST(model_name_source->get() == "calculator-v1");
 
   auto *remote_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
       proxy->ports()->getPort("Feedback"));
@@ -354,6 +374,22 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(offset->get() == 2);
   offset->set(3);
   BOOST_TEST(target.offset == 3);
+
+  RTT::base::AttributeBase *mode = math->getAttribute("Mode");
+  BOOST_REQUIRE(mode != nullptr);
+  auto *mode_source = RTT::internal::AssignableDataSource<std::string>::narrow(
+      mode->getDataSource().get());
+  BOOST_REQUIRE(mode_source != nullptr);
+  mode_source->set("automatic");
+  BOOST_TEST(target.mode == "automatic");
+
+  RTT::base::AttributeBase *unit = math->getAttribute("Unit");
+  BOOST_REQUIRE(unit != nullptr);
+  BOOST_TEST(!unit->getDataSource()->isAssignable());
+  auto *unit_source = RTT::internal::DataSource<std::string>::narrow(
+      unit->getDataSource().get());
+  BOOST_REQUIRE(unit_source != nullptr);
+  BOOST_TEST(unit_source->get() == "counts");
 
   std::int32_t scaled = 0;
   RTT::OperationInterfacePart *scale = math->getOperation("scale");
