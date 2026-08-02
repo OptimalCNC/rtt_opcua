@@ -36,6 +36,7 @@ orocos_library(
 target_compile_features(orocos-rtt-opcua PUBLIC cxx_std_20)
 target_include_directories(
   orocos-rtt-opcua
+  BEFORE
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -60,7 +61,12 @@ orocos_plugin(
   src/type_transport_plugin.cpp
 )
 target_compile_features(rtt-transport-opcua PRIVATE cxx_std_20)
-target_include_directories(rtt-transport-opcua PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(
+  rtt-transport-opcua
+  BEFORE
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 target_link_libraries(rtt-transport-opcua orocos-rtt-opcua)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(rtt-transport-opcua PRIVATE -Wall -Wextra -Wpedantic)
