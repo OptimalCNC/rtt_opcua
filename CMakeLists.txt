@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OROCOS-RTT REQUIRED)
 find_package(open62541 CONFIG REQUIRED)
-find_package(open62541pp 0.21.1 CONFIG REQUIRED)
+find_package(open62541pp 0.21.2 CONFIG REQUIRED)
 
 include(${OROCOS-RTT_USE_FILE})
 
