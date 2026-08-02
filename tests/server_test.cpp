@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -52,6 +53,20 @@ std::uint16_t unusedLoopbackPort() {
 }
 
 } // namespace
+
+BOOST_AUTO_TEST_CASE(non_loopback_server_options_are_rejected_as_unsupported) {
+  for (const std::string &bind_address :
+       {std::string("0.0.0.0"), std::string("192.0.2.1"),
+        std::string("::")}) {
+    RTT::opcua::ServerOptions options;
+    options.bind_address = bind_address;
+
+    const std::optional<std::string> error =
+        RTT::opcua::validateServerOptions(options);
+    BOOST_REQUIRE(error.has_value());
+    BOOST_TEST(*error == "non-loopback OPC UA listening is not supported");
+  }
+}
 
 BOOST_AUTO_TEST_CASE(invalid_server_options_fail_without_starting_a_thread) {
   RTT::opcua::ServerOptions options;

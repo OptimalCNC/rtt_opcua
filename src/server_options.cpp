@@ -24,17 +24,8 @@ std::optional<std::string> validateServerOptions(const ServerOptions& options) {
   if (options.application_name.empty()) {
     return "application name must not be empty";
   }
-  if (options.certificate_file.empty() != options.private_key_file.empty()) {
-    return "certificate and private key must be configured together";
-  }
   if (!isLoopbackAddress(options.bind_address)) {
-    if (options.certificate_file.empty()) {
-      return "non-loopback startup requires a certificate and private key";
-    }
-    if (options.allow_anonymous_remote) {
-      return "anonymous remote startup requires the unsafe-development server mode";
-    }
-    return "authenticated non-loopback startup is not implemented";
+    return "non-loopback OPC UA listening is not supported";
   }
   return std::nullopt;
 }

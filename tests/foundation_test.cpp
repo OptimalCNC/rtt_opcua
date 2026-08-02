@@ -44,13 +44,9 @@ BOOST_AUTO_TEST_CASE(server_rejects_unsafe_or_malformed_bindings) {
   BOOST_TEST(RTT::opcua::validateServerOptions(options).has_value());
 
   options.bind_address = "192.0.2.10";
-  options.certificate_file = "server.der";
-  options.private_key_file = "server.key";
   BOOST_TEST(RTT::opcua::validateServerOptions(options).has_value());
 
   options.bind_address = "::1";
-  options.certificate_file.clear();
-  options.private_key_file.clear();
   options.endpoint_path = "rtt";
   BOOST_TEST(RTT::opcua::validateServerOptions(options).has_value());
 

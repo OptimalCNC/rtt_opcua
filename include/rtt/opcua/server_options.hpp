@@ -12,9 +12,6 @@ struct ServerOptions {
   std::uint16_t port {4840};
   std::string endpoint_path {"/rtt"};
   std::string application_name {"Orocos RTT OPC UA"};
-  std::string certificate_file;
-  std::string private_key_file;
-  bool allow_anonymous_remote {false};
 };
 
 bool isLoopbackAddress(std::string_view address);
