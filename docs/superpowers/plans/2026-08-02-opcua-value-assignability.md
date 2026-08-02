@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - Never install into or read runtime state from `~/.orocos`; build, install, and run from `/tmp/orocos-rock-modernization.0QPXI6`.
+- Run every build, test, install, and runtime command through `/tmp/orocos-rock-modernization.0QPXI6/clean-env` so ambient loader paths cannot resolve RTT from `~/.orocos`.
 - Assignable properties and `addAttribute(...)` values are writable in every lifecycle state, including Running.
 - `addConstant(...)` and every other non-assignable data source remain read-only.
 - Apply the same behavior at the component root and in nested RTT services.
@@ -165,9 +166,12 @@ BOOST_TEST(unit_source->get() == "counts");
 Run:
 
 ```bash
-cmake --build /tmp/orocos-rock-modernization.0QPXI6/build-state/rtt_opcua \
+OROCOS_TEST_ROOT=/tmp/orocos-rock-modernization.0QPXI6
+"$OROCOS_TEST_ROOT/clean-env" env OROCOS_TARGET=gnulinux \
+  cmake --build "$OROCOS_TEST_ROOT/build-state/rtt_opcua" \
   --target rtt_opcua_object_model_test rtt_opcua_task_context_proxy_test -j2
-ctest --test-dir /tmp/orocos-rock-modernization.0QPXI6/build-state/rtt_opcua \
+"$OROCOS_TEST_ROOT/clean-env" env OROCOS_TARGET=gnulinux \
+  ctest --test-dir "$OROCOS_TEST_ROOT/build-state/rtt_opcua" \
   -R 'rtt_opcua_(object_model|task_context_proxy)_test' --output-on-failure
 ```
 
@@ -218,8 +222,11 @@ Expected: `2/2` selected tests pass with no compiler warnings under
 Run:
 
 ```bash
-cmake --build /tmp/orocos-rock-modernization.0QPXI6/build-state/rtt_opcua -j2
-ctest --test-dir /tmp/orocos-rock-modernization.0QPXI6/build-state/rtt_opcua \
+OROCOS_TEST_ROOT=/tmp/orocos-rock-modernization.0QPXI6
+"$OROCOS_TEST_ROOT/clean-env" env OROCOS_TARGET=gnulinux \
+  cmake --build "$OROCOS_TEST_ROOT/build-state/rtt_opcua" -j2
+"$OROCOS_TEST_ROOT/clean-env" env OROCOS_TARGET=gnulinux \
+  ctest --test-dir "$OROCOS_TEST_ROOT/build-state/rtt_opcua" \
   --output-on-failure
 ```
 
@@ -264,7 +271,9 @@ git commit -m "fix: preserve RTT value assignability over OPC UA"
 Run:
 
 ```bash
-cmake --install /tmp/orocos-rock-modernization.0QPXI6/build-state/rtt_opcua
+OROCOS_TEST_ROOT=/tmp/orocos-rock-modernization.0QPXI6
+"$OROCOS_TEST_ROOT/clean-env" env OROCOS_TARGET=gnulinux \
+  cmake --install "$OROCOS_TEST_ROOT/build-state/rtt_opcua"
 ```
 
 Expected: installation updates
