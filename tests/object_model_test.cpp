@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -451,5 +452,50 @@ BOOST_FIXTURE_TEST_CASE(
 
   registration->reset();
   client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    object_model_shutdown_waits_for_timed_out_own_thread_operations,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::milliseconds(10);
+  model_options.operation_timeout = std::chrono::milliseconds(30);
+  auto model = std::make_unique<RTT::opcua::ObjectModel>(server, model_options);
+
+  OperationComponent component;
+  auto registration = model->registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  ::opcua::ClientConfig client_config;
+  client_config.setTimeout(2000U);
+  ::opcua::Client client(std::move(client_config));
+  client.connect(server.endpointUrl());
+
+  const auto operations_id =
+      modelNodeId(namespace_index, {"components", "calculator", "operations"});
+  const auto slow_id = modelNodeId(
+      namespace_index, {"components", "calculator", "operations", "slow"});
+  const std::vector<::opcua::Variant> inputs{
+      ::opcua::Variant(std::uint32_t{200})};
+
+  const auto result =
+      ::opcua::services::call(client, operations_id, slow_id, inputs);
+  BOOST_TEST(result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
+  BOOST_TEST(model->pendingOperationCount() == 1U);
+
+  client.disconnect();
+  model.reset();
+
+  BOOST_TEST(component.slow_completed.load());
+  BOOST_TEST(!registration->active());
+  registration->reset();
   server.stop();
 }
