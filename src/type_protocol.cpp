@@ -2,6 +2,7 @@
 
 #include <rtt/opcua/type_descriptor.hpp>
 
+#include <open62541pp/datatype.hpp>
 #include <open62541pp/ua/nodeids.hpp>
 
 #include <rtt/OutputPort.hpp>
@@ -26,6 +27,13 @@ std::mutex &registrationMutex() {
   return mutex;
 }
 
+bool fail(std::string *error, std::string message) {
+  if (error != nullptr) {
+    *error = std::move(message);
+  }
+  return false;
+}
+
 template <typename T, typename Wire>
 bool decodeScalar(const ::opcua::Variant &value,
                   const ::opcua::NodeId &data_type, T *decoded) noexcept {
@@ -43,8 +51,7 @@ bool decodeScalar(const ::opcua::Variant &value,
 template <typename T, typename Wire>
 class ScalarProxyDataSource final : public RTT::internal::DataSource<T> {
 public:
-  ScalarProxyDataSource(TypeProtocol::VariantReader reader,
-                        ::opcua::NodeId data_type)
+  ScalarProxyDataSource(VariantReader reader, ::opcua::NodeId data_type)
       : reader_(std::move(reader)), data_type_(std::move(data_type)) {}
 
   T get() const override {
@@ -89,7 +96,7 @@ private:
     }
   }
 
-  TypeProtocol::VariantReader reader_;
+  VariantReader reader_;
   ::opcua::NodeId data_type_;
   mutable T last_value_{};
 };
@@ -98,8 +105,7 @@ template <typename T, typename Wire>
 class ScalarAssignableProxyDataSource final
     : public RTT::internal::AssignableDataSource<T> {
 public:
-  ScalarAssignableProxyDataSource(TypeProtocol::VariantReader reader,
-                                  TypeProtocol::VariantWriter writer,
+  ScalarAssignableProxyDataSource(VariantReader reader, VariantWriter writer,
                                   ::opcua::NodeId data_type)
       : reader_(std::move(reader)), writer_(std::move(writer)),
         data_type_(std::move(data_type)) {}
@@ -164,17 +170,17 @@ private:
     }
   }
 
-  TypeProtocol::VariantReader reader_;
-  TypeProtocol::VariantWriter writer_;
+  VariantReader reader_;
+  VariantWriter writer_;
   ::opcua::NodeId data_type_;
   mutable T last_value_{};
 };
 
 template <typename T, typename Wire = T>
-class ScalarTypeProtocol final : public TypeProtocol {
+class ScalarTypeCodec final : public TypeCodec {
 public:
-  explicit ScalarTypeProtocol(::opcua::NodeId data_type)
-      : data_type_(std::move(data_type)) {}
+  explicit ScalarTypeCodec(::opcua::NodeId data_type)
+      : TypeCodec(std::move(data_type), ::opcua::ValueRank::Scalar, true) {}
 
   bool toVariant(const RTT::base::DataSourceBase::shared_ptr &source,
                  ::opcua::Variant *value) const override {
@@ -226,9 +232,10 @@ public:
     }
     if (writer) {
       return new ScalarAssignableProxyDataSource<T, Wire>(
-          std::move(reader), std::move(writer), data_type_);
+          std::move(reader), std::move(writer), dataTypeNodeId());
     }
-    return new ScalarProxyDataSource<T, Wire>(std::move(reader), data_type_);
+    return new ScalarProxyDataSource<T, Wire>(std::move(reader),
+                                               dataTypeNodeId());
   }
 
   bool portValue(const RTT::base::OutputPortInterface *port,
@@ -241,32 +248,25 @@ public:
     return true;
   }
 
-  ::opcua::NodeId dataTypeNodeId() const override { return data_type_; }
-
-  ::opcua::ValueRank valueRank() const override {
-    return ::opcua::ValueRank::Scalar;
-  }
-
-  bool hasValue() const noexcept override { return true; }
-
 private:
   bool isCompatible(const ::opcua::Variant &value) const noexcept {
-    return value.isScalar() && value.isType(data_type_);
+    return value.isScalar() && value.isType(dataTypeNodeId());
   }
-
-  ::opcua::NodeId data_type_;
 };
 
-class VoidTypeProtocol final : public TypeProtocol {
+class VoidTypeCodec final : public TypeCodec {
 public:
+  explicit VoidTypeCodec(::opcua::NodeId data_type)
+      : TypeCodec(std::move(data_type), ::opcua::ValueRank::Scalar, false) {}
+
   bool toVariant(const RTT::base::DataSourceBase::shared_ptr &,
                  ::opcua::Variant *) const override {
     return false;
   }
 
-  bool
-  assignVariant(const ::opcua::Variant &,
-                const RTT::base::DataSourceBase::shared_ptr &) const override {
+  bool assignVariant(
+      const ::opcua::Variant &,
+      const RTT::base::DataSourceBase::shared_ptr &) const override {
     return false;
   }
 
@@ -284,16 +284,60 @@ public:
                  ::opcua::Variant *) const override {
     return false;
   }
+};
 
-  ::opcua::NodeId dataTypeNodeId() const override {
-    return ::opcua::DataTypeId::BaseDataType;
+template <typename T, typename Wire = T>
+class ScalarTypeProtocol final : public TypeProtocol {
+public:
+  ScalarTypeProtocol(::opcua::NodeId data_type, std::string fingerprint)
+      : data_type_(std::move(data_type)), fingerprint_(std::move(fingerprint)) {}
+
+  DataTypeReference dataType() const override { return data_type_; }
+
+  std::string registrationFingerprint() const override { return fingerprint_; }
+
+  std::unique_ptr<TypeCodec>
+  bind(const ::opcua::NodeId &data_type, const UA_DataType &native_type,
+       std::string *error) const override {
+    if (data_type != data_type_ ||
+        ::opcua::NodeId(native_type.typeId) != data_type) {
+      fail(error, "OPC UA scalar protocol datatype mismatch");
+      return {};
+    }
+    if (error != nullptr) {
+      error->clear();
+    }
+    return std::make_unique<ScalarTypeCodec<T, Wire>>(data_type);
   }
 
-  ::opcua::ValueRank valueRank() const override {
-    return ::opcua::ValueRank::Scalar;
+private:
+  ::opcua::NodeId data_type_;
+  std::string fingerprint_;
+};
+
+class VoidTypeProtocol final : public TypeProtocol {
+public:
+  DataTypeReference dataType() const override {
+    return ::opcua::NodeId(::opcua::DataTypeId::BaseDataType);
   }
 
-  bool hasValue() const noexcept override { return false; }
+  std::string registrationFingerprint() const override {
+    return "rtt-opcua/builtin/Void/v1";
+  }
+
+  std::unique_ptr<TypeCodec>
+  bind(const ::opcua::NodeId &data_type, const UA_DataType &native_type,
+       std::string *error) const override {
+    if (data_type != ::opcua::NodeId(::opcua::DataTypeId::BaseDataType) ||
+        ::opcua::NodeId(native_type.typeId) != data_type) {
+      fail(error, "OPC UA void protocol datatype mismatch");
+      return {};
+    }
+    if (error != nullptr) {
+      error->clear();
+    }
+    return std::make_unique<VoidTypeCodec>(data_type);
+  }
 };
 
 std::unique_ptr<TypeProtocol>
@@ -302,57 +346,62 @@ makeCanonicalProtocol(std::string_view type_name) {
   if (descriptor == nullptr) {
     return {};
   }
+  const std::string fingerprint = "rtt-opcua/builtin/" +
+                                  std::string(type_name) + "/v1";
 
   if (type_name == "Bool") {
-    return std::make_unique<ScalarTypeProtocol<bool>>(descriptor->data_type);
+    return std::make_unique<ScalarTypeProtocol<bool>>(descriptor->data_type,
+                                                       fingerprint);
   }
   if (type_name == "Int8") {
     return std::make_unique<ScalarTypeProtocol<std::int8_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "UInt8") {
     return std::make_unique<ScalarTypeProtocol<std::uint8_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "Int16") {
     return std::make_unique<ScalarTypeProtocol<std::int16_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "UInt16") {
     return std::make_unique<ScalarTypeProtocol<std::uint16_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "Int32") {
     return std::make_unique<ScalarTypeProtocol<std::int32_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "UInt32") {
     return std::make_unique<ScalarTypeProtocol<std::uint32_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "Int64") {
     return std::make_unique<ScalarTypeProtocol<std::int64_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "UInt64") {
     return std::make_unique<ScalarTypeProtocol<std::uint64_t>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "Float32") {
-    return std::make_unique<ScalarTypeProtocol<float>>(descriptor->data_type);
+    return std::make_unique<ScalarTypeProtocol<float>>(descriptor->data_type,
+                                                        fingerprint);
   }
   if (type_name == "Float64") {
-    return std::make_unique<ScalarTypeProtocol<double>>(descriptor->data_type);
+    return std::make_unique<ScalarTypeProtocol<double>>(descriptor->data_type,
+                                                         fingerprint);
   }
   if (type_name == "Char") {
     using CharWire =
         std::conditional_t<std::is_signed_v<char>, std::int8_t, std::uint8_t>;
     return std::make_unique<ScalarTypeProtocol<char, CharWire>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "String") {
     return std::make_unique<ScalarTypeProtocol<std::string>>(
-        descriptor->data_type);
+        descriptor->data_type, fingerprint);
   }
   if (type_name == "Void") {
     return std::make_unique<VoidTypeProtocol>();
@@ -360,19 +409,71 @@ makeCanonicalProtocol(std::string_view type_name) {
   return {};
 }
 
+bool sameRegistration(const TypeProtocol &lhs, const TypeProtocol &rhs) {
+  return lhs.dataType() == rhs.dataType() &&
+         lhs.registrationFingerprint() == rhs.registrationFingerprint();
+}
+
 bool registerTypeProtocolUnlocked(RTT::types::TypeInfo *type_info,
-                                  std::unique_ptr<TypeProtocol> protocol) {
-  if (type_info == nullptr || !protocol) {
-    return false;
+                                  std::unique_ptr<TypeProtocol> protocol,
+                                  std::string *error) {
+  if (type_info == nullptr || !protocol ||
+      protocol->registrationFingerprint().empty()) {
+    return fail(error, "invalid OPC UA type protocol registration");
   }
   if (type_info->hasProtocol(kTransportProtocolId)) {
-    return dynamic_cast<TypeProtocol *>(
-               type_info->getProtocol(kTransportProtocolId)) != nullptr;
+    const auto *existing = dynamic_cast<const TypeProtocol *>(
+        type_info->getProtocol(kTransportProtocolId));
+    if (existing != nullptr && sameRegistration(*existing, *protocol)) {
+      if (error != nullptr) {
+        error->clear();
+      }
+      return true;
+    }
+    return fail(error, "conflicting OPC UA type protocol registration for '" +
+                           type_info->getTypeName() + "'");
   }
-  return type_info->addProtocol(kTransportProtocolId, protocol.release());
+  if (dataTypeRegistryFrozen()) {
+    return fail(error, "late OPC UA type protocol registration for '" +
+                           type_info->getTypeName() + "'");
+  }
+  if (!type_info->addProtocol(kTransportProtocolId, protocol.release())) {
+    return fail(error, "invalid OPC UA type protocol registration for '" +
+                           type_info->getTypeName() + "'");
+  }
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
+}
+
+std::unique_ptr<TypeCodec> bindBuiltinCodec(const TypeProtocol &protocol) {
+  const DataTypeReference reference = protocol.dataType();
+  const auto *node_id = std::get_if<::opcua::NodeId>(&reference);
+  if (node_id == nullptr) {
+    return {};
+  }
+  const UA_DataType *native_type = ::opcua::findDataType(*node_id);
+  return native_type == nullptr ? nullptr
+                                : protocol.bind(*node_id, *native_type);
 }
 
 } // namespace
+
+TypeCodec::TypeCodec(::opcua::NodeId data_type,
+                     ::opcua::ValueRank value_rank, bool has_value)
+    : data_type_(std::move(data_type)), value_rank_(value_rank),
+      has_value_(has_value) {}
+
+const ::opcua::NodeId &TypeCodec::dataTypeNodeId() const noexcept {
+  return data_type_;
+}
+
+::opcua::ValueRank TypeCodec::valueRank() const noexcept {
+  return value_rank_;
+}
+
+bool TypeCodec::hasValue() const noexcept { return has_value_; }
 
 RTT::base::ChannelElementBase::shared_ptr
 TypeProtocol::createStream(RTT::base::PortInterface *, const RTT::ConnPolicy &,
@@ -380,46 +481,99 @@ TypeProtocol::createStream(RTT::base::PortInterface *, const RTT::ConnPolicy &,
   return {};
 }
 
+bool TypeProtocol::toVariant(
+    const RTT::base::DataSourceBase::shared_ptr &source,
+    ::opcua::Variant *value) const {
+  const auto codec = bindBuiltinCodec(*this);
+  return codec && codec->toVariant(source, value);
+}
+
+bool TypeProtocol::assignVariant(
+    const ::opcua::Variant &value,
+    const RTT::base::DataSourceBase::shared_ptr &destination) const {
+  const auto codec = bindBuiltinCodec(*this);
+  return codec && codec->assignVariant(value, destination);
+}
+
+RTT::base::DataSourceBase::shared_ptr
+TypeProtocol::makeDataSource(const ::opcua::Variant &value) const {
+  const auto codec = bindBuiltinCodec(*this);
+  return codec ? codec->makeDataSource(value)
+               : RTT::base::DataSourceBase::shared_ptr{};
+}
+
+RTT::base::DataSourceBase::shared_ptr
+TypeProtocol::makeProxyDataSource(VariantReader reader,
+                                  VariantWriter writer) const {
+  const auto codec = bindBuiltinCodec(*this);
+  return codec ? codec->makeProxyDataSource(std::move(reader),
+                                            std::move(writer))
+               : RTT::base::DataSourceBase::shared_ptr{};
+}
+
+bool TypeProtocol::portValue(const RTT::base::OutputPortInterface *port,
+                             ::opcua::Variant *value) const {
+  const auto codec = bindBuiltinCodec(*this);
+  return codec && codec->portValue(port, value);
+}
+
+::opcua::NodeId TypeProtocol::dataTypeNodeId() const {
+  const auto codec = bindBuiltinCodec(*this);
+  return codec ? codec->dataTypeNodeId() : ::opcua::NodeId{};
+}
+
+::opcua::ValueRank TypeProtocol::valueRank() const {
+  const auto codec = bindBuiltinCodec(*this);
+  return codec ? codec->valueRank() : ::opcua::ValueRank::Scalar;
+}
+
+bool TypeProtocol::hasValue() const noexcept {
+  try {
+    const auto codec = bindBuiltinCodec(*this);
+    return codec && codec->hasValue();
+  } catch (const std::exception &) {
+    return false;
+  }
+}
+
 bool registerTypeProtocol(RTT::types::TypeInfo *type_info,
-                          std::unique_ptr<TypeProtocol> protocol) {
+                          std::unique_ptr<TypeProtocol> protocol,
+                          std::string *error) {
   std::lock_guard<std::mutex> lock(registrationMutex());
-  return registerTypeProtocolUnlocked(type_info, std::move(protocol));
+  return registerTypeProtocolUnlocked(type_info, std::move(protocol), error);
 }
 
 bool registerCanonicalTypeProtocol(std::string_view type_name,
-                                   RTT::types::TypeInfo *type_info) {
+                                   RTT::types::TypeInfo *type_info,
+                                   std::string *error) {
   if (type_info == nullptr || type_info->getTypeName() != type_name ||
       descriptorForType(type_name) == nullptr) {
-    return false;
+    return fail(error, "invalid canonical OPC UA type protocol registration");
   }
   std::lock_guard<std::mutex> lock(registrationMutex());
   return registerTypeProtocolUnlocked(type_info,
-                                      makeCanonicalProtocol(type_name));
+                                      makeCanonicalProtocol(type_name), error);
 }
 
-bool registerCanonicalTypeProtocols() {
+bool registerCanonicalTypeProtocols(std::string *error) {
   std::lock_guard<std::mutex> lock(registrationMutex());
   for (const TypeDescriptor &descriptor : canonicalTypeDescriptors()) {
     RTT::types::TypeInfo *type_info =
         RTT::types::Types()->type(std::string(descriptor.rtt_name));
     if (type_info == nullptr ||
         !registerTypeProtocolUnlocked(
-            type_info, makeCanonicalProtocol(descriptor.rtt_name))) {
+            type_info, makeCanonicalProtocol(descriptor.rtt_name), error)) {
       return false;
     }
+  }
+  if (error != nullptr) {
+    error->clear();
   }
   return true;
 }
 
 const TypeProtocol *protocolForTypeInfo(const RTT::types::TypeInfo *type_info) {
-  if (type_info == nullptr ||
-      descriptorForType(type_info->getTypeName()) == nullptr) {
-    return nullptr;
-  }
-  if (!type_info->hasProtocol(kTransportProtocolId) &&
-      !registerCanonicalTypeProtocol(
-          type_info->getTypeName(),
-          const_cast<RTT::types::TypeInfo *>(type_info))) {
+  if (type_info == nullptr || !type_info->hasProtocol(kTransportProtocolId)) {
     return nullptr;
   }
   return dynamic_cast<const TypeProtocol *>(
@@ -427,10 +581,8 @@ const TypeProtocol *protocolForTypeInfo(const RTT::types::TypeInfo *type_info) {
 }
 
 const TypeProtocol *protocolForTypeName(std::string_view type_name) {
-  if (descriptorForType(type_name) == nullptr) {
-    return nullptr;
-  }
-  return protocolForTypeInfo(RTT::types::Types()->type(std::string(type_name)));
+  return protocolForTypeInfo(
+      RTT::types::Types()->type(std::string(type_name)));
 }
 
 const TypeProtocol *

@@ -2,6 +2,7 @@
 #include <boost/test/included/unit_test.hpp>
 
 #include <rtt/opcua/type_descriptor.hpp>
+#include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/type_protocol.hpp>
 #include <rtt/opcua/type_transport_plugin.hpp>
 
@@ -11,6 +12,7 @@
 #include <rtt/types/Types.hpp>
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 
@@ -21,50 +23,64 @@ struct CanonicalTypeFixture {
     if (RTT::types::Types()->type("Int32") == nullptr) {
       RTT::types::RealTimeTypekitPlugin().loadTypes();
     }
+    std::string error;
+    if (!RTT::opcua::registerCanonicalTypeProtocols(&error)) {
+      throw std::runtime_error(error);
+    }
   }
 };
 
+std::shared_ptr<RTT::opcua::EndpointTypeRegistry> makeRegistry() {
+  std::string error;
+  auto registry = RTT::opcua::EndpointTypeRegistry::create(
+      {{"http://opcfoundation.org/UA/", 0}, {"urn:orocos:rtt", 1}},
+      &error);
+  BOOST_REQUIRE_MESSAGE(registry, error);
+  return registry;
+}
+
 } // namespace
 
-BOOST_FIXTURE_TEST_SUITE(type_protocol_suite, CanonicalTypeFixture)
+BOOST_GLOBAL_FIXTURE(CanonicalTypeFixture);
+
+BOOST_AUTO_TEST_SUITE(type_protocol_suite)
 
 BOOST_AUTO_TEST_CASE(all_canonical_types_receive_the_opcua_transport) {
-  BOOST_REQUIRE(RTT::opcua::registerCanonicalTypeProtocols());
+  const auto registry = makeRegistry();
 
   for (const auto &descriptor : RTT::opcua::canonicalTypeDescriptors()) {
     RTT::types::TypeInfo *type_info =
         RTT::types::Types()->type(std::string(descriptor.rtt_name));
     BOOST_REQUIRE_MESSAGE(type_info != nullptr, descriptor.rtt_name);
     BOOST_TEST(type_info->hasProtocol(RTT::opcua::kTransportProtocolId));
-    const RTT::opcua::TypeProtocol *protocol =
-        RTT::opcua::protocolForTypeName(descriptor.rtt_name);
-    BOOST_REQUIRE_MESSAGE(protocol != nullptr, descriptor.rtt_name);
-    BOOST_CHECK(protocol->dataTypeNodeId() == descriptor.data_type);
-    BOOST_TEST(protocol->hasValue() == descriptor.has_value);
+    const RTT::opcua::TypeCodec *codec =
+        registry->codecForTypeName(descriptor.rtt_name);
+    BOOST_REQUIRE_MESSAGE(codec != nullptr, descriptor.rtt_name);
+    BOOST_CHECK(codec->dataTypeNodeId() == descriptor.data_type);
+    BOOST_TEST(codec->hasValue() == descriptor.has_value);
   }
 
-  BOOST_TEST(RTT::opcua::protocolForTypeName("int") == nullptr);
-  BOOST_TEST(RTT::opcua::protocolForTypeName("uint16") == nullptr);
+  BOOST_TEST(registry->codecForTypeName("int") == nullptr);
+  BOOST_TEST(registry->codecForTypeName("uint16") == nullptr);
 }
 
 BOOST_AUTO_TEST_CASE(scalar_protocol_round_trips_data_sources) {
-  BOOST_REQUIRE(RTT::opcua::registerCanonicalTypeProtocols());
-  const RTT::opcua::TypeProtocol *protocol =
-      RTT::opcua::protocolForTypeName("Int32");
-  BOOST_REQUIRE(protocol != nullptr);
+  const auto registry = makeRegistry();
+  const RTT::opcua::TypeCodec *codec = registry->codecForTypeName("Int32");
+  BOOST_REQUIRE(codec != nullptr);
 
   RTT::internal::ValueDataSource<std::int32_t>::shared_ptr value =
       new RTT::internal::ValueDataSource<std::int32_t>(42);
   ::opcua::Variant encoded;
-  BOOST_REQUIRE(protocol->toVariant(value, &encoded));
+  BOOST_REQUIRE(codec->toVariant(value, &encoded));
   BOOST_TEST(encoded.to<std::int32_t>() == 42);
 
   BOOST_REQUIRE(
-      protocol->assignVariant(::opcua::Variant(std::int32_t{84}), value));
+      codec->assignVariant(::opcua::Variant(std::int32_t{84}), value));
   BOOST_TEST(value->get() == 84);
 
   const auto decoded =
-      protocol->makeDataSource(::opcua::Variant(std::int32_t{-7}));
+      codec->makeDataSource(::opcua::Variant(std::int32_t{-7}));
   const auto typed =
       boost::dynamic_pointer_cast<RTT::internal::DataSource<std::int32_t>>(
           decoded);
@@ -72,13 +88,13 @@ BOOST_AUTO_TEST_CASE(scalar_protocol_round_trips_data_sources) {
   BOOST_TEST(typed->get() == -7);
 
   BOOST_TEST(
-      !protocol->assignVariant(::opcua::Variant(std::string("wrong")), value));
+      !codec->assignVariant(::opcua::Variant(std::string("wrong")), value));
 }
 
 BOOST_AUTO_TEST_CASE(byte_and_character_protocols_preserve_numeric_values) {
-  BOOST_REQUIRE(RTT::opcua::registerCanonicalTypeProtocols());
+  const auto registry = makeRegistry();
 
-  const auto *byte_protocol = RTT::opcua::protocolForTypeName("UInt8");
+  const auto *byte_protocol = registry->codecForTypeName("UInt8");
   BOOST_REQUIRE(byte_protocol != nullptr);
   RTT::internal::ValueDataSource<std::uint8_t>::shared_ptr byte =
       new RTT::internal::ValueDataSource<std::uint8_t>(200U);
@@ -87,7 +103,7 @@ BOOST_AUTO_TEST_CASE(byte_and_character_protocols_preserve_numeric_values) {
   BOOST_TEST(static_cast<unsigned int>(encoded_byte.to<std::uint8_t>()) ==
              200U);
 
-  const auto *char_protocol = RTT::opcua::protocolForTypeName("Char");
+  const auto *char_protocol = registry->codecForTypeName("Char");
   BOOST_REQUIRE(char_protocol != nullptr);
   RTT::internal::ValueDataSource<char>::shared_ptr character =
       new RTT::internal::ValueDataSource<char>('A');

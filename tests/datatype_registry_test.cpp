@@ -2,6 +2,7 @@
 #include <boost/test/included/unit_test.hpp>
 
 #include <rtt/opcua/datatype_registry.hpp>
+#include <rtt/opcua/endpoint_type_registry.hpp>
 
 #include <algorithm>
 #include <string>
@@ -9,6 +10,10 @@
 #include <vector>
 
 namespace {
+
+struct BoundValue {
+  std::int32_t value;
+};
 
 RTT::opcua::CustomDataTypeDefinition
 definition(std::string name, std::string type_node,
@@ -110,4 +115,42 @@ BOOST_AUTO_TEST_CASE(invalid_definition) {
   std::string error;
   BOOST_TEST(!RTT::opcua::registerDataTypeProvider(std::move(invalid), &error));
   checkPrefix(error, "invalid OPC UA datatype provider");
+}
+
+BOOST_AUTO_TEST_CASE(endpoint_binding) {
+  const RTT::opcua::LogicalDataTypeId id{"urn:test:types", "BoundValue",
+                                         "BoundValueBinary"};
+  RTT::opcua::CustomDataTypeDefinition data_type;
+  data_type.name = "BoundValue";
+  data_type.id = id;
+  data_type.schema_fingerprint = "bound-value-v1";
+  data_type.materialize = [id](const RTT::opcua::DataTypeFactoryContext &ctx) {
+    return ::opcua::DataTypeBuilder<BoundValue>::createStructure(
+               "BoundValue", ctx.nodeId(id),
+               {ctx.namespaceIndex(id.namespace_uri),
+                id.binary_encoding_node_id})
+        .addField<&BoundValue::value>("value")
+        .build();
+  };
+  BOOST_REQUIRE(RTT::opcua::registerDataTypeProvider(
+      provider("bound", {}, std::move(data_type))));
+
+  std::string error;
+  const auto binding_three = RTT::opcua::EndpointTypeRegistry::create(
+      {{"http://opcfoundation.org/UA/", 0}, {"urn:test:types", 3}}, &error);
+  BOOST_REQUIRE_MESSAGE(binding_three, error);
+  const auto *type_three = binding_three->dataType(id);
+  BOOST_REQUIRE(type_three != nullptr);
+  BOOST_CHECK(type_three->typeId() == ::opcua::NodeId(3, "BoundValue"));
+  BOOST_CHECK(type_three->binaryEncodingId() ==
+              ::opcua::NodeId(3, "BoundValueBinary"));
+
+  const auto binding_nine = RTT::opcua::EndpointTypeRegistry::create(
+      {{"http://opcfoundation.org/UA/", 0}, {"urn:test:types", 9}}, &error);
+  BOOST_REQUIRE_MESSAGE(binding_nine, error);
+  const auto *type_nine = binding_nine->dataType(id);
+  BOOST_REQUIRE(type_nine != nullptr);
+  BOOST_CHECK(type_nine->typeId() == ::opcua::NodeId(9, "BoundValue"));
+  BOOST_CHECK(type_nine->binaryEncodingId() ==
+              ::opcua::NodeId(9, "BoundValueBinary"));
 }

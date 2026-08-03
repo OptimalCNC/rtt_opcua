@@ -22,6 +22,7 @@ orocos_library(
   src/node_id.cpp
   src/client_session.cpp
   src/datatype_registry.cpp
+  src/endpoint_type_registry.cpp
   src/object_model.cpp
   src/operation_dispatcher.cpp
   src/port_bridge.cpp
@@ -101,7 +102,14 @@ if(BUILD_TESTING)
       target_compile_options(rtt_opcua_datatype_registry_test PRIVATE -Werror)
     endif()
   endif()
-  foreach(case lifecycle missing_dependency dependency_cycle invalid_definition)
+  foreach(
+    case
+    lifecycle
+    missing_dependency
+    dependency_cycle
+    invalid_definition
+    endpoint_binding
+  )
     add_test(
       NAME rtt_opcua_datatype_registry_test_${case}
       COMMAND rtt_opcua_datatype_registry_test --run_test=${case}
