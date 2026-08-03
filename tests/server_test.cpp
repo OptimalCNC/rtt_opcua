@@ -10,7 +10,9 @@
 #include <open62541pp/datatype.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
 #include <open62541pp/services/nodemanagement.hpp>
+#include <open62541pp/services/view.hpp>
 #include <open62541pp/ua/nodeids.hpp>
+#include <open62541pp/ua/types.hpp>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -21,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -241,6 +244,70 @@ BOOST_AUTO_TEST_CASE(custom_datatype_binding_follows_endpoint_namespace_order) {
   BOOST_CHECK(
       second_registry->customDataTypes().front().typeId() ==
       ::opcua::NodeId(*second_provider_index, "types/ServerFixtureValue"));
+
+  bool republished = true;
+  std::string publication_error;
+  BOOST_REQUIRE_MESSAGE(second.invoke(
+                            [&second_registry, &republished,
+                             &publication_error](::opcua::Server &native) {
+                              republished =
+                                  second_registry->publishDataTypeNodes(
+                                      native, &publication_error);
+                            },
+                            std::chrono::seconds(2), &error),
+                        error);
+  BOOST_TEST(!republished);
+  BOOST_TEST(publication_error.find("BadNodeIdExists") != std::string::npos);
+
+  ::opcua::ClientConfig client_config;
+  client_config.setTimeout(2000U);
+  ::opcua::Client client(std::move(client_config));
+  client.connect(second.endpointUrl());
+  const auto namespaces = client.namespaceArray();
+  const auto provider_uri =
+      std::find(namespaces.begin(), namespaces.end(), kFixtureNamespaceUri);
+  BOOST_REQUIRE(provider_uri != namespaces.end());
+  const auto client_provider_index =
+      std::distance(namespaces.begin(), provider_uri);
+  BOOST_REQUIRE(client_provider_index > 0);
+  BOOST_REQUIRE(client_provider_index <=
+                std::numeric_limits<std::uint16_t>::max());
+  const auto namespace_index =
+      static_cast<std::uint16_t>(client_provider_index);
+  const ::opcua::NodeId type_id(namespace_index, "types/ServerFixtureValue");
+  const ::opcua::NodeId encoding_id(namespace_index,
+                                    "encodings/ServerFixtureValue/Binary");
+
+  const auto type_class = ::opcua::services::readNodeClass(client, type_id);
+  BOOST_REQUIRE(type_class);
+  BOOST_CHECK(type_class.value() == ::opcua::NodeClass::DataType);
+  const auto encoding_class =
+      ::opcua::services::readNodeClass(client, encoding_id);
+  BOOST_REQUIRE(encoding_class);
+  BOOST_CHECK(encoding_class.value() == ::opcua::NodeClass::Object);
+
+  const ::opcua::BrowseDescription encoding_browse(
+      type_id, ::opcua::BrowseDirection::Forward,
+      ::opcua::ReferenceTypeId::HasEncoding, true, ::opcua::NodeClass::Object,
+      ::opcua::BrowseResultMask::All);
+  const auto encodings = ::opcua::services::browseAll(client, encoding_browse);
+  BOOST_REQUIRE(encodings);
+  BOOST_REQUIRE_EQUAL(encodings.value().size(), 1U);
+  BOOST_REQUIRE(encodings.value().front().nodeId().isLocal());
+  BOOST_CHECK(encodings.value().front().nodeId().nodeId() == encoding_id);
+
+  const auto definition =
+      ::opcua::services::readDataTypeDefinition(client, type_id);
+  BOOST_REQUIRE(definition);
+  BOOST_REQUIRE(definition.value().isScalar());
+  BOOST_REQUIRE(definition.value().isType<::opcua::StructureDefinition>());
+  const auto structure =
+      definition.value().scalar<::opcua::StructureDefinition>();
+  BOOST_CHECK(structure.defaultEncodingId() == encoding_id);
+  BOOST_REQUIRE_EQUAL(structure.fields().size(), 1U);
+  BOOST_TEST(structure.fields().front().name() == "value");
+
+  client.disconnect();
   second.stop();
   BOOST_TEST(second.typeRegistry() == nullptr);
 }

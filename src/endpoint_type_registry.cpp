@@ -3,6 +3,10 @@
 #include "datatype_registry_internal.hpp"
 
 #include <open62541pp/datatype.hpp>
+#include <open62541pp/server.hpp>
+#include <open62541pp/services/nodemanagement.hpp>
+#include <open62541pp/ua/nodeids.hpp>
+#include <open62541pp/ua/types.hpp>
 
 #include <rtt/types/TypeInfo.hpp>
 #include <rtt/types/Types.hpp>
@@ -36,13 +40,29 @@ bool kindMatches(CustomDataTypeKind expected, std::uint8_t actual) {
   return false;
 }
 
+::opcua::NodeId parentDataType(CustomDataTypeKind kind) {
+  switch (kind) {
+  case CustomDataTypeKind::structure:
+    return ::opcua::DataTypeId::Structure;
+  case CustomDataTypeKind::enumeration:
+    return ::opcua::DataTypeId::Enumeration;
+  case CustomDataTypeKind::union_type:
+    return ::opcua::DataTypeId::Union;
+  }
+  return ::opcua::DataTypeId::BaseDataType;
+}
+
+std::string statusName(::opcua::StatusCode status) {
+  return std::string(status.name());
+}
+
 } // namespace
 
 std::shared_ptr<EndpointTypeRegistry> EndpointTypeRegistry::create(
     const std::vector<std::pair<std::string, std::uint16_t>> &namespaces,
     std::string *error) {
-  auto registry = std::shared_ptr<EndpointTypeRegistry>(
-      new EndpointTypeRegistry());
+  auto registry =
+      std::shared_ptr<EndpointTypeRegistry>(new EndpointTypeRegistry());
   std::set<std::uint16_t> indexes;
   for (const auto &[uri, index] : namespaces) {
     if (uri.empty() || uri.find('\0') != std::string::npos ||
@@ -85,6 +105,7 @@ bool EndpointTypeRegistry::bind(std::string *error) {
     custom_type_count += provider.data_types.size();
   }
   custom_data_types_.reserve(custom_type_count);
+  data_type_nodes_.reserve(custom_type_count);
 
   const DataTypeFactoryContext context(factory_state_);
   for (const DataTypeProvider &provider : *providers) {
@@ -103,7 +124,7 @@ bool EndpointTypeRegistry::bind(std::string *error) {
       const auto namespace_index =
           namespace_indexes_.at(definition.id.namespace_uri);
       const ::opcua::NodeId expected_type(namespace_index,
-                                           definition.id.type_node_id);
+                                          definition.id.type_node_id);
       const ::opcua::NodeId expected_encoding(
           namespace_index, definition.id.binary_encoding_node_id);
       if (materialized.typeId() != expected_type ||
@@ -116,22 +137,22 @@ bool EndpointTypeRegistry::bind(std::string *error) {
       custom_data_types_.push_back(std::move(materialized));
       const std::size_t index = custom_data_types_.size() - 1U;
       custom_data_type_indexes_.emplace(definition.id, index);
-      factory_state_->data_types.emplace(
-          definition.id, custom_data_types_[index].handle());
+      data_type_nodes_.push_back({definition.name, definition.kind, index});
+      factory_state_->data_types.emplace(definition.id,
+                                         custom_data_types_[index].handle());
     }
   }
 
   for (const std::string &name : RTT::types::Types()->getTypes()) {
     RTT::types::TypeInfo *type_info = RTT::types::Types()->type(name);
-    if (type_info == nullptr ||
-        !type_info->hasProtocol(kTransportProtocolId)) {
+    if (type_info == nullptr || !type_info->hasProtocol(kTransportProtocolId)) {
       continue;
     }
     const auto *protocol = dynamic_cast<const TypeProtocol *>(
         type_info->getProtocol(kTransportProtocolId));
     if (protocol == nullptr) {
-      return fail(error, "invalid OPC UA type protocol for RTT type '" + name +
-                             "'");
+      return fail(error,
+                  "invalid OPC UA type protocol for RTT type '" + name + "'");
     }
 
     const DataTypeReference reference = protocol->dataType();
@@ -154,8 +175,8 @@ bool EndpointTypeRegistry::bind(std::string *error) {
       }
     }
     if (native_type == nullptr) {
-      return fail(error, "unresolved OPC UA datatype for RTT type '" + name +
-                             "'");
+      return fail(error,
+                  "unresolved OPC UA datatype for RTT type '" + name + "'");
     }
 
     std::string bind_error;
@@ -182,8 +203,8 @@ const TypeCodec *EndpointTypeRegistry::codecForTypeInfo(
   return found == codecs_.end() ? nullptr : found->second.get();
 }
 
-const TypeCodec *EndpointTypeRegistry::codecForTypeName(
-    std::string_view type_name) const {
+const TypeCodec *
+EndpointTypeRegistry::codecForTypeName(std::string_view type_name) const {
   const auto found = codecs_by_name_.find(type_name);
   return found == codecs_by_name_.end() ? nullptr : found->second;
 }
@@ -198,8 +219,8 @@ EndpointTypeRegistry::customDataTypes() const noexcept {
   return custom_data_types_;
 }
 
-const ::opcua::DataType *EndpointTypeRegistry::dataType(
-    const LogicalDataTypeId &id) const noexcept {
+const ::opcua::DataType *
+EndpointTypeRegistry::dataType(const LogicalDataTypeId &id) const noexcept {
   const auto found = custom_data_type_indexes_.find(id);
   return found == custom_data_type_indexes_.end()
              ? nullptr
@@ -212,6 +233,51 @@ std::optional<std::uint16_t> EndpointTypeRegistry::namespaceIndex(
   return found == namespace_indexes_.end()
              ? std::nullopt
              : std::optional<std::uint16_t>(found->second);
+}
+
+bool EndpointTypeRegistry::publishDataTypeNodes(::opcua::Server &server,
+                                                std::string *error) const {
+  for (const DataTypeNode &node : data_type_nodes_) {
+    const ::opcua::DataType &data_type =
+        custom_data_types_[node.data_type_index];
+
+    ::opcua::DataTypeAttributes type_attributes;
+    type_attributes.setDisplayName(::opcua::LocalizedText("en-US", node.name));
+    type_attributes.setIsAbstract(false);
+    const auto type_result = ::opcua::services::addDataType(
+        server, parentDataType(node.kind), data_type.typeId(), node.name,
+        type_attributes, ::opcua::ReferenceTypeId::HasSubtype);
+    if (!type_result) {
+      return fail(error, "failed to publish OPC UA datatype node '" +
+                             node.name +
+                             "': " + statusName(type_result.code()));
+    }
+
+    ::opcua::ObjectAttributes encoding_attributes;
+    encoding_attributes.setDisplayName(
+        ::opcua::LocalizedText("en-US", "Default Binary"));
+    const auto encoding_result = ::opcua::services::addObject(
+        server, ::opcua::NodeId{}, data_type.binaryEncodingId(),
+        "Default Binary", encoding_attributes,
+        ::opcua::ObjectTypeId::DataTypeEncodingType, ::opcua::NodeId{});
+    if (!encoding_result) {
+      return fail(error, "failed to publish OPC UA binary encoding node for '" +
+                             node.name +
+                             "': " + statusName(encoding_result.code()));
+    }
+    const ::opcua::StatusCode reference_result =
+        ::opcua::services::addReference(
+            server, data_type.typeId(), data_type.binaryEncodingId(),
+            ::opcua::ReferenceTypeId::HasEncoding, true);
+    if (!reference_result.isGood()) {
+      return fail(error, "failed to link OPC UA binary encoding node for '" +
+                             node.name + "': " + statusName(reference_result));
+    }
+  }
+  if (error != nullptr) {
+    error->clear();
+  }
+  return true;
 }
 
 } // namespace RTT::opcua

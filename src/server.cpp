@@ -305,6 +305,10 @@ private:
         native_server->config().addCustomDataTypes(
             endpoint_registry->customDataTypes());
       }
+      if (!endpoint_registry->publishDataTypeNodes(*native_server,
+                                                   &registry_error)) {
+        throw std::runtime_error(registry_error);
+      }
       {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         type_registry = std::move(endpoint_registry);
