@@ -496,6 +496,9 @@ dataSourceSpec(const std::string &parent_path, const std::string &name,
     attributes.setValue(std::move(value));
     attributes.setDataType(codec->dataTypeNodeId());
     attributes.setValueRank(codec->valueRank());
+    if (codec->valueRank() == ::opcua::ValueRank::OneDimension) {
+      attributes.setArrayDimensions({0U});
+    }
     attributes.setAccessLevel(writable ? readWriteAccess() : readOnlyAccess());
     attributes.setUserAccessLevel(writable ? readWriteAccess()
                                            : readOnlyAccess());

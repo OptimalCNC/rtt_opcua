@@ -139,6 +139,25 @@ struct UnsupportedValue {
   std::int32_t value{0};
 };
 
+class CanonicalArrayComponent final : public RTT::TaskContext {
+public:
+  CanonicalArrayComponent() : RTT::TaskContext("canonical-arrays") {
+    addProperty("Float64ArrayProperty", float64_property);
+    addProperty("Int32ArrayProperty", int32_property);
+    addProperty("StringArrayProperty", string_property);
+    addAttribute("Float64ArrayAttribute", float64_attribute);
+    addAttribute("Int32ArrayAttribute", int32_attribute);
+    addAttribute("StringArrayAttribute", string_attribute);
+  }
+
+  std::vector<double> float64_property{1.0, 2.0};
+  std::vector<std::int32_t> int32_property{3, 4};
+  std::vector<std::string> string_property{"five", "six"};
+  std::vector<double> float64_attribute{7.0, 8.0};
+  std::vector<std::int32_t> int32_attribute{9, 10};
+  std::vector<std::string> string_attribute{"eleven", "twelve"};
+};
+
 constexpr std::string_view kUnsupportedTypeName = "/test/UnsupportedValue";
 constexpr std::string_view kMissingProtocolReason =
     "has no registered OPC UA protocol";
@@ -182,6 +201,47 @@ public:
 };
 
 } // namespace
+
+BOOST_FIXTURE_TEST_CASE(canonical_array_value_nodes_publish_and_remain_writable,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModel model(server);
+  CanonicalArrayComponent component;
+  auto registration = model.registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto float64_property_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "properties", "Float64ArrayProperty"});
+  const auto string_attribute_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "attributes", "StringArrayAttribute"});
+  BOOST_TEST(::opcua::services::readValue(client, float64_property_id)
+                     .value()
+                     .to<std::vector<double>>() == component.float64_property,
+             boost::test_tools::per_element());
+  BOOST_TEST(
+      ::opcua::services::writeValue(
+          client, string_attribute_id,
+          ::opcua::Variant(std::vector<std::string>{"updated", "attribute"}))
+          .isGood());
+  BOOST_REQUIRE(waitUntil([&] {
+    return component.string_attribute ==
+           std::vector<std::string>{"updated", "attribute"};
+  }));
+
+  client.disconnect();
+  registration->reset();
+  server.stop();
+}
 
 BOOST_FIXTURE_TEST_CASE(
     unsupported_resources_are_queryable_deduplicated_and_recover,
