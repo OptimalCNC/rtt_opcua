@@ -16,6 +16,7 @@
 #include <rtt/TaskContext.hpp>
 #include <rtt/internal/GlobalEngine.hpp>
 #include <rtt/typekit/RealTimeTypekit.hpp>
+#include <rtt/types/TemplateTypeInfo.hpp>
 #include <rtt/types/Types.hpp>
 
 #include <arpa/inet.h>
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -133,7 +135,127 @@ public:
   std::atomic_bool slow_completed{false};
 };
 
+struct UnsupportedValue {
+  std::int32_t value{0};
+};
+
+constexpr std::string_view kUnsupportedTypeName = "/test/UnsupportedValue";
+constexpr std::string_view kMissingProtocolReason =
+    "has no registered OPC UA protocol";
+
+void registerUnsupportedValueType() {
+  if (RTT::types::Types()->type(std::string(kUnsupportedTypeName)) != nullptr) {
+    return;
+  }
+  BOOST_REQUIRE(RTT::types::Types()->addType(
+      new RTT::types::TemplateTypeInfo<UnsupportedValue, false>(
+          std::string(kUnsupportedTypeName))));
+}
+
+class UnsupportedResourceComponent final : public RTT::TaskContext {
+public:
+  UnsupportedResourceComponent()
+      : RTT::TaskContext("unsupported-component"),
+        unsupported_service(RTT::Service::Create("unsupported")) {
+    unsupported_service
+        ->addOperation("consume", &UnsupportedResourceComponent::consume, this,
+                       RTT::ClientThread)
+        .arg("value", "Unsupported input value.");
+    unsupported_service->addOperation("produce",
+                                      &UnsupportedResourceComponent::produce,
+                                      this, RTT::ClientThread);
+    unsupported_service->addProperty("UnsupportedProperty", property);
+    unsupported_service->addAttribute("UnsupportedAttribute", attribute);
+    unsupported_service->addPort(input);
+    unsupported_service->addPort(output);
+    BOOST_REQUIRE(provides()->addService(unsupported_service));
+  }
+
+  bool consume(UnsupportedValue) const { return true; }
+  UnsupportedValue produce() const { return UnsupportedValue{42}; }
+
+  RTT::Service::shared_ptr unsupported_service;
+  UnsupportedValue property{1};
+  UnsupportedValue attribute{2};
+  RTT::InputPort<UnsupportedValue> input{"UnsupportedInput"};
+  RTT::OutputPort<UnsupportedValue> output{"UnsupportedOutput"};
+};
+
 } // namespace
+
+BOOST_FIXTURE_TEST_CASE(
+    unsupported_resources_are_queryable_deduplicated_and_recover,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  std::vector<std::string> messages;
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::milliseconds(20);
+  model_options.warning_sink = [&messages](const std::string &message) {
+    messages.push_back(message);
+  };
+  RTT::opcua::ObjectModel model(server, model_options);
+
+  UnsupportedResourceComponent component;
+  auto registration = model.registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  BOOST_REQUIRE_MESSAGE(model.reconcile(&error), error);
+
+  const std::vector<RTT::opcua::UnsupportedResource> diagnostics =
+      model.unsupportedResources(component.getName());
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 6U);
+  BOOST_TEST(std::ranges::is_sorted(diagnostics));
+  BOOST_TEST(messages.size() == diagnostics.size());
+
+  const std::vector<std::pair<std::string, std::string>> expected_resources{
+      {"unsupported.UnsupportedAttribute", "attribute"},
+      {"unsupported.UnsupportedInput", "input port"},
+      {"unsupported.UnsupportedOutput", "output port"},
+      {"unsupported.UnsupportedProperty", "property"},
+      {"unsupported.consume", "operation"},
+      {"unsupported.produce", "operation"},
+  };
+  for (std::size_t index = 0U; index < diagnostics.size(); ++index) {
+    const auto &diagnostic = diagnostics[index];
+    BOOST_TEST(diagnostic.component == component.getName());
+    BOOST_TEST(diagnostic.path == expected_resources[index].first);
+    BOOST_TEST(diagnostic.kind == expected_resources[index].second);
+    BOOST_TEST(diagnostic.type_name == kUnsupportedTypeName);
+    BOOST_TEST(diagnostic.reason == kMissingProtocolReason);
+    BOOST_TEST(messages[index] == diagnostic.message());
+  }
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto unsupported_input_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "services",
+                        "unsupported", "ports", "UnsupportedInput"});
+  BOOST_TEST(!::opcua::services::readBrowseName(client, unsupported_input_id));
+
+  component.provides()->removeService("unsupported");
+  BOOST_REQUIRE_MESSAGE(model.reconcile(&error), error);
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+  BOOST_REQUIRE_EQUAL(messages.size(), 12U);
+  for (std::size_t index = 0U; index < diagnostics.size(); ++index) {
+    const auto &diagnostic = diagnostics[index];
+    const std::string expected = "OPC UA: component '" + diagnostic.component +
+                                 "' now publishes " + diagnostic.kind + " '" +
+                                 diagnostic.path + "' with RTT type '" +
+                                 diagnostic.type_name + "'.";
+    BOOST_TEST(messages[index + diagnostics.size()] == expected);
+  }
+
+  client.disconnect();
+  registration->reset();
+  server.stop();
+}
 
 BOOST_FIXTURE_TEST_CASE(
     component_metadata_reconciles_and_registration_guards_lifetime,

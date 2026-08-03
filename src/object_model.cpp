@@ -12,6 +12,7 @@
 #include <open62541pp/services/nodemanagement.hpp>
 #include <open62541pp/ua/nodeids.hpp>
 
+#include <rtt/Logger.hpp>
 #include <rtt/OperationInterfacePart.hpp>
 #include <rtt/Service.hpp>
 #include <rtt/TaskContext.hpp>
@@ -19,12 +20,14 @@
 #include <rtt/base/InputPortInterface.hpp>
 #include <rtt/base/OutputPortInterface.hpp>
 #include <rtt/base/PropertyBase.hpp>
+#include <rtt/types/TypeInfo.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -210,6 +213,58 @@ struct NodeSpec {
 };
 
 using NodeMap = std::map<std::string, NodeSpec>;
+
+struct ComponentSnapshot {
+  NodeMap nodes;
+  std::vector<UnsupportedResource> unsupported;
+};
+
+struct DiagnosticEvent {
+  bool recovered{false};
+  UnsupportedResource resource;
+};
+
+std::string appendDiagnosticSegment(std::string_view path,
+                                    std::string_view segment) {
+  if (path.empty()) {
+    return std::string(segment);
+  }
+  return std::string(path) + '.' + std::string(segment);
+}
+
+std::string typeName(const RTT::types::TypeInfo *type) {
+  return type == nullptr ? "<unknown>" : type->getTypeName();
+}
+
+std::string unsupportedValueReason(const RTT::types::TypeInfo *type,
+                                   const TypeCodec *codec) {
+  if (type == nullptr) {
+    return "has no RTT type information";
+  }
+  if (codec == nullptr) {
+    return "has no registered OPC UA protocol";
+  }
+  return "does not support OPC UA values";
+}
+
+void appendUnsupported(std::vector<UnsupportedResource> &unsupported,
+                       const std::string &component, std::string path,
+                       std::string kind, const RTT::types::TypeInfo *type,
+                       const TypeCodec *codec) {
+  unsupported.push_back(
+      UnsupportedResource{component, std::move(path), std::move(kind),
+                          typeName(type), unsupportedValueReason(type, codec)});
+}
+
+void appendUnsupported(std::vector<UnsupportedResource> &unsupported,
+                       const std::string &component, std::string path,
+                       std::string kind, std::string type_name,
+                       std::string reason) {
+  unsupported.push_back(UnsupportedResource{
+      component, std::move(path), std::move(kind),
+      type_name.empty() ? "<unknown>" : std::move(type_name),
+      reason.empty() ? "is not supported by OPC UA" : std::move(reason)});
+}
 
 bool addObjectNode(::opcua::Server &server, std::uint16_t namespace_index,
                    const std::string &parent_path, const std::string &path,
@@ -635,8 +690,10 @@ void insertNode(NodeMap &nodes, NodeSpec spec) {
 }
 
 void appendOperationNodes(
-    NodeMap &nodes, const RTT::Service::shared_ptr &service,
-    const std::string &owner_path, const std::shared_ptr<ComponentState> &state,
+    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
+    const RTT::Service::shared_ptr &service, const std::string &owner_path,
+    const std::string &diagnostic_path,
+    const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<OperationDispatcher> &dispatcher) {
   const std::string operations_path =
       appendNodeSegment(owner_path, "operations");
@@ -647,6 +704,10 @@ void appendOperationNodes(
     }
     OperationSchema schema = dispatcher->describe(*operation);
     if (!schema.supported) {
+      appendUnsupported(unsupported, state->component_name,
+                        appendDiagnosticSegment(diagnostic_path, name),
+                        "operation", std::move(schema.unsupported_type_name),
+                        std::move(schema.unsupported_reason));
       continue;
     }
     const std::string operation_path = appendNodeSegment(operations_path, name);
@@ -696,8 +757,10 @@ void appendResourceFolders(NodeMap &nodes, const std::string &owner_path,
 }
 
 void appendConfigurationNodes(
-    NodeMap &nodes, const RTT::Service::shared_ptr &service,
-    const std::string &owner_path, const std::shared_ptr<ComponentState> &state,
+    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
+    const RTT::Service::shared_ptr &service, const std::string &owner_path,
+    const std::string &diagnostic_path,
+    const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
   const std::string properties_path =
       appendNodeSegment(owner_path, "properties");
@@ -707,8 +770,14 @@ void appendConfigurationNodes(
       continue;
     }
     const auto source = property->getDataSource();
-    const TypeCodec *codec = type_registry->codecForDataSource(source);
+    const RTT::types::TypeInfo *type =
+        source == nullptr ? nullptr : source->getTypeInfo();
+    const TypeCodec *codec =
+        source == nullptr ? nullptr : type_registry->codecForDataSource(source);
     if (codec == nullptr || !codec->hasValue()) {
+      appendUnsupported(unsupported, state->component_name,
+                        appendDiagnosticSegment(diagnostic_path, name),
+                        "property", type, codec);
       continue;
     }
     insertNode(nodes,
@@ -729,8 +798,14 @@ void appendConfigurationNodes(
       continue;
     }
     const auto source = attribute->getDataSource();
-    const TypeCodec *codec = type_registry->codecForDataSource(source);
+    const RTT::types::TypeInfo *type =
+        source == nullptr ? nullptr : source->getTypeInfo();
+    const TypeCodec *codec =
+        source == nullptr ? nullptr : type_registry->codecForDataSource(source);
     if (codec == nullptr || !codec->hasValue()) {
+      appendUnsupported(unsupported, state->component_name,
+                        appendDiagnosticSegment(diagnostic_path, name),
+                        "attribute", type, codec);
       continue;
     }
     insertNode(nodes, dataSourceSpec(attributes_path, name, {}, source, state,
@@ -745,14 +820,31 @@ void appendConfigurationNodes(
 }
 
 void appendPortNodes(
-    NodeMap &nodes, const RTT::Service::shared_ptr &service,
-    const std::string &owner_path, const std::shared_ptr<ComponentState> &state,
+    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
+    const RTT::Service::shared_ptr &service, const std::string &owner_path,
+    const std::string &diagnostic_path,
+    const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
     std::size_t buffer_size) {
   const std::string ports_path = appendNodeSegment(owner_path, "ports");
   for (const std::string &name : service->getPortNames()) {
     RTT::base::PortInterface *port = service->getPort(name);
-    if (port == nullptr || port->getTypeInfo() == nullptr) {
+    if (port == nullptr) {
+      continue;
+    }
+    const RTT::types::TypeInfo *type = port->getTypeInfo();
+    const TypeCodec *codec =
+        type == nullptr ? nullptr : type_registry->codecForTypeInfo(type);
+    const bool is_input =
+        dynamic_cast<RTT::base::InputPortInterface *>(port) != nullptr;
+    const bool is_output =
+        dynamic_cast<RTT::base::OutputPortInterface *>(port) != nullptr;
+    if (codec == nullptr || !codec->hasValue()) {
+      appendUnsupported(unsupported, state->component_name,
+                        appendDiagnosticSegment(diagnostic_path, name),
+                        is_input ? "input port"
+                                 : (is_output ? "output port" : "port"),
+                        type, codec);
       continue;
     }
     const std::string port_path = appendNodeSegment(ports_path, name);
@@ -764,10 +856,9 @@ void appendPortNodes(
                                 port->getTypeInfo()->getTypeName()));
 
     std::string direction = "unknown";
-    if (dynamic_cast<RTT::base::InputPortInterface *>(port) != nullptr) {
+    if (is_input) {
       direction = "input";
-    } else if (dynamic_cast<RTT::base::OutputPortInterface *>(port) !=
-               nullptr) {
+    } else if (is_output) {
       direction = "output";
     }
     insertNode(nodes,
@@ -779,11 +870,10 @@ void appendPortNodes(
                           port_path, "description", "RTT port description.",
                           port->getDescription()));
 
-    if (dynamic_cast<RTT::base::InputPortInterface *>(port) != nullptr) {
+    if (is_input) {
       insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
                                        buffer_size, PortMethodKind::write));
-    } else if (dynamic_cast<RTT::base::OutputPortInterface *>(port) !=
-               nullptr) {
+    } else if (is_output) {
       insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
                                        buffer_size, PortMethodKind::read));
     }
@@ -791,8 +881,9 @@ void appendPortNodes(
 }
 
 void appendServiceContents(
-    NodeMap &nodes, const RTT::Service::shared_ptr &service,
-    const std::string &service_path,
+    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
+    const RTT::Service::shared_ptr &service, const std::string &service_path,
+    const std::string &diagnostic_path,
     const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
     const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
@@ -805,10 +896,12 @@ void appendServiceContents(
   ancestry.insert(service.get());
 
   appendResourceFolders(nodes, service_path, service->doc());
-  appendConfigurationNodes(nodes, service, service_path, state, type_registry);
-  appendOperationNodes(nodes, service, service_path, state, dispatcher);
-  appendPortNodes(nodes, service, service_path, state, type_registry,
-                  port_buffer_size);
+  appendConfigurationNodes(nodes, unsupported, service, service_path,
+                           diagnostic_path, state, type_registry);
+  appendOperationNodes(nodes, unsupported, service, service_path,
+                       diagnostic_path, state, dispatcher);
+  appendPortNodes(nodes, unsupported, service, service_path, diagnostic_path,
+                  state, type_registry, port_buffer_size);
 
   const std::string services_path = appendNodeSegment(service_path, "services");
   for (const std::string &name : service->getProviderNames()) {
@@ -822,33 +915,39 @@ void appendServiceContents(
     const std::string child_path = appendNodeSegment(services_path, name);
     insertNode(nodes,
                objectSpec(child_path, services_path, name, child->doc()));
-    appendServiceContents(nodes, child, child_path, state, dispatcher,
-                          type_registry, port_buffer_size, ancestry,
+    appendServiceContents(nodes, unsupported, child, child_path,
+                          appendDiagnosticSegment(diagnostic_path, name), state,
+                          dispatcher, type_registry, port_buffer_size, ancestry,
                           depth + 1U);
   }
 
   ancestry.erase(service.get());
 }
 
-NodeMap snapshotComponent(
+ComponentSnapshot snapshotComponent(
     const std::shared_ptr<ComponentState> &state, RTT::TaskContext &component,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
     const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
     std::size_t port_buffer_size) {
-  NodeMap nodes;
+  ComponentSnapshot snapshot;
   const std::string components_path = appendNodeSegment("rtt", "components");
   const std::string component_path =
       appendNodeSegment(components_path, state->component_name);
-  insertNode(nodes,
+  insertNode(snapshot.nodes,
              objectSpec(component_path, components_path, state->component_name,
                         component.provides()->doc()));
-  insertNode(nodes, lifecycleSpec(component_path, state));
+  insertNode(snapshot.nodes, lifecycleSpec(component_path, state));
 
   std::set<const RTT::Service *> ancestry;
-  appendServiceContents(nodes, component.provides(), component_path, state,
+  appendServiceContents(snapshot.nodes, snapshot.unsupported,
+                        component.provides(), component_path, {}, state,
                         dispatcher, type_registry, port_buffer_size, ancestry,
                         0U);
-  return nodes;
+  std::sort(snapshot.unsupported.begin(), snapshot.unsupported.end());
+  snapshot.unsupported.erase(
+      std::unique(snapshot.unsupported.begin(), snapshot.unsupported.end()),
+      snapshot.unsupported.end());
+  return snapshot;
 }
 
 bool deleteNodes(::opcua::Server &server, std::uint16_t namespace_index,
@@ -988,6 +1087,7 @@ public:
     if (!invoked) {
       std::lock_guard<std::mutex> lock(model_mutex);
       published.erase(state.get());
+      unsupported.erase(state->component_name);
     }
   }
 
@@ -1009,9 +1109,12 @@ public:
 
     const auto self = shared_from_this();
     const auto reconcile_error = std::make_shared<std::string>();
+    const auto diagnostic_events =
+        std::make_shared<std::vector<DiagnosticEvent>>();
     std::string server_error;
     const bool success = server.invoke(
-        [self, current, reconcile_error](::opcua::Server &native) {
+        [self, current, reconcile_error,
+         diagnostic_events](::opcua::Server &native) {
           std::lock_guard<std::mutex> lock(self->model_mutex);
           const auto namespace_index = self->server.namespaceIndex();
           if (!namespace_index || !self->ensureRoots(native, *namespace_index,
@@ -1025,22 +1128,29 @@ public:
             if (!lease) {
               continue;
             }
-            const NodeMap expected = snapshotComponent(
+            const ComponentSnapshot expected = snapshotComponent(
                 state, *lease.get(), self->dispatcher, self->type_registry,
                 self->options.port_buffer_size);
             bool component_changed = false;
             if (!self->reconcileComponent(native, *namespace_index, state.get(),
-                                          expected, &component_changed,
+                                          expected.nodes, &component_changed,
                                           reconcile_error.get())) {
               return;
             }
-            changed = changed || component_changed;
+            const bool diagnostics_changed = self->updateDiagnostics(
+                state->component_name, expected.unsupported,
+                *diagnostic_events);
+            changed = changed || component_changed || diagnostics_changed;
           }
           if (changed) {
             self->advanceRevision(native);
           }
         },
         std::chrono::seconds(5), &server_error);
+
+    if (success) {
+      emitDiagnosticEvents(*diagnostic_events);
+    }
 
     std::string failure =
         server_error.empty() ? *reconcile_error : server_error;
@@ -1066,6 +1176,14 @@ public:
 
   std::size_t pendingOperationCount() const noexcept {
     return dispatcher->pendingCount();
+  }
+
+  std::vector<UnsupportedResource>
+  unsupportedResources(std::string_view component) const {
+    std::lock_guard<std::mutex> lock(model_mutex);
+    const auto found = unsupported.find(component);
+    return found == unsupported.end() ? std::vector<UnsupportedResource>{}
+                                      : found->second;
   }
 
   std::string lastError() const {
@@ -1125,11 +1243,13 @@ public:
               deleteNodes(native, *namespace_index, paths, nullptr);
             }
             self->published.clear();
+            self->unsupported.clear();
           },
           std::chrono::seconds(5));
     }
     std::lock_guard<std::mutex> lock(model_mutex);
     published.clear();
+    unsupported.clear();
   }
 
 private:
@@ -1238,12 +1358,63 @@ private:
     return true;
   }
 
+  bool updateDiagnostics(const std::string &component,
+                         const std::vector<UnsupportedResource> &expected,
+                         std::vector<DiagnosticEvent> &events) {
+    std::vector<UnsupportedResource> &current = unsupported[component];
+    std::vector<UnsupportedResource> additions;
+    std::vector<UnsupportedResource> removals;
+    std::set_difference(expected.begin(), expected.end(), current.begin(),
+                        current.end(), std::back_inserter(additions));
+    std::set_difference(current.begin(), current.end(), expected.begin(),
+                        expected.end(), std::back_inserter(removals));
+    for (auto &resource : additions) {
+      events.push_back(DiagnosticEvent{false, std::move(resource)});
+    }
+    for (auto &resource : removals) {
+      events.push_back(DiagnosticEvent{true, std::move(resource)});
+    }
+    if (additions.empty() && removals.empty()) {
+      return false;
+    }
+    current = expected;
+    return true;
+  }
+
+  void emitDiagnosticEvents(
+      const std::vector<DiagnosticEvent> &events) const noexcept {
+    for (const DiagnosticEvent &event : events) {
+      const UnsupportedResource &resource = event.resource;
+      const std::string message =
+          event.recovered
+              ? "OPC UA: component '" + resource.component +
+                    "' now publishes " + resource.kind + " '" + resource.path +
+                    "' with RTT type '" + resource.type_name + "'."
+              : resource.message();
+      if (options.warning_sink) {
+        try {
+          options.warning_sink(message);
+        } catch (...) {
+          RTT::Logger::log().logf(
+              RTT::Logger::Error, "ObjectModel",
+              "OPC UA diagnostic callback threw an exception");
+        }
+        continue;
+      }
+      RTT::Logger::log().logf(event.recovered ? RTT::Logger::Info
+                                              : RTT::Logger::Warning,
+                              "ObjectModel", "%s", message.c_str());
+    }
+  }
+
   bool removePublishedComponent(::opcua::Server &native,
                                 const ComponentState *state,
                                 std::string *error) {
+    const bool diagnostics_removed =
+        unsupported.erase(state->component_name) != 0U;
     const auto found = published.find(state);
     if (found == published.end()) {
-      return false;
+      return diagnostics_removed;
     }
     const auto namespace_index = server.namespaceIndex();
     if (!namespace_index) {
@@ -1262,7 +1433,7 @@ private:
               });
     const bool deleted = deleteNodes(native, *namespace_index, paths, error);
     published.erase(found);
-    return deleted;
+    return deleted || diagnostics_removed;
   }
 
   void advanceRevision(::opcua::Server &native) {
@@ -1292,6 +1463,8 @@ private:
   std::map<std::string, std::shared_ptr<ComponentState>> components;
   mutable std::mutex model_mutex;
   std::map<const ComponentState *, NodeMap> published;
+  std::map<std::string, std::vector<UnsupportedResource>, std::less<>>
+      unsupported;
   bool roots_ready{false};
   std::atomic<std::uint64_t> revision{0U};
   mutable std::mutex error_mutex;
@@ -1303,6 +1476,11 @@ private:
 };
 
 } // namespace detail
+
+std::string UnsupportedResource::message() const {
+  return "OPC UA: component '" + component + "' skipped " + kind + " '" + path +
+         "' because RTT type '" + type_name + "' " + reason + ".";
+}
 
 ComponentRegistration::ComponentRegistration(
     std::weak_ptr<detail::ObjectModelImpl> model,
@@ -1380,6 +1558,11 @@ std::size_t ObjectModel::componentCount() const noexcept {
 
 std::size_t ObjectModel::pendingOperationCount() const noexcept {
   return impl_->pendingOperationCount();
+}
+
+std::vector<UnsupportedResource>
+ObjectModel::unsupportedResources(std::string_view component) const {
+  return impl_->unsupportedResources(component);
 }
 
 std::string ObjectModel::lastError() const { return impl_->lastError(); }

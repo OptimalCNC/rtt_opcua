@@ -23,6 +23,8 @@ struct ComponentState;
 
 struct OperationSchema {
   bool supported{false};
+  std::string unsupported_type_name;
+  std::string unsupported_reason;
   std::string fingerprint;
   std::vector<::opcua::Argument> inputs;
   std::vector<::opcua::Argument> outputs;

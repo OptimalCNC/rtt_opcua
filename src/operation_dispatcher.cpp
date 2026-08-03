@@ -60,6 +60,26 @@ bool isMutableReference(std::string_view type) {
   return !type.starts_with("const ");
 }
 
+OperationSchema unsupportedSchema(const RTT::types::TypeInfo *type,
+                                  std::string reason) {
+  OperationSchema schema;
+  schema.unsupported_type_name =
+      type == nullptr ? "<unknown>" : type->getTypeName();
+  schema.unsupported_reason = std::move(reason);
+  return schema;
+}
+
+OperationSchema unsupportedValueSchema(const RTT::types::TypeInfo *type,
+                                       const TypeCodec *codec) {
+  if (type == nullptr) {
+    return unsupportedSchema(nullptr, "has no RTT type information");
+  }
+  if (codec == nullptr) {
+    return unsupportedSchema(type, "has no registered OPC UA protocol");
+  }
+  return unsupportedSchema(type, "does not support OPC UA values");
+}
+
 struct PendingInvocation {
   PendingInvocation(
       ComponentLease &&component_lease,
@@ -94,8 +114,16 @@ public:
               std::vector<RTT::base::DataSourceBase::shared_ptr> values) {
     auto pending = std::make_shared<PendingInvocation>(std::move(lease), handle,
                                                        std::move(values));
-    std::lock_guard<std::mutex> lock(mutex);
-    invocations.push_back(std::move(pending));
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!draining) {
+        invocations.push_back(std::move(pending));
+        return;
+      }
+    }
+    while (!pending->finished()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   void reap() noexcept {
@@ -123,12 +151,20 @@ public:
   }
 
   void drain() noexcept {
-    std::vector<std::shared_ptr<PendingInvocation>> pending;
     {
       std::lock_guard<std::mutex> lock(mutex);
-      pending.swap(invocations);
+      draining = true;
     }
-    pending.clear();
+    while (true) {
+      reap();
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (invocations.empty()) {
+          return;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
 
   std::size_t count() const noexcept {
@@ -140,6 +176,7 @@ public:
   const std::chrono::milliseconds timeout;
   mutable std::mutex mutex;
   std::vector<std::shared_ptr<PendingInvocation>> invocations;
+  bool draining{false};
 };
 
 OperationDispatcher::OperationDispatcher(
@@ -165,7 +202,7 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
           impl_->type_registry ? impl_->type_registry->codecForTypeInfo(type)
                                : nullptr;
       if (type == nullptr || codec == nullptr || !codec->hasValue()) {
-        return schema;
+        return unsupportedValueSchema(type, codec);
       }
       const std::string name = argumentName(arguments, index);
       const std::string description = argumentDescription(arguments, index);
@@ -184,7 +221,10 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
             ? impl_->type_registry->codecForTypeInfo(return_type)
             : nullptr;
     if (return_type == nullptr || return_codec == nullptr) {
-      return schema;
+      return unsupportedValueSchema(return_type, return_codec);
+    }
+    if (!return_codec->hasValue() && return_type->getTypeName() != "Void") {
+      return unsupportedValueSchema(return_type, return_codec);
     }
     has_return_value = return_codec->hasValue();
 
@@ -202,7 +242,7 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
           impl_->type_registry ? impl_->type_registry->codecForTypeInfo(type)
                                : nullptr;
       if (type == nullptr || codec == nullptr || !codec->hasValue()) {
-        return schema;
+        return unsupportedValueSchema(type, codec);
       }
 
       std::string name;
@@ -218,7 +258,8 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
         schema.output_sources.push_back(
             static_cast<std::int32_t>(argument_index));
       } else {
-        return OperationSchema{};
+        return unsupportedSchema(type,
+                                 "has unsupported mutable output metadata");
       }
 
       schema.outputs.emplace_back(name,
@@ -232,7 +273,8 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
     schema.fingerprint = fingerprint.str();
     schema.supported = true;
   } catch (...) {
-    return OperationSchema{};
+    return unsupportedSchema(nullptr,
+                             "could not be described for OPC UA publication");
   }
   return schema;
 }
