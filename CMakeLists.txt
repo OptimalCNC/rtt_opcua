@@ -21,6 +21,7 @@ orocos_library(
   orocos-rtt-opcua
   src/node_id.cpp
   src/client_session.cpp
+  src/datatype_registry.cpp
   src/object_model.cpp
   src/operation_dispatcher.cpp
   src/port_bridge.cpp
@@ -80,6 +81,32 @@ install(FILES package.xml DESTINATION share/rtt_opcua)
 
 if(BUILD_TESTING)
   enable_testing()
+
+  add_executable(
+    rtt_opcua_datatype_registry_test
+    tests/datatype_registry_test.cpp
+  )
+  target_link_libraries(
+    rtt_opcua_datatype_registry_test
+    PRIVATE orocos-rtt-opcua
+  )
+  target_compile_features(
+    rtt_opcua_datatype_registry_test PRIVATE cxx_std_20
+  )
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+      rtt_opcua_datatype_registry_test PRIVATE -Wall -Wextra -Wpedantic
+    )
+    if(RTT_OPCUA_WARNINGS_AS_ERRORS)
+      target_compile_options(rtt_opcua_datatype_registry_test PRIVATE -Werror)
+    endif()
+  endif()
+  foreach(case lifecycle missing_dependency dependency_cycle invalid_definition)
+    add_test(
+      NAME rtt_opcua_datatype_registry_test_${case}
+      COMMAND rtt_opcua_datatype_registry_test --run_test=${case}
+    )
+  endforeach()
 
   add_executable(
     rtt_opcua_foundation_test
