@@ -18,10 +18,6 @@ class TypeInfo;
 }
 } // namespace RTT
 
-namespace RTT::opcua {
-class TypeProtocol;
-}
-
 namespace RTT::opcua::detail {
 
 class RemotePortAdapter final {
@@ -47,8 +43,9 @@ public:
 private:
   RemotePortAdapter(std::shared_ptr<ClientSession> session,
                     RemotePortDescription description,
+                    std::shared_ptr<const EndpointTypeRegistry> type_registry,
                     const RTT::types::TypeInfo *type_info,
-                    const TypeProtocol *protocol,
+                    const TypeCodec *codec,
                     std::unique_ptr<RTT::base::PortInterface> port);
 
   void pumpInput();
@@ -59,8 +56,9 @@ private:
 
   std::shared_ptr<ClientSession> session_;
   RemotePortDescription description_;
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   const RTT::types::TypeInfo *type_info_;
-  const TypeProtocol *protocol_;
+  const TypeCodec *codec_;
   std::unique_ptr<RTT::base::PortInterface> port_;
   RTT::base::DataSourceBase::shared_ptr pending_input_source_;
   std::optional<::opcua::Variant> pending_input_;

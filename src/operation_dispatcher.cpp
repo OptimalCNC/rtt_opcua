@@ -2,7 +2,7 @@
 
 #include "component_state.hpp"
 
-#include <rtt/opcua/type_protocol.hpp>
+#include <rtt/opcua/endpoint_type_registry.hpp>
 
 #include <rtt/ArgumentDescription.hpp>
 #include <rtt/OperationInterfacePart.hpp>
@@ -85,8 +85,10 @@ struct PendingInvocation {
 
 class OperationDispatcher::Impl final {
 public:
-  explicit Impl(std::chrono::milliseconds operation_timeout)
-      : timeout(operation_timeout) {}
+  Impl(std::shared_ptr<const EndpointTypeRegistry> endpoint_type_registry,
+       std::chrono::milliseconds operation_timeout)
+      : type_registry(std::move(endpoint_type_registry)),
+        timeout(operation_timeout) {}
 
   void retain(ComponentLease &&lease, const RTT::internal::SendHandleC &handle,
               std::vector<RTT::base::DataSourceBase::shared_ptr> values) {
@@ -134,13 +136,16 @@ public:
     return invocations.size();
   }
 
+  const std::shared_ptr<const EndpointTypeRegistry> type_registry;
   const std::chrono::milliseconds timeout;
   mutable std::mutex mutex;
   std::vector<std::shared_ptr<PendingInvocation>> invocations;
 };
 
-OperationDispatcher::OperationDispatcher(std::chrono::milliseconds timeout)
-    : impl_(std::make_unique<Impl>(timeout)) {}
+OperationDispatcher::OperationDispatcher(
+    std::shared_ptr<const EndpointTypeRegistry> type_registry,
+    std::chrono::milliseconds timeout)
+    : impl_(std::make_unique<Impl>(std::move(type_registry), timeout)) {}
 
 OperationDispatcher::~OperationDispatcher() { impl_->drain(); }
 
@@ -156,15 +161,17 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
 
     for (unsigned int index = 0U; index < operation.arity(); ++index) {
       const RTT::types::TypeInfo *type = operation.getArgumentType(index + 1U);
-      const TypeProtocol *protocol = protocolForTypeInfo(type);
-      if (type == nullptr || protocol == nullptr || !protocol->hasValue()) {
+      const TypeCodec *codec =
+          impl_->type_registry ? impl_->type_registry->codecForTypeInfo(type)
+                               : nullptr;
+      if (type == nullptr || codec == nullptr || !codec->hasValue()) {
         return schema;
       }
       const std::string name = argumentName(arguments, index);
       const std::string description = argumentDescription(arguments, index);
-      schema.inputs.emplace_back(
-          name, ::opcua::LocalizedText("en-US", description),
-          protocol->dataTypeNodeId(), protocol->valueRank());
+      schema.inputs.emplace_back(name,
+                                 ::opcua::LocalizedText("en-US", description),
+                                 codec->dataTypeNodeId(), codec->valueRank());
       schema.input_type_names.push_back(type->getTypeName());
       fingerprint << "|in:" << name << ':' << description << ':'
                   << type->getTypeName();
@@ -172,11 +179,14 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
 
     bool has_return_value = false;
     const RTT::types::TypeInfo *return_type = operation.getArgumentType(0U);
-    const TypeProtocol *return_protocol = protocolForTypeInfo(return_type);
-    if (return_type == nullptr || return_protocol == nullptr) {
+    const TypeCodec *return_codec =
+        impl_->type_registry
+            ? impl_->type_registry->codecForTypeInfo(return_type)
+            : nullptr;
+    if (return_type == nullptr || return_codec == nullptr) {
       return schema;
     }
-    has_return_value = return_protocol->hasValue();
+    has_return_value = return_codec->hasValue();
 
     std::vector<std::size_t> mutable_arguments;
     for (std::size_t index = 0U; index < arguments.size(); ++index) {
@@ -188,8 +198,10 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
     std::size_t mutable_index = 0U;
     for (unsigned int index = 0U; index < operation.collectArity(); ++index) {
       const RTT::types::TypeInfo *type = operation.getCollectType(index + 1U);
-      const TypeProtocol *protocol = protocolForTypeInfo(type);
-      if (type == nullptr || protocol == nullptr || !protocol->hasValue()) {
+      const TypeCodec *codec =
+          impl_->type_registry ? impl_->type_registry->codecForTypeInfo(type)
+                               : nullptr;
+      if (type == nullptr || codec == nullptr || !codec->hasValue()) {
         return schema;
       }
 
@@ -209,9 +221,9 @@ OperationDispatcher::describe(RTT::OperationInterfacePart &operation) const {
         return OperationSchema{};
       }
 
-      schema.outputs.emplace_back(
-          name, ::opcua::LocalizedText("en-US", description),
-          protocol->dataTypeNodeId(), protocol->valueRank());
+      schema.outputs.emplace_back(name,
+                                  ::opcua::LocalizedText("en-US", description),
+                                  codec->dataTypeNodeId(), codec->valueRank());
       schema.output_type_names.push_back(type->getTypeName());
       fingerprint << "|out:" << name << ':' << description << ':'
                   << type->getTypeName();
@@ -249,10 +261,12 @@ OperationDispatcher::invoke(const std::shared_ptr<ComponentState> &state,
     for (std::size_t index = 0U; index < inputs.size(); ++index) {
       const RTT::types::TypeInfo *type =
           operation.getArgumentType(static_cast<unsigned int>(index + 1U));
-      const TypeProtocol *protocol = protocolForTypeInfo(type);
-      const auto value = protocol == nullptr
+      const TypeCodec *codec =
+          impl_->type_registry ? impl_->type_registry->codecForTypeInfo(type)
+                               : nullptr;
+      const auto value = codec == nullptr
                              ? RTT::base::DataSourceBase::shared_ptr{}
-                             : protocol->makeDataSource(inputs[index]);
+                             : codec->makeDataSource(inputs[index]);
       if (!value) {
         return UA_STATUSCODE_BADINVALIDARGUMENT;
       }
@@ -287,10 +301,12 @@ OperationDispatcher::invoke(const std::shared_ptr<ComponentState> &state,
       const RTT::SendStatus status = handle.collectIfDone();
       if (status == RTT::SendSuccess) {
         for (std::size_t index = 0U; index < outputs.size(); ++index) {
-          const TypeProtocol *protocol =
-              protocolForDataSource(collected_values[index]);
-          if (protocol == nullptr ||
-              !protocol->toVariant(collected_values[index], &outputs[index])) {
+          const TypeCodec *codec =
+              impl_->type_registry ? impl_->type_registry->codecForDataSource(
+                                         collected_values[index])
+                                   : nullptr;
+          if (codec == nullptr ||
+              !codec->toVariant(collected_values[index], &outputs[index])) {
             return UA_STATUSCODE_BADINTERNALERROR;
           }
         }

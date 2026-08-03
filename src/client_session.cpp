@@ -1,7 +1,6 @@
 #include "client_session.hpp"
 
 #include <rtt/opcua/node_id.hpp>
-#include <rtt/opcua/type_protocol.hpp>
 
 #include <open62541pp/client.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
@@ -211,9 +210,10 @@ bool argumentMatches(const ::opcua::Argument &argument,
 }
 
 bool validatePortMethod(::opcua::Client &client,
+                        const EndpointTypeRegistry &type_registry,
                         const RemotePortDescription &port, std::string *error) {
-  const TypeProtocol *protocol = protocolForTypeName(port.type_name);
-  if (protocol == nullptr || !protocol->hasValue()) {
+  const TypeCodec *codec = type_registry.codecForTypeName(port.type_name);
+  if (codec == nullptr || !codec->hasValue()) {
     assignError(error, "remote port '" + port.name +
                            "' uses unsupported RTT type '" + port.type_name +
                            "'");
@@ -247,11 +247,11 @@ bool validatePortMethod(::opcua::Client &client,
   const bool valid =
       port.direction == RemotePortDirection::input
           ? inputs.size() == 1U && outputs.size() == 1U && status_output &&
-                argumentMatches(inputs.front(), protocol->dataTypeNodeId(),
-                                protocol->valueRank())
+                argumentMatches(inputs.front(), codec->dataTypeNodeId(),
+                                codec->valueRank())
           : inputs.empty() && outputs.size() == 2U && status_output &&
-                argumentMatches(outputs[1], protocol->dataTypeNodeId(),
-                                protocol->valueRank());
+                argumentMatches(outputs[1], codec->dataTypeNodeId(),
+                                codec->valueRank());
   if (!valid) {
     assignError(error, "remote port '" + port.name +
                            "' exposes an incompatible method signature");
@@ -284,18 +284,26 @@ bool ClientSession::connect(std::string *error) {
   last_error_.clear();
 
   try {
-    ::opcua::ClientConfig config;
-    config.setTimeout(static_cast<std::uint32_t>(request_timeout_.count()));
-    client_ = std::make_unique<::opcua::Client>(std::move(config));
-    client_->connect(endpoint_url_);
+    if (client_) {
+      client_->disconnect();
+      client_.reset();
+    }
+    type_registry_.reset();
 
-    const auto namespaces = client_->namespaceArray();
+    std::vector<::opcua::String> namespaces;
+    {
+      ::opcua::ClientConfig discovery_config;
+      discovery_config.setTimeout(
+          static_cast<std::uint32_t>(request_timeout_.count()));
+      ::opcua::Client discovery_client(std::move(discovery_config));
+      discovery_client.connect(endpoint_url_);
+      namespaces = discovery_client.namespaceArray();
+      discovery_client.disconnect();
+    }
     const auto namespace_iterator =
         std::find(namespaces.begin(), namespaces.end(), kNamespaceUri);
     if (namespace_iterator == namespaces.end()) {
       last_error_ = "server does not expose the Orocos RTT OPC UA namespace";
-      client_->disconnect();
-      client_.reset();
       state_.store(ProxyConnectionState::disconnected);
       assignError(error, last_error_);
       return false;
@@ -304,19 +312,46 @@ bool ClientSession::connect(std::string *error) {
     if (index <= 0 || index > static_cast<std::ptrdiff_t>(
                                   std::numeric_limits<std::uint16_t>::max())) {
       last_error_ = "server returned an invalid Orocos RTT namespace index";
-      client_->disconnect();
-      client_.reset();
       state_.store(ProxyConnectionState::disconnected);
       assignError(error, last_error_);
       return false;
     }
     namespace_index_ = static_cast<std::uint16_t>(index);
+
+    std::vector<std::pair<std::string, std::uint16_t>> namespace_table;
+    namespace_table.reserve(namespaces.size());
+    for (std::size_t namespace_position = 0U;
+         namespace_position < namespaces.size(); ++namespace_position) {
+      namespace_table.emplace_back(
+          std::string(std::string_view(namespaces[namespace_position])),
+          static_cast<std::uint16_t>(namespace_position));
+    }
+    std::string registry_error;
+    auto endpoint_registry =
+        EndpointTypeRegistry::create(namespace_table, &registry_error);
+    if (!endpoint_registry) {
+      last_error_ = "failed to bind local OPC UA datatypes: " + registry_error;
+      namespace_index_ = 0U;
+      state_.store(ProxyConnectionState::disconnected);
+      assignError(error, last_error_);
+      return false;
+    }
+
+    ::opcua::ClientConfig config;
+    config.setTimeout(static_cast<std::uint32_t>(request_timeout_.count()));
+    if (!endpoint_registry->customDataTypes().empty()) {
+      config.addCustomDataTypes(endpoint_registry->customDataTypes());
+    }
+    type_registry_ = std::move(endpoint_registry);
+    client_ = std::make_unique<::opcua::Client>(std::move(config));
+    client_->connect(endpoint_url_);
     state_.store(ProxyConnectionState::connected);
     return true;
   } catch (const std::exception &exception) {
     last_error_ = std::string("failed to connect to '") + endpoint_url_ +
                   "': " + exception.what();
     client_.reset();
+    type_registry_.reset();
     namespace_index_ = 0U;
     state_.store(ProxyConnectionState::disconnected);
     assignError(error, last_error_);
@@ -675,9 +710,8 @@ bool ClientSession::readLifecycleState(const std::string &component_name,
     assignError(error, "");
     return true;
   } catch (const std::exception &exception) {
-    last_error_ =
-        std::string("failed to read remote RTT lifecycle state: ") +
-        exception.what();
+    last_error_ = std::string("failed to read remote RTT lifecycle state: ") +
+                  exception.what();
     if (!client_->isConnected()) {
       state_.store(ProxyConnectionState::stale);
     }
@@ -894,7 +928,8 @@ ClientSession::discoverPorts(const std::string &component_name,
         ports.clear();
         return ports;
       }
-      if (!validatePortMethod(*client_, port, &last_error_)) {
+      if (!type_registry_ ||
+          !validatePortMethod(*client_, *type_registry_, port, &last_error_)) {
         assignError(error, last_error_);
         ports.clear();
         return ports;
@@ -1017,21 +1052,20 @@ ClientSession::callPort(const ::opcua::NodeId &object_id,
   return callLocked(object_id, method_id, inputs, true, true);
 }
 
-RemoteCallResult ClientSession::callOperation(
-    const std::string &component_name,
-    const RemoteServicePath &service_path, const std::string &operation_name,
-    const std::vector<::opcua::Variant> &inputs) {
+RemoteCallResult
+ClientSession::callOperation(const std::string &component_name,
+                             const RemoteServicePath &service_path,
+                             const std::string &operation_name,
+                             const std::vector<::opcua::Variant> &inputs) {
   std::lock_guard<std::mutex> lock(mutex_);
   const std::vector<std::string_view> operation_folder{"operations"};
   const std::vector<std::string_view> operation_method{"operations",
-                                                        operation_name};
+                                                       operation_name};
   return callLocked(
-      ::opcua::NodeId(
-          namespace_index_,
-          modelPath(component_name, service_path, operation_folder)),
-      ::opcua::NodeId(
-          namespace_index_,
-          modelPath(component_name, service_path, operation_method)),
+      ::opcua::NodeId(namespace_index_, modelPath(component_name, service_path,
+                                                  operation_folder)),
+      ::opcua::NodeId(namespace_index_, modelPath(component_name, service_path,
+                                                  operation_method)),
       inputs, false, false);
 }
 
@@ -1053,8 +1087,8 @@ void ClientSession::invalidateInterfaceLocked() noexcept {
 
 RemoteCallResult ClientSession::callLocked(
     const ::opcua::NodeId &object_id, const ::opcua::NodeId &method_id,
-    const std::vector<::opcua::Variant> &inputs,
-    bool require_interface_access, bool tolerate_not_connected) {
+    const std::vector<::opcua::Variant> &inputs, bool require_interface_access,
+    bool tolerate_not_connected) {
   RemoteCallResult call_result;
   if (require_interface_access && !interface_access_enabled_.load()) {
     call_result.error =
@@ -1074,8 +1108,7 @@ RemoteCallResult ClientSession::callLocked(
         ::opcua::services::call(*client_, object_id, method_id, inputs);
     if (!result.statusCode().isGood()) {
       const ::opcua::StatusCode status = result.statusCode();
-      call_result.error =
-          statusMessage("remote RTT operation failed", status);
+      call_result.error = statusMessage("remote RTT operation failed", status);
       last_error_ = call_result.error;
       const bool expected_port_disconnect =
           tolerate_not_connected &&
@@ -1106,6 +1139,12 @@ ProxyConnectionState ClientSession::state() const noexcept {
 
 const std::string &ClientSession::endpointUrl() const noexcept {
   return endpoint_url_;
+}
+
+std::shared_ptr<const EndpointTypeRegistry>
+ClientSession::typeRegistry() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return type_registry_;
 }
 
 std::string ClientSession::lastError() const {

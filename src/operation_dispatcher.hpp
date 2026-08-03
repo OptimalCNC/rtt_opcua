@@ -13,6 +13,10 @@ namespace RTT {
 class OperationInterfacePart;
 }
 
+namespace RTT::opcua {
+class EndpointTypeRegistry;
+}
+
 namespace RTT::opcua::detail {
 
 struct ComponentState;
@@ -29,7 +33,8 @@ struct OperationSchema {
 
 class OperationDispatcher final {
 public:
-  explicit OperationDispatcher(std::chrono::milliseconds timeout);
+  OperationDispatcher(std::shared_ptr<const EndpointTypeRegistry> type_registry,
+                      std::chrono::milliseconds timeout);
   ~OperationDispatcher();
 
   OperationDispatcher(const OperationDispatcher &) = delete;

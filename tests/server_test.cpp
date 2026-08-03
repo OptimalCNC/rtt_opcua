@@ -1,10 +1,13 @@
 #define BOOST_TEST_MODULE rtt_opcua_server
 #include <boost/test/included/unit_test.hpp>
 
+#include <rtt/opcua/datatype_registry.hpp>
+#include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/server.hpp>
 
 #include <open62541pp/client.hpp>
+#include <open62541pp/datatype.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
 #include <open62541pp/services/nodemanagement.hpp>
 #include <open62541pp/ua/nodeids.hpp>
@@ -24,6 +27,43 @@
 #include <thread>
 
 namespace {
+
+constexpr std::string_view kFixtureNamespaceUri =
+    "urn:test:rtt-opcua:server-types";
+
+struct ServerFixtureValue {
+  std::int32_t value;
+};
+
+struct ServerDatatypeFixture {
+  ServerDatatypeFixture() {
+    const RTT::opcua::LogicalDataTypeId id{
+        std::string(kFixtureNamespaceUri), "types/ServerFixtureValue",
+        "encodings/ServerFixtureValue/Binary"};
+    RTT::opcua::CustomDataTypeDefinition definition;
+    definition.name = "ServerFixtureValue";
+    definition.id = id;
+    definition.schema_fingerprint = "server-fixture-value-v1";
+    definition.materialize =
+        [id](const RTT::opcua::DataTypeFactoryContext &context) {
+          return ::opcua::DataTypeBuilder<ServerFixtureValue>::createStructure(
+                     "ServerFixtureValue", context.nodeId(id),
+                     {context.namespaceIndex(id.namespace_uri),
+                      id.binary_encoding_node_id})
+              .addField<&ServerFixtureValue::value>("value")
+              .build();
+        };
+
+    RTT::opcua::DataTypeProvider provider;
+    provider.name = "server-fixture";
+    provider.namespace_uri = std::string(kFixtureNamespaceUri);
+    provider.data_types.push_back(std::move(definition));
+    std::string error;
+    if (!RTT::opcua::registerDataTypeProvider(std::move(provider), &error)) {
+      throw std::runtime_error(error);
+    }
+  }
+};
 
 std::uint16_t unusedLoopbackPort() {
   const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -54,10 +94,11 @@ std::uint16_t unusedLoopbackPort() {
 
 } // namespace
 
+BOOST_GLOBAL_FIXTURE(ServerDatatypeFixture);
+
 BOOST_AUTO_TEST_CASE(non_loopback_server_options_are_rejected_as_unsupported) {
   for (const std::string &bind_address :
-       {std::string("0.0.0.0"), std::string("192.0.2.1"),
-        std::string("::")}) {
+       {std::string("0.0.0.0"), std::string("192.0.2.1"), std::string("::")}) {
     RTT::opcua::ServerOptions options;
     options.bind_address = bind_address;
 
@@ -157,4 +198,49 @@ BOOST_AUTO_TEST_CASE(loopback_server_exposes_namespace_and_serialized_tasks) {
   BOOST_CHECK(server.state() == RTT::opcua::ServerState::stopped);
   BOOST_TEST(!server.isRunning());
   server.stop();
+}
+
+BOOST_AUTO_TEST_CASE(custom_datatype_binding_follows_endpoint_namespace_order) {
+  RTT::opcua::ServerOptions first_options;
+  first_options.port = unusedLoopbackPort();
+  RTT::opcua::Server first(first_options);
+
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(first.start(&error), error);
+  const auto first_registry = first.typeRegistry();
+  BOOST_REQUIRE(first_registry != nullptr);
+  const auto first_provider_index = first.namespaceIndex(kFixtureNamespaceUri);
+  BOOST_REQUIRE(first_provider_index.has_value());
+  BOOST_REQUIRE(
+      first_registry->namespaceIndex(kFixtureNamespaceUri).has_value());
+  BOOST_TEST(*first_registry->namespaceIndex(kFixtureNamespaceUri) ==
+             *first_provider_index);
+  BOOST_REQUIRE(first_registry->customDataTypes().size() == 1U);
+  BOOST_CHECK(
+      first_registry->customDataTypes().front().typeId() ==
+      ::opcua::NodeId(*first_provider_index, "types/ServerFixtureValue"));
+  first.stop();
+  BOOST_TEST(first.typeRegistry() == nullptr);
+
+  RTT::opcua::ServerOptions second_options;
+  second_options.port = unusedLoopbackPort();
+  second_options.additional_namespace_uris = {"urn:test:rtt-opcua:unrelated"};
+  RTT::opcua::Server second(second_options);
+  BOOST_REQUIRE_MESSAGE(second.start(&error), error);
+  const auto second_registry = second.typeRegistry();
+  BOOST_REQUIRE(second_registry != nullptr);
+  const auto second_provider_index =
+      second.namespaceIndex(kFixtureNamespaceUri);
+  BOOST_REQUIRE(second_provider_index.has_value());
+  BOOST_TEST(*second_provider_index != *first_provider_index);
+  BOOST_REQUIRE(
+      second_registry->namespaceIndex(kFixtureNamespaceUri).has_value());
+  BOOST_TEST(*second_registry->namespaceIndex(kFixtureNamespaceUri) ==
+             *second_provider_index);
+  BOOST_REQUIRE(second_registry->customDataTypes().size() == 1U);
+  BOOST_CHECK(
+      second_registry->customDataTypes().front().typeId() ==
+      ::opcua::NodeId(*second_provider_index, "types/ServerFixtureValue"));
+  second.stop();
+  BOOST_TEST(second.typeRegistry() == nullptr);
 }

@@ -1,6 +1,6 @@
 #include "port_bridge.hpp"
 
-#include <rtt/opcua/type_protocol.hpp>
+#include <rtt/opcua/endpoint_type_registry.hpp>
 
 #include <rtt/ConnPolicy.hpp>
 #include <rtt/FlowStatus.hpp>
@@ -47,8 +47,10 @@ std::string writeStatusName(RTT::WriteStatus status) {
 
 } // namespace
 
-PortBridge::PortBridge(std::unique_ptr<RTT::base::PortInterface> peer)
-    : peer_(std::move(peer)) {}
+PortBridge::PortBridge(
+    std::shared_ptr<const EndpointTypeRegistry> type_registry,
+    std::unique_ptr<RTT::base::PortInterface> peer)
+    : type_registry_(std::move(type_registry)), peer_(std::move(peer)) {}
 
 PortBridge::~PortBridge() {
   if (peer_) {
@@ -60,16 +62,17 @@ PortBridge::~PortBridge() {
   }
 }
 
-std::shared_ptr<PortBridge> PortBridge::create(RTT::base::PortInterface &port,
-                                               std::size_t buffer_size,
-                                               std::string *error) {
+std::shared_ptr<PortBridge>
+PortBridge::create(RTT::base::PortInterface &port,
+                   std::shared_ptr<const EndpointTypeRegistry> type_registry,
+                   std::size_t buffer_size, std::string *error) {
   if (buffer_size == 0U ||
       buffer_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     assignError(error, "OPC UA port buffer size is out of range");
     return {};
   }
-  if (port.getTypeInfo() == nullptr ||
-      protocolForTypeInfo(port.getTypeInfo()) == nullptr) {
+  if (!type_registry || port.getTypeInfo() == nullptr ||
+      type_registry->codecForTypeInfo(port.getTypeInfo()) == nullptr) {
     assignError(error, "OPC UA port type is not transportable");
     return {};
   }
@@ -97,7 +100,8 @@ std::shared_ptr<PortBridge> PortBridge::create(RTT::base::PortInterface &port,
   }
 
   assignError(error, {});
-  return std::shared_ptr<PortBridge>(new PortBridge(std::move(peer)));
+  return std::shared_ptr<PortBridge>(
+      new PortBridge(std::move(type_registry), std::move(peer)));
 }
 
 ::opcua::StatusCode
@@ -112,13 +116,14 @@ PortBridge::read(::opcua::Span<::opcua::Variant> outputs) noexcept {
 
   try {
     const auto value = input->getTypeInfo()->buildValue();
-    const TypeProtocol *protocol = protocolForTypeInfo(input->getTypeInfo());
-    if (!value || protocol == nullptr) {
+    const TypeCodec *codec =
+        type_registry_->codecForTypeInfo(input->getTypeInfo());
+    if (!value || codec == nullptr) {
       return UA_STATUSCODE_BADNOTSUPPORTED;
     }
     const RTT::FlowStatus status = input->read(value, true);
     outputs[0] = ::opcua::Variant(flowStatusName(status));
-    if (!protocol->toVariant(value, &outputs[1])) {
+    if (!codec->toVariant(value, &outputs[1])) {
       return UA_STATUSCODE_BADINTERNALERROR;
     }
     return UA_STATUSCODE_GOOD;
@@ -139,10 +144,11 @@ PortBridge::write(::opcua::Span<const ::opcua::Variant> inputs,
   }
 
   try {
-    const TypeProtocol *protocol = protocolForTypeInfo(output->getTypeInfo());
-    const auto value = protocol == nullptr
+    const TypeCodec *codec =
+        type_registry_->codecForTypeInfo(output->getTypeInfo());
+    const auto value = codec == nullptr
                            ? RTT::base::DataSourceBase::shared_ptr{}
-                           : protocol->makeDataSource(inputs[0]);
+                           : codec->makeDataSource(inputs[0]);
     if (!value) {
       return UA_STATUSCODE_BADINVALIDARGUMENT;
     }

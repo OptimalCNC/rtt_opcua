@@ -10,13 +10,18 @@ namespace RTT::base {
 class PortInterface;
 }
 
+namespace RTT::opcua {
+class EndpointTypeRegistry;
+}
+
 namespace RTT::opcua::detail {
 
 class PortBridge final {
 public:
-  static std::shared_ptr<PortBridge> create(RTT::base::PortInterface &port,
-                                            std::size_t buffer_size,
-                                            std::string *error = nullptr);
+  static std::shared_ptr<PortBridge>
+  create(RTT::base::PortInterface &port,
+         std::shared_ptr<const EndpointTypeRegistry> type_registry,
+         std::size_t buffer_size, std::string *error = nullptr);
 
   ~PortBridge();
 
@@ -28,8 +33,10 @@ public:
                             ::opcua::Span<::opcua::Variant> outputs) noexcept;
 
 private:
-  explicit PortBridge(std::unique_ptr<RTT::base::PortInterface> peer);
+  PortBridge(std::shared_ptr<const EndpointTypeRegistry> type_registry,
+             std::unique_ptr<RTT::base::PortInterface> peer);
 
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   std::unique_ptr<RTT::base::PortInterface> peer_;
 };
 

@@ -1,6 +1,8 @@
 #define BOOST_TEST_MODULE rtt_opcua_task_context_proxy
 #include <boost/test/included/unit_test.hpp>
 
+#include "custom_datatype_test_support.hpp"
+
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/object_model.hpp>
 #include <rtt/opcua/server.hpp>
@@ -42,6 +44,8 @@
 
 namespace {
 
+using RTT::opcua::test::FixtureValue;
+
 std::uint16_t unusedLoopbackPort() {
   const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (socket_fd < 0) {
@@ -78,6 +82,19 @@ struct CanonicalTypesFixture {
   }
 };
 
+struct CustomDatatypeFixture {
+  CustomDatatypeFixture() {
+    if (RTT::types::Types()->type("Int32") == nullptr) {
+      RTT::types::RealTimeTypekitPlugin().loadTypes();
+    }
+    std::string error;
+    if (!RTT::opcua::registerCanonicalTypeProtocols(&error) ||
+        !RTT::opcua::test::registerFixtureType(&error)) {
+      throw std::runtime_error(error);
+    }
+  }
+};
+
 template <typename Predicate>
 bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout =
                                         std::chrono::milliseconds(1000)) {
@@ -94,7 +111,8 @@ bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout =
 class ProxyTarget final : public RTT::TaskContext {
 public:
   ProxyTarget()
-      : RTT::TaskContext("remote/calculator", RTT::TaskContext::PreOperational) {
+      : RTT::TaskContext("remote/calculator",
+                         RTT::TaskContext::PreOperational) {
     provides()->doc("Remote calculator.");
     addPort(feedback).doc("Calculated feedback.");
     addPort(command).doc("Requested command.");
@@ -166,7 +184,33 @@ public:
   RTT::OutputPort<std::int32_t> math_feedback{"MathFeedback"};
 };
 
+class CustomProxyTarget final : public RTT::TaskContext {
+public:
+  CustomProxyTarget()
+      : RTT::TaskContext("remote/custom", RTT::TaskContext::PreOperational) {
+    addProperty("Configured", configured);
+    addAttribute("Observed", observed);
+    addPort(feedback);
+    addPort(command);
+    addOperation("adjust", &CustomProxyTarget::adjust, this, RTT::OwnThread)
+        .arg("value", "Value to adjust.");
+  }
+
+  FixtureValue adjust(FixtureValue value) {
+    ++value.count;
+    value.scale *= 2.0;
+    return value;
+  }
+
+  FixtureValue configured{3, 1.5};
+  FixtureValue observed{4, 2.5};
+  RTT::OutputPort<FixtureValue> feedback{"Feedback"};
+  RTT::InputPort<FixtureValue> command{"Command"};
+};
+
 } // namespace
+
+BOOST_GLOBAL_FIXTURE(CustomDatatypeFixture);
 
 BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
                         CanonicalTypesFixture) {
@@ -200,8 +244,7 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(proxy->setPeriod(0.0));
   BOOST_TEST(proxy->setPeriod(0.01));
   BOOST_TEST(proxy->getPeriod() == 0.01, boost::test_tools::tolerance(0.001));
-  BOOST_TEST(target.getPeriod() == 0.01,
-             boost::test_tools::tolerance(0.001));
+  BOOST_TEST(target.getPeriod() == 0.01, boost::test_tools::tolerance(0.001));
   BOOST_TEST(proxy->setPeriod(0.0));
   BOOST_TEST(proxy->getCpuAffinity() == target.getCpuAffinity());
   BOOST_TEST(!proxy->update());
@@ -241,8 +284,9 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
 
   RTT::base::AttributeBase *status = proxy->provides()->getAttribute("Status");
   BOOST_REQUIRE(status != nullptr);
-  auto *status_source = RTT::internal::AssignableDataSource<std::string>::narrow(
-      status->getDataSource().get());
+  auto *status_source =
+      RTT::internal::AssignableDataSource<std::string>::narrow(
+          status->getDataSource().get());
   BOOST_REQUIRE(status_source != nullptr);
   BOOST_TEST(status_source->get() == "idle");
   BOOST_REQUIRE(proxy->configure());
@@ -445,10 +489,9 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(add_caller.call());
   BOOST_TEST(sum == 42);
 
-  const std::vector<RTT::base::DataSourceBase::shared_ptr>
-      cached_add_arguments{
-          new RTT::internal::ConstantDataSource<std::int32_t>(30),
-          new RTT::internal::ConstantDataSource<std::int32_t>(12)};
+  const std::vector<RTT::base::DataSourceBase::shared_ptr> cached_add_arguments{
+      new RTT::internal::ConstantDataSource<std::int32_t>(30),
+      new RTT::internal::ConstantDataSource<std::int32_t>(12)};
   RTT::base::DataSourceBase::shared_ptr cached_add_call = add->produce(
       cached_add_arguments, RTT::internal::GlobalEngine::Instance());
   BOOST_REQUIRE(cached_add_call);
@@ -598,6 +641,93 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(!proxy->configure());
   BOOST_TEST(proxy->getPeriod() == -1.0);
   BOOST_TEST(proxy->getCpuAffinity() == ~0U);
+  proxy.reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_round_trips_an_endpoint_bound_custom_datatype,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  server_options.additional_namespace_uris = {"urn:test:unrelated"};
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::milliseconds(10);
+  RTT::opcua::ObjectModel model(server, model_options);
+  CustomProxyTarget target;
+  auto registration = model.registerComponent(target, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  RTT::opcua::TaskContextProxyOptions proxy_options;
+  proxy_options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), proxy_options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+
+  auto *configured = dynamic_cast<RTT::Property<FixtureValue> *>(
+      proxy->provides()->getProperty("Configured"));
+  BOOST_REQUIRE(configured != nullptr);
+  BOOST_TEST(configured->get().count == 3);
+  BOOST_TEST(configured->get().scale == 1.5);
+  configured->set({8, 4.5});
+  BOOST_TEST(target.configured.count == 8);
+  BOOST_TEST(target.configured.scale == 4.5);
+
+  RTT::base::AttributeBase *observed =
+      proxy->provides()->getAttribute("Observed");
+  BOOST_REQUIRE(observed != nullptr);
+  auto *observed_source =
+      RTT::internal::AssignableDataSource<FixtureValue>::narrow(
+          observed->getDataSource().get());
+  BOOST_REQUIRE(observed_source != nullptr);
+  BOOST_TEST(observed_source->get().count == 4);
+  observed_source->set({9, 5.5});
+  BOOST_TEST(target.observed.count == 9);
+  BOOST_TEST(target.observed.scale == 5.5);
+
+  RTT::OperationInterfacePart *adjust =
+      proxy->provides()->getOperation("adjust");
+  BOOST_REQUIRE(adjust != nullptr);
+  FixtureValue adjusted;
+  RTT::internal::OperationCallerC adjust_caller(
+      adjust, "adjust", RTT::internal::GlobalEngine::Instance());
+  adjust_caller.argC(FixtureValue{10, 3.0}).ret(adjusted);
+  adjust_caller.check();
+  BOOST_REQUIRE(adjust_caller.call());
+  BOOST_TEST(adjusted.count == 11);
+  BOOST_TEST(adjusted.scale == 6.0);
+
+  auto *remote_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
+      proxy->ports()->getPort("Feedback"));
+  BOOST_REQUIRE(remote_feedback != nullptr);
+  RTT::InputPort<FixtureValue> feedback_sink("FeedbackSink");
+  BOOST_REQUIRE(remote_feedback->createConnection(
+      feedback_sink, RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  BOOST_TEST(target.feedback.write(FixtureValue{12, 6.5}) == RTT::WriteSuccess);
+  FixtureValue feedback_value;
+  BOOST_REQUIRE(waitUntil(
+      [&] { return feedback_sink.read(feedback_value) == RTT::NewData; }));
+  BOOST_TEST(feedback_value.count == 12);
+  BOOST_TEST(feedback_value.scale == 6.5);
+
+  auto *remote_command = dynamic_cast<RTT::base::InputPortInterface *>(
+      proxy->ports()->getPort("Command"));
+  BOOST_REQUIRE(remote_command != nullptr);
+  RTT::OutputPort<FixtureValue> command_source("CommandSource");
+  BOOST_REQUIRE(command_source.createConnection(
+      *remote_command,
+      RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  BOOST_TEST(command_source.write(FixtureValue{13, 7.5}) == RTT::WriteSuccess);
+  FixtureValue command_value;
+  BOOST_REQUIRE(waitUntil(
+      [&] { return target.command.read(command_value) == RTT::NewData; }));
+  BOOST_TEST(command_value.count == 13);
+  BOOST_TEST(command_value.scale == 7.5);
+
+  registration->reset();
   proxy.reset();
   server.stop();
 }

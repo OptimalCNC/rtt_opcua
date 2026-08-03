@@ -1,7 +1,5 @@
 #include "remote_operation.hpp"
 
-#include <rtt/opcua/type_protocol.hpp>
-
 #include <rtt/ArgumentDescription.hpp>
 #include <rtt/FactoryExceptions.hpp>
 #include <rtt/Handle.hpp>
@@ -53,15 +51,16 @@ copyDataSources(const DataSourceList &sources,
   return copies;
 }
 
-bool encodeArguments(const DataSourceList &arguments,
+bool encodeArguments(const EndpointTypeRegistry &type_registry,
+                     const DataSourceList &arguments,
                      std::vector<::opcua::Variant> *inputs) {
   inputs->clear();
   inputs->reserve(arguments.size());
   try {
     for (const auto &argument : arguments) {
-      const TypeProtocol *protocol = protocolForDataSource(argument);
+      const TypeCodec *codec = type_registry.codecForDataSource(argument);
       ::opcua::Variant value;
-      if (protocol == nullptr || !protocol->toVariant(argument, &value)) {
+      if (codec == nullptr || !codec->toVariant(argument, &value)) {
         inputs->clear();
         return false;
       }
@@ -74,7 +73,8 @@ bool encodeArguments(const DataSourceList &arguments,
   }
 }
 
-bool assignCallOutputs(const RemoteCallResult &result,
+bool assignCallOutputs(const EndpointTypeRegistry &type_registry,
+                       const RemoteCallResult &result,
                        const std::vector<std::string> &output_types,
                        const std::vector<std::int32_t> &output_sources,
                        const DataSourceList &arguments,
@@ -84,7 +84,8 @@ bool assignCallOutputs(const RemoteCallResult &result,
     return false;
   }
   for (std::size_t index = 0U; index < output_types.size(); ++index) {
-    const TypeProtocol *protocol = protocolForTypeName(output_types[index]);
+    const TypeCodec *codec =
+        type_registry.codecForTypeName(output_types[index]);
     const std::int32_t source = output_sources[index];
     const DataSource::shared_ptr destination =
         source == -1 ? return_value
@@ -92,8 +93,8 @@ bool assignCallOutputs(const RemoteCallResult &result,
                                            arguments.size()
                             ? arguments[static_cast<std::size_t>(source)]
                             : DataSource::shared_ptr{});
-    if (protocol == nullptr || !destination ||
-        !protocol->assignVariant(result.outputs[index], destination)) {
+    if (codec == nullptr || !destination ||
+        !codec->assignVariant(result.outputs[index], destination)) {
       return false;
     }
   }
@@ -103,19 +104,22 @@ bool assignCallOutputs(const RemoteCallResult &result,
 class RemoteCallAction final : public RTT::base::ActionInterface {
 public:
   RemoteCallAction(std::shared_ptr<ClientSession> session,
+                   std::shared_ptr<const EndpointTypeRegistry> type_registry,
                    ::opcua::NodeId object_id, ::opcua::NodeId method_id,
                    DataSourceList arguments,
                    std::vector<std::string> output_types,
                    std::vector<std::int32_t> output_sources,
                    DataSource::shared_ptr return_value)
-      : session_(std::move(session)), object_id_(std::move(object_id)),
-        method_id_(std::move(method_id)), arguments_(std::move(arguments)),
+      : session_(std::move(session)), type_registry_(std::move(type_registry)),
+        object_id_(std::move(object_id)), method_id_(std::move(method_id)),
+        arguments_(std::move(arguments)),
         output_types_(std::move(output_types)),
         output_sources_(std::move(output_sources)),
         return_value_(std::move(return_value)) {}
 
   void readArguments() override {
-    prepared_ = encodeArguments(arguments_, &inputs_);
+    prepared_ = type_registry_ &&
+                encodeArguments(*type_registry_, arguments_, &inputs_);
   }
 
   bool execute() override {
@@ -124,13 +128,15 @@ public:
     }
     const RemoteCallResult result =
         session_->call(object_id_, method_id_, inputs_);
-    return assignCallOutputs(result, output_types_, output_sources_, arguments_,
-                             return_value_);
+    return type_registry_ &&
+           assignCallOutputs(*type_registry_, result, output_types_,
+                             output_sources_, arguments_, return_value_);
   }
 
   RemoteCallAction *clone() const override {
-    return new RemoteCallAction(session_, object_id_, method_id_, arguments_,
-                                output_types_, output_sources_, return_value_);
+    return new RemoteCallAction(session_, type_registry_, object_id_,
+                                method_id_, arguments_, output_types_,
+                                output_sources_, return_value_);
   }
 
   RemoteCallAction *copy(std::map<const DataSource *, DataSource *>
@@ -138,14 +144,15 @@ public:
     DataSource::shared_ptr return_copy =
         return_value_ ? return_value_->copy(already_cloned)
                       : DataSource::shared_ptr{};
-    return new RemoteCallAction(session_, object_id_, method_id_,
-                                copyDataSources(arguments_, already_cloned),
-                                output_types_, output_sources_,
-                                std::move(return_copy));
+    return new RemoteCallAction(
+        session_, type_registry_, object_id_, method_id_,
+        copyDataSources(arguments_, already_cloned), output_types_,
+        output_sources_, std::move(return_copy));
   }
 
 private:
   std::shared_ptr<ClientSession> session_;
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   ::opcua::NodeId object_id_;
   ::opcua::NodeId method_id_;
   DataSourceList arguments_;
@@ -159,15 +166,17 @@ private:
 class RemoteSendAction final : public RTT::base::ActionInterface {
 public:
   RemoteSendAction(std::shared_ptr<ClientSession> session,
+                   std::shared_ptr<const EndpointTypeRegistry> type_registry,
                    ::opcua::NodeId object_id, ::opcua::NodeId method_id,
                    DataSourceList arguments,
                    InvocationDataSource::shared_ptr handle)
-      : session_(std::move(session)), object_id_(std::move(object_id)),
-        method_id_(std::move(method_id)), arguments_(std::move(arguments)),
-        handle_(std::move(handle)) {}
+      : session_(std::move(session)), type_registry_(std::move(type_registry)),
+        object_id_(std::move(object_id)), method_id_(std::move(method_id)),
+        arguments_(std::move(arguments)), handle_(std::move(handle)) {}
 
   void readArguments() override {
-    prepared_ = encodeArguments(arguments_, &inputs_);
+    prepared_ = type_registry_ &&
+                encodeArguments(*type_registry_, arguments_, &inputs_);
   }
 
   bool execute() override {
@@ -193,20 +202,21 @@ public:
   }
 
   RemoteSendAction *clone() const override {
-    return new RemoteSendAction(session_, object_id_, method_id_, arguments_,
-                                handle_);
+    return new RemoteSendAction(session_, type_registry_, object_id_,
+                                method_id_, arguments_, handle_);
   }
 
   RemoteSendAction *copy(std::map<const DataSource *, DataSource *>
                              &already_cloned) const override {
     InvocationDataSource::shared_ptr handle_copy(handle_->copy(already_cloned));
-    return new RemoteSendAction(session_, object_id_, method_id_,
-                                copyDataSources(arguments_, already_cloned),
-                                std::move(handle_copy));
+    return new RemoteSendAction(
+        session_, type_registry_, object_id_, method_id_,
+        copyDataSources(arguments_, already_cloned), std::move(handle_copy));
   }
 
 private:
   std::shared_ptr<ClientSession> session_;
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   ::opcua::NodeId object_id_;
   ::opcua::NodeId method_id_;
   DataSourceList arguments_;
@@ -218,11 +228,13 @@ private:
 class RemoteCollectDataSource final
     : public RTT::internal::DataSource<RTT::SendStatus> {
 public:
-  RemoteCollectDataSource(RemoteInvocationPtr invocation,
-                          DataSourceList destinations,
-                          std::vector<std::string> output_types,
-                          RTT::internal::DataSource<bool>::shared_ptr blocking)
-      : invocation_(std::move(invocation)),
+  RemoteCollectDataSource(
+      std::shared_ptr<const EndpointTypeRegistry> type_registry,
+      RemoteInvocationPtr invocation, DataSourceList destinations,
+      std::vector<std::string> output_types,
+      RTT::internal::DataSource<bool>::shared_ptr blocking)
+      : type_registry_(std::move(type_registry)),
+        invocation_(std::move(invocation)),
         destinations_(std::move(destinations)),
         output_types_(std::move(output_types)), blocking_(std::move(blocking)) {
   }
@@ -252,11 +264,12 @@ public:
         return status_;
       }
       for (std::size_t index = 0U; index < destinations_.size(); ++index) {
-        const TypeProtocol *protocol =
-            protocolForTypeName(output_types_[index]);
-        if (protocol == nullptr ||
-            !protocol->assignVariant(result->outputs[index],
-                                     destinations_[index])) {
+        const TypeCodec *codec =
+            type_registry_
+                ? type_registry_->codecForTypeName(output_types_[index])
+                : nullptr;
+        if (codec == nullptr || !codec->assignVariant(result->outputs[index],
+                                                      destinations_[index])) {
           status_ = RTT::SendFailure;
           return status_;
         }
@@ -274,8 +287,8 @@ public:
   const RTT::SendStatus &rvalue() const override { return status_; }
 
   RemoteCollectDataSource *clone() const override {
-    return new RemoteCollectDataSource(invocation_, destinations_,
-                                       output_types_, blocking_);
+    return new RemoteCollectDataSource(type_registry_, invocation_,
+                                       destinations_, output_types_, blocking_);
   }
 
   RemoteCollectDataSource *
@@ -284,11 +297,13 @@ public:
     RTT::internal::DataSource<bool>::shared_ptr blocking_copy(
         blocking_->copy(already_cloned));
     return new RemoteCollectDataSource(
-        invocation_, copyDataSources(destinations_, already_cloned),
-        output_types_, std::move(blocking_copy));
+        type_registry_, invocation_,
+        copyDataSources(destinations_, already_cloned), output_types_,
+        std::move(blocking_copy));
   }
 
 private:
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   RemoteInvocationPtr invocation_;
   DataSourceList destinations_;
   std::vector<std::string> output_types_;
@@ -300,10 +315,16 @@ class RemoteOperation final : public RTT::OperationInterfacePart {
 public:
   RemoteOperation(std::shared_ptr<ClientSession> session,
                   RemoteOperationDescription description)
-      : session_(std::move(session)), description_(std::move(description)) {
+      : session_(std::move(session)),
+        type_registry_(session_ ? session_->typeRegistry() : nullptr),
+        description_(std::move(description)) {
+    if (!type_registry_) {
+      throw std::runtime_error("OPC UA client type registry is unavailable");
+    }
     for (const std::string &name : description_.input_types) {
       const RTT::types::TypeInfo *type = RTT::types::Types()->type(name);
-      if (type == nullptr || protocolForTypeInfo(type) == nullptr) {
+      if (type == nullptr ||
+          type_registry_->codecForTypeInfo(type) == nullptr) {
         throw std::runtime_error("unsupported remote RTT input type '" + name +
                                  "'");
       }
@@ -311,7 +332,8 @@ public:
     }
     for (const std::string &name : description_.output_types) {
       const RTT::types::TypeInfo *type = RTT::types::Types()->type(name);
-      if (type == nullptr || protocolForTypeInfo(type) == nullptr) {
+      if (type == nullptr ||
+          type_registry_->codecForTypeInfo(type) == nullptr) {
         throw std::runtime_error("unsupported remote RTT output type '" + name +
                                  "'");
       }
@@ -425,8 +447,9 @@ public:
       }
     }
     auto *action = new RemoteCallAction(
-        session_, description_.object_id, description_.method_id, arguments,
-        description_.output_types, description_.output_sources, return_value);
+        session_, type_registry_, description_.object_id,
+        description_.method_id, arguments, description_.output_types,
+        description_.output_sources, return_value);
     if (!return_value) {
       return new RTT::internal::DataSourceCommand(action);
     }
@@ -446,7 +469,7 @@ public:
         new RTT::internal::ValueDataSource<RemoteInvocationPtr>();
     return new RTT::internal::ActionAliasAssignableDataSource<
         RemoteInvocationPtr>(
-        new RemoteSendAction(session_, description_.object_id,
+        new RemoteSendAction(session_, type_registry_, description_.object_id,
                              description_.method_id, arguments, handle),
         handle.get());
   }
@@ -472,9 +495,9 @@ public:
 
     DataSourceList destinations(arguments.begin() + 1, arguments.end());
     validateDestinations(destinations);
-    return new RemoteCollectDataSource(handle->get(), std::move(destinations),
-                                       description_.output_types,
-                                       std::move(blocking));
+    return new RemoteCollectDataSource(
+        type_registry_, handle->get(), std::move(destinations),
+        description_.output_types, std::move(blocking));
   }
 
 #ifdef ORO_SIGNALLING_OPERATIONS
@@ -498,7 +521,7 @@ private:
                            : std::string("null");
       const std::string expected = input_types_[index]->getTypeName();
       if (!arguments[index] || received != expected ||
-          protocolForDataSource(arguments[index]) == nullptr) {
+          type_registry_->codecForDataSource(arguments[index]) == nullptr) {
         throw RTT::wrong_types_of_args_exception(static_cast<int>(index + 1U),
                                                  expected, received);
       }
@@ -526,6 +549,7 @@ private:
   }
 
   std::shared_ptr<ClientSession> session_;
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   RemoteOperationDescription description_;
   std::vector<const RTT::types::TypeInfo *> input_types_;
   std::vector<const RTT::types::TypeInfo *> output_types_;

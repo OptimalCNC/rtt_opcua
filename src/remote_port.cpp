@@ -1,7 +1,5 @@
 #include "remote_port.hpp"
 
-#include <rtt/opcua/type_protocol.hpp>
-
 #include <rtt/FlowStatus.hpp>
 #include <rtt/base/InputPortInterface.hpp>
 #include <rtt/base/OutputPortInterface.hpp>
@@ -30,9 +28,11 @@ RemotePortAdapter::create(std::shared_ptr<ClientSession> session,
                           std::string *error) {
   RTT::types::TypeInfo *type_info =
       RTT::types::Types()->type(description.type_name);
-  const TypeProtocol *protocol = protocolForTypeInfo(type_info);
-  if (!session || type_info == nullptr || protocol == nullptr ||
-      !protocol->hasValue()) {
+  const auto type_registry = session ? session->typeRegistry() : nullptr;
+  const TypeCodec *codec =
+      type_registry ? type_registry->codecForTypeInfo(type_info) : nullptr;
+  if (!session || type_info == nullptr || codec == nullptr ||
+      !codec->hasValue()) {
     assignError(error, "remote port '" + description.name +
                            "' uses unsupported RTT type '" +
                            description.type_name + "'");
@@ -54,15 +54,17 @@ RemotePortAdapter::create(std::shared_ptr<ClientSession> session,
   assignError(error, {});
   return std::shared_ptr<RemotePortAdapter>(
       new RemotePortAdapter(std::move(session), std::move(description),
-                            type_info, protocol, std::move(port)));
+                            type_registry, type_info, codec, std::move(port)));
 }
 
 RemotePortAdapter::RemotePortAdapter(
     std::shared_ptr<ClientSession> session, RemotePortDescription description,
-    const RTT::types::TypeInfo *type_info, const TypeProtocol *protocol,
+    std::shared_ptr<const EndpointTypeRegistry> type_registry,
+    const RTT::types::TypeInfo *type_info, const TypeCodec *codec,
     std::unique_ptr<RTT::base::PortInterface> port)
     : session_(std::move(session)), description_(std::move(description)),
-      type_info_(type_info), protocol_(protocol), port_(std::move(port)) {}
+      type_registry_(std::move(type_registry)), type_info_(type_info),
+      codec_(codec), port_(std::move(port)) {}
 
 RemotePortAdapter::~RemotePortAdapter() noexcept {
   if (!port_) {
@@ -162,7 +164,7 @@ void RemotePortAdapter::pumpInput() {
 
   if (!pending_input_) {
     ::opcua::Variant encoded;
-    if (!protocol_->toVariant(pending_input_source_, &encoded)) {
+    if (!codec_->toVariant(pending_input_source_, &encoded)) {
       setError("failed to encode pending sample for remote input port '" +
                description_.name + "'");
       return;
@@ -172,9 +174,8 @@ void RemotePortAdapter::pumpInput() {
   }
 
   const std::vector<::opcua::Variant> inputs{*pending_input_};
-  const RemoteCallResult result =
-      session_->callPort(description_.object_id, description_.method_id,
-                         inputs);
+  const RemoteCallResult result = session_->callPort(
+      description_.object_id, description_.method_id, inputs);
   if (!result.success) {
     setError(result.error);
     return;
@@ -232,7 +233,7 @@ void RemotePortAdapter::pumpOutput() {
   }
   const std::string status = result.outputs[0].to<std::string>();
   if (status == "NewData" || (status == "OldData" && first_connected_poll)) {
-    pending_output_ = protocol_->makeDataSource(result.outputs[1]);
+    pending_output_ = codec_->makeDataSource(result.outputs[1]);
     if (!pending_output_) {
       setError("failed to decode sample from remote output port '" +
                description_.name + "'");

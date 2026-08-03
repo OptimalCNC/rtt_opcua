@@ -1,5 +1,8 @@
+#include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/server.hpp>
+
+#include "datatype_registry_internal.hpp"
 
 #include <open62541/types_generated.h>
 
@@ -8,10 +11,12 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace RTT::opcua {
 namespace {
@@ -50,6 +55,24 @@ void setServerUrl(::opcua::ServerConfig &config, const std::string &url) {
   }
   config->serverUrls = urls;
   config->serverUrlsSize = 1U;
+}
+
+std::vector<std::pair<std::string, std::uint16_t>>
+namespaceTable(::opcua::Server &server) {
+  const auto namespace_array = server.namespaceArray();
+  if (namespace_array.size() >
+      static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) +
+          1U) {
+    throw std::runtime_error("OPC UA server namespace table is too large");
+  }
+
+  std::vector<std::pair<std::string, std::uint16_t>> result;
+  result.reserve(namespace_array.size());
+  for (std::size_t index = 0U; index < namespace_array.size(); ++index) {
+    result.emplace_back(std::string(std::string_view(namespace_array[index])),
+                        static_cast<std::uint16_t>(index));
+  }
+  return result;
 }
 
 } // namespace
@@ -225,6 +248,7 @@ public:
   std::thread server_thread;
   std::thread::id server_thread_id;
   std::atomic_bool stop_requested{false};
+  std::shared_ptr<EndpointTypeRegistry> type_registry;
   std::unique_ptr<::opcua::Server> native_server;
 
   std::mutex tasks_mutex;
@@ -249,6 +273,42 @@ private:
       const ::opcua::NamespaceIndex registered =
           native_server->registerNamespace(kNamespaceUri);
       namespace_index.store(registered);
+
+      for (const std::string &uri : options.additional_namespace_uris) {
+        static_cast<void>(native_server->registerNamespace(uri));
+      }
+
+      std::string registry_error;
+      const auto providers = detail::frozenDataTypeProviders(&registry_error);
+      if (!providers) {
+        throw std::runtime_error(registry_error);
+      }
+      std::vector<std::string> provider_uris;
+      provider_uris.reserve(providers->size());
+      for (const DataTypeProvider &provider : *providers) {
+        provider_uris.push_back(provider.namespace_uri);
+      }
+      std::sort(provider_uris.begin(), provider_uris.end());
+      provider_uris.erase(
+          std::unique(provider_uris.begin(), provider_uris.end()),
+          provider_uris.end());
+      for (const std::string &uri : provider_uris) {
+        static_cast<void>(native_server->registerNamespace(uri));
+      }
+
+      auto endpoint_registry = EndpointTypeRegistry::create(
+          namespaceTable(*native_server), &registry_error);
+      if (!endpoint_registry) {
+        throw std::runtime_error(registry_error);
+      }
+      if (!endpoint_registry->customDataTypes().empty()) {
+        native_server->config().addCustomDataTypes(
+            endpoint_registry->customDataTypes());
+      }
+      {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        type_registry = std::move(endpoint_registry);
+      }
       native_server->runIterate();
 
       {
@@ -269,11 +329,19 @@ private:
       drainTasks();
       native_server->stop();
       native_server.reset();
+      {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        type_registry.reset();
+      }
       failPendingTasks("OPC UA server stopped");
       namespace_index.store(0U);
       current_state.store(ServerState::stopped);
     } catch (...) {
       native_server.reset();
+      {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        type_registry.reset();
+      }
       failPendingTasks("OPC UA server failed");
       namespace_index.store(0U);
       setFailure(exceptionMessage(std::current_exception()));
@@ -384,8 +452,18 @@ std::string Server::endpointUrl() const {
 }
 
 std::optional<std::uint16_t> Server::namespaceIndex() const noexcept {
-  const std::uint16_t index = impl_->namespace_index.load();
-  return index == 0U ? std::nullopt : std::optional<std::uint16_t>(index);
+  return namespaceIndex(kNamespaceUri);
+}
+
+std::optional<std::uint16_t>
+Server::namespaceIndex(std::string_view namespace_uri) const noexcept {
+  const auto registry = typeRegistry();
+  return registry ? registry->namespaceIndex(namespace_uri) : std::nullopt;
+}
+
+std::shared_ptr<const EndpointTypeRegistry> Server::typeRegistry() const {
+  std::lock_guard<std::mutex> lock(impl_->lifecycle_mutex);
+  return impl_->type_registry;
 }
 
 std::string Server::lastError() const {

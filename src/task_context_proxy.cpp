@@ -111,26 +111,28 @@ makeRemoteDataSource(const std::shared_ptr<detail::ClientSession> &session,
                      const detail::RemoteValueDescription &description) {
   RTT::types::TypeInfo *type_info =
       RTT::types::Types()->type(description.type_name);
-  const TypeProtocol *protocol = protocolForTypeInfo(type_info);
-  if (type_info == nullptr || protocol == nullptr || !protocol->hasValue()) {
+  const auto type_registry = session ? session->typeRegistry() : nullptr;
+  const TypeCodec *codec =
+      type_registry ? type_registry->codecForTypeInfo(type_info) : nullptr;
+  if (type_info == nullptr || codec == nullptr || !codec->hasValue()) {
     throw std::runtime_error("remote value '" + description.name +
                              "' uses unsupported RTT type '" +
                              description.type_name + "'");
   }
 
   const ::opcua::NodeId node_id = description.node_id;
-  TypeProtocol::VariantReader reader = [session,
-                                        node_id](::opcua::Variant *value) {
-    return session->readValue(node_id, value);
+  VariantReader reader = [session, type_registry,
+                          node_id](::opcua::Variant *value) {
+    return type_registry && session->readValue(node_id, value);
   };
-  TypeProtocol::VariantWriter writer;
+  VariantWriter writer;
   if (description.writable) {
-    writer = [session, node_id](const ::opcua::Variant &value) {
-      return session->writeValue(node_id, value);
+    writer = [session, type_registry, node_id](const ::opcua::Variant &value) {
+      return type_registry && session->writeValue(node_id, value);
     };
   }
   RTT::base::DataSourceBase::shared_ptr source =
-      protocol->makeProxyDataSource(std::move(reader), std::move(writer));
+      codec->makeProxyDataSource(std::move(reader), std::move(writer));
   if (!source) {
     throw std::runtime_error("failed to build remote data source for '" +
                              description.name + "'");
@@ -370,10 +372,9 @@ public:
       clearControlError();
       return value;
     } catch (const std::exception &exception) {
-      markInterfaceStale("remote RTT operation '" +
-                         std::string(operation_name) +
-                         "' returned an incompatible result: " +
-                         exception.what());
+      markInterfaceStale(
+          "remote RTT operation '" + std::string(operation_name) +
+          "' returned an incompatible result: " + exception.what());
     } catch (...) {
       markInterfaceStale("remote RTT operation '" +
                          std::string(operation_name) +
@@ -485,8 +486,9 @@ public:
     }
   }
 
-  void quarantinePortAdapters(
-      std::vector<std::shared_ptr<detail::RemotePortAdapter>> adapters) noexcept {
+  void
+  quarantinePortAdapters(std::vector<std::shared_ptr<detail::RemotePortAdapter>>
+                             adapters) noexcept {
     try {
       const std::lock_guard<std::mutex> lock(port_mutex);
       if (quarantined_port_adapters.empty()) {
@@ -752,7 +754,7 @@ bool TaskContextProxy::synchronize(std::string *error) {
   if (entry_session_state != ProxyConnectionState::connected) {
     if (!impl_->session->connect(error)) {
       impl_->markInterfaceStale(error == nullptr ? impl_->session->lastError()
-                                                  : *error);
+                                                 : *error);
       return false;
     }
   }
@@ -912,8 +914,7 @@ Seconds TaskContextProxy::getPeriod() const {
 }
 
 bool TaskContextProxy::setPeriod(Seconds period) {
-  return impl_ &&
-         impl_->invokeOperation<bool>("setPeriod", false, period);
+  return impl_ && impl_->invokeOperation<bool>("setPeriod", false, period);
 }
 
 unsigned TaskContextProxy::getCpuAffinity() const {
@@ -921,8 +922,7 @@ unsigned TaskContextProxy::getCpuAffinity() const {
 }
 
 bool TaskContextProxy::setCpuAffinity(unsigned cpu) {
-  return impl_ &&
-         impl_->invokeOperation<bool>("setCpuAffinity", false, cpu);
+  return impl_ && impl_->invokeOperation<bool>("setCpuAffinity", false, cpu);
 }
 
 bool TaskContextProxy::update() {

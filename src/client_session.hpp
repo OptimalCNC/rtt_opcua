@@ -1,5 +1,6 @@
 #pragma once
 
+#include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/task_context_proxy.hpp>
 
 #include <open62541pp/types.hpp>
@@ -102,15 +103,15 @@ public:
   RemoteCallResult callPort(const ::opcua::NodeId &object_id,
                             const ::opcua::NodeId &method_id,
                             const std::vector<::opcua::Variant> &inputs);
-  RemoteCallResult
-  callOperation(const std::string &component_name,
-                const RemoteServicePath &service_path,
-                const std::string &operation_name,
-                const std::vector<::opcua::Variant> &inputs);
+  RemoteCallResult callOperation(const std::string &component_name,
+                                 const RemoteServicePath &service_path,
+                                 const std::string &operation_name,
+                                 const std::vector<::opcua::Variant> &inputs);
   void setInterfaceAccessEnabled(bool enabled);
 
   ProxyConnectionState state() const noexcept;
   const std::string &endpointUrl() const noexcept;
+  std::shared_ptr<const EndpointTypeRegistry> typeRegistry() const;
   std::string lastError() const;
 
 private:
@@ -124,6 +125,7 @@ private:
   const std::string endpoint_url_;
   const std::chrono::milliseconds request_timeout_;
   mutable std::mutex mutex_;
+  std::shared_ptr<EndpointTypeRegistry> type_registry_;
   std::unique_ptr<::opcua::Client> client_;
   std::uint16_t namespace_index_{0U};
   std::atomic<ProxyConnectionState> state_{ProxyConnectionState::disconnected};

@@ -10,8 +10,11 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace RTT::opcua {
+
+class EndpointTypeRegistry;
 
 enum class ServerState {
   stopped,
@@ -41,6 +44,9 @@ public:
   const ServerOptions &options() const noexcept;
   std::string endpointUrl() const;
   std::optional<std::uint16_t> namespaceIndex() const noexcept;
+  std::optional<std::uint16_t>
+  namespaceIndex(std::string_view namespace_uri) const noexcept;
+  std::shared_ptr<const EndpointTypeRegistry> typeRegistry() const;
   std::string lastError() const;
 
   bool post(Task task);

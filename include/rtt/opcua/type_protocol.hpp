@@ -26,8 +26,7 @@ namespace RTT::opcua {
 
 inline constexpr int kTransportProtocolId = 1042;
 
-using DataTypeReference =
-    std::variant<::opcua::NodeId, LogicalDataTypeId>;
+using DataTypeReference = std::variant<::opcua::NodeId, LogicalDataTypeId>;
 using VariantReader = std::function<bool(::opcua::Variant *)>;
 using VariantWriter = std::function<bool(const ::opcua::Variant &)>;
 
@@ -64,9 +63,6 @@ private:
 
 class TypeProtocol : public RTT::types::TypeTransporter {
 public:
-  using VariantReader = RTT::opcua::VariantReader;
-  using VariantWriter = RTT::opcua::VariantWriter;
-
   ~TypeProtocol() override = default;
 
   RTT::base::ChannelElementBase::shared_ptr
@@ -78,22 +74,6 @@ public:
   virtual std::unique_ptr<TypeCodec>
   bind(const ::opcua::NodeId &data_type, const UA_DataType &native_type,
        std::string *error = nullptr) const = 0;
-
-  bool toVariant(const RTT::base::DataSourceBase::shared_ptr &source,
-                 ::opcua::Variant *value) const;
-  bool assignVariant(
-      const ::opcua::Variant &value,
-      const RTT::base::DataSourceBase::shared_ptr &destination) const;
-  RTT::base::DataSourceBase::shared_ptr
-  makeDataSource(const ::opcua::Variant &value) const;
-  RTT::base::DataSourceBase::shared_ptr
-  makeProxyDataSource(VariantReader reader,
-                      VariantWriter writer = {}) const;
-  bool portValue(const RTT::base::OutputPortInterface *port,
-                 ::opcua::Variant *value) const;
-  ::opcua::NodeId dataTypeNodeId() const;
-  ::opcua::ValueRank valueRank() const;
-  bool hasValue() const noexcept;
 };
 
 bool registerTypeProtocol(RTT::types::TypeInfo *type_info,
@@ -103,10 +83,5 @@ bool registerCanonicalTypeProtocol(std::string_view type_name,
                                    RTT::types::TypeInfo *type_info,
                                    std::string *error = nullptr);
 bool registerCanonicalTypeProtocols(std::string *error = nullptr);
-
-const TypeProtocol *protocolForTypeInfo(const RTT::types::TypeInfo *type_info);
-const TypeProtocol *protocolForTypeName(std::string_view type_name);
-const TypeProtocol *
-protocolForDataSource(const RTT::base::DataSourceBase::shared_ptr &source);
 
 } // namespace RTT::opcua

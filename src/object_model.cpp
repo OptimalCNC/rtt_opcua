@@ -4,8 +4,8 @@
 #include "operation_dispatcher.hpp"
 #include "port_bridge.hpp"
 
+#include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/node_id.hpp>
-#include <rtt/opcua/type_protocol.hpp>
 
 #include <open62541pp/plugin/nodestore.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
@@ -103,11 +103,14 @@ std::string taskStateName(RTT::base::TaskCore::TaskState state) {
 
 class GuardedValueDataSource final : public ::opcua::DataSourceBase {
 public:
-  GuardedValueDataSource(std::weak_ptr<ComponentState> state,
-                         RTT::base::DataSourceBase::shared_ptr source,
-                         const TypeProtocol *protocol, bool writable)
+  GuardedValueDataSource(
+      std::weak_ptr<ComponentState> state,
+      RTT::base::DataSourceBase::shared_ptr source,
+      std::shared_ptr<const EndpointTypeRegistry> type_registry,
+      const TypeCodec *codec, bool writable)
       : state_(std::move(state)), source_(std::move(source)),
-        protocol_(protocol), writable_(writable) {}
+        type_registry_(std::move(type_registry)), codec_(codec),
+        writable_(writable) {}
 
   ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
                            const ::opcua::NumericRange *range,
@@ -124,7 +127,7 @@ public:
     }
 
     ::opcua::Variant encoded;
-    if (protocol_ == nullptr || !protocol_->toVariant(source_, &encoded)) {
+    if (codec_ == nullptr || !codec_->toVariant(source_, &encoded)) {
       value.setStatus(UA_STATUSCODE_BADTYPEMISMATCH);
       return UA_STATUSCODE_BADTYPEMISMATCH;
     }
@@ -149,8 +152,7 @@ public:
     if (!lease) {
       return UA_STATUSCODE_BADNOTCONNECTED;
     }
-    return protocol_ != nullptr &&
-                   protocol_->assignVariant(value.value(), source_)
+    return codec_ != nullptr && codec_->assignVariant(value.value(), source_)
                ? ::opcua::StatusCode(UA_STATUSCODE_GOOD)
                : ::opcua::StatusCode(UA_STATUSCODE_BADTYPEMISMATCH);
   }
@@ -158,7 +160,8 @@ public:
 private:
   std::weak_ptr<ComponentState> state_;
   RTT::base::DataSourceBase::shared_ptr source_;
-  const TypeProtocol *protocol_;
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
+  const TypeCodec *codec_;
   bool writable_;
 };
 
@@ -400,28 +403,31 @@ NodeSpec lifecycleSpec(const std::string &component_path,
   return spec;
 }
 
-NodeSpec dataSourceSpec(const std::string &parent_path, const std::string &name,
-                        const std::string &description,
-                        const RTT::base::DataSourceBase::shared_ptr &source,
-                        const std::shared_ptr<ComponentState> &state) {
+NodeSpec
+dataSourceSpec(const std::string &parent_path, const std::string &name,
+               const std::string &description,
+               const RTT::base::DataSourceBase::shared_ptr &source,
+               const std::shared_ptr<ComponentState> &state,
+               std::shared_ptr<const EndpointTypeRegistry> type_registry) {
   NodeSpec spec;
   spec.kind = NodeKind::variable;
   spec.parent_path = parent_path;
   spec.path = appendNodeSegment(parent_path, name);
   spec.browse_name = name;
-  const TypeProtocol *protocol = protocolForDataSource(source);
+  const TypeCodec *codec =
+      type_registry ? type_registry->codecForDataSource(source) : nullptr;
   const bool writable = source->isAssignable();
   spec.fingerprint = "rtt-value|" + pointerFingerprint(source.get()) + "|" +
                      (writable ? "rw|" : "ro|") + description;
   spec.create = [path = spec.path, parent = spec.parent_path, name, description,
-                 source, protocol, writable,
-                 weak_state = std::weak_ptr<ComponentState>(state)](
+                 source, type_registry = std::move(type_registry), codec,
+                 writable, weak_state = std::weak_ptr<ComponentState>(state)](
                     ::opcua::Server &server, std::uint16_t namespace_index,
                     std::string *error) {
     ::opcua::Variant value;
     const auto current_state = weak_state.lock();
     ComponentLease lease(current_state);
-    if (!lease || protocol == nullptr || !protocol->toVariant(source, &value)) {
+    if (!lease || codec == nullptr || !codec->toVariant(source, &value)) {
       assignError(error,
                   "failed to encode RTT value for OPC UA node '" + path + "'");
       return false;
@@ -433,8 +439,8 @@ NodeSpec dataSourceSpec(const std::string &parent_path, const std::string &name,
       attributes.setDescription(::opcua::LocalizedText("en-US", description));
     }
     attributes.setValue(std::move(value));
-    attributes.setDataType(protocol->dataTypeNodeId());
-    attributes.setValueRank(protocol->valueRank());
+    attributes.setDataType(codec->dataTypeNodeId());
+    attributes.setValueRank(codec->valueRank());
     attributes.setAccessLevel(writable ? readWriteAccess() : readOnlyAccess());
     attributes.setUserAccessLevel(writable ? readWriteAccess()
                                            : readOnlyAccess());
@@ -449,8 +455,8 @@ NodeSpec dataSourceSpec(const std::string &parent_path, const std::string &name,
     }
     ::opcua::setVariableNodeValueBackend(
         server, nodeId(namespace_index, path),
-        std::make_unique<GuardedValueDataSource>(weak_state, source, protocol,
-                                                 writable));
+        std::make_unique<GuardedValueDataSource>(
+            weak_state, source, type_registry, codec, writable));
     return true;
   };
   return spec;
@@ -519,10 +525,11 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
 
 enum class PortMethodKind { read, write };
 
-NodeSpec portMethodSpec(const std::string &port_path,
-                        RTT::base::PortInterface &port,
-                        const std::shared_ptr<ComponentState> &state,
-                        std::size_t buffer_size, PortMethodKind method_kind) {
+NodeSpec
+portMethodSpec(const std::string &port_path, RTT::base::PortInterface &port,
+               const std::shared_ptr<ComponentState> &state,
+               std::shared_ptr<const EndpointTypeRegistry> type_registry,
+               std::size_t buffer_size, PortMethodKind method_kind) {
   const bool reads = method_kind == PortMethodKind::read;
   const std::string method_name = reads ? "read" : "write";
   NodeSpec spec;
@@ -536,9 +543,9 @@ NodeSpec portMethodSpec(const std::string &port_path,
   spec.create = [path = spec.path, parent = spec.parent_path, method_name,
                  port = &port,
                  weak_state = std::weak_ptr<ComponentState>(state), buffer_size,
-                 reads, bridge_slot](::opcua::Server &server,
-                                     std::uint16_t namespace_index,
-                                     std::string *error) {
+                 type_registry = std::move(type_registry), reads, bridge_slot](
+                    ::opcua::Server &server, std::uint16_t namespace_index,
+                    std::string *error) {
     const auto current_state = weak_state.lock();
     ComponentLease lease(current_state);
     if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
@@ -546,14 +553,17 @@ NodeSpec portMethodSpec(const std::string &port_path,
                   "RTT port became unavailable while creating OPC UA method");
       return false;
     }
-    const TypeProtocol *protocol = protocolForTypeInfo(port->getTypeInfo());
-    if (protocol == nullptr || !protocol->hasValue()) {
+    const TypeCodec *codec =
+        type_registry ? type_registry->codecForTypeInfo(port->getTypeInfo())
+                      : nullptr;
+    if (codec == nullptr || !codec->hasValue()) {
       assignError(error, "RTT port type has no OPC UA protocol");
       return false;
     }
 
     std::string bridge_error;
-    const auto bridge = PortBridge::create(*port, buffer_size, &bridge_error);
+    const auto bridge =
+        PortBridge::create(*port, type_registry, buffer_size, &bridge_error);
     if (!bridge) {
       assignError(error, std::move(bridge_error));
       return false;
@@ -566,7 +576,7 @@ NodeSpec portMethodSpec(const std::string &port_path,
         ::opcua::DataTypeId::String, ::opcua::ValueRank::Scalar);
     const ::opcua::Argument value_argument(
         "value", ::opcua::LocalizedText("en-US", "RTT port sample."),
-        protocol->dataTypeNodeId(), protocol->valueRank());
+        codec->dataTypeNodeId(), codec->valueRank());
     if (reads) {
       outputs.push_back(status_argument);
       outputs.push_back(value_argument);
@@ -685,10 +695,10 @@ void appendResourceFolders(NodeMap &nodes, const std::string &owner_path,
   }
 }
 
-void appendConfigurationNodes(NodeMap &nodes,
-                              const RTT::Service::shared_ptr &service,
-                              const std::string &owner_path,
-                              const std::shared_ptr<ComponentState> &state) {
+void appendConfigurationNodes(
+    NodeMap &nodes, const RTT::Service::shared_ptr &service,
+    const std::string &owner_path, const std::shared_ptr<ComponentState> &state,
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
   const std::string properties_path =
       appendNodeSegment(owner_path, "properties");
   for (const std::string &name : service->properties()->getPropertyNames()) {
@@ -697,13 +707,13 @@ void appendConfigurationNodes(NodeMap &nodes,
       continue;
     }
     const auto source = property->getDataSource();
-    const TypeProtocol *protocol = protocolForDataSource(source);
-    if (protocol == nullptr || !protocol->hasValue()) {
+    const TypeCodec *codec = type_registry->codecForDataSource(source);
+    if (codec == nullptr || !codec->hasValue()) {
       continue;
     }
     insertNode(nodes,
                dataSourceSpec(properties_path, name, property->getDescription(),
-                              source, state));
+                              source, state, type_registry));
     const std::string property_path = appendNodeSegment(properties_path, name);
     insertNode(nodes, staticStringSpec(
                           appendNodeSegment(property_path, "rttType"),
@@ -719,12 +729,12 @@ void appendConfigurationNodes(NodeMap &nodes,
       continue;
     }
     const auto source = attribute->getDataSource();
-    const TypeProtocol *protocol = protocolForDataSource(source);
-    if (protocol == nullptr || !protocol->hasValue()) {
+    const TypeCodec *codec = type_registry->codecForDataSource(source);
+    if (codec == nullptr || !codec->hasValue()) {
       continue;
     }
-    insertNode(nodes,
-               dataSourceSpec(attributes_path, name, {}, source, state));
+    insertNode(nodes, dataSourceSpec(attributes_path, name, {}, source, state,
+                                     type_registry));
     const std::string attribute_path = appendNodeSegment(attributes_path, name);
     insertNode(nodes,
                staticStringSpec(appendNodeSegment(attribute_path, "rttType"),
@@ -734,10 +744,11 @@ void appendConfigurationNodes(NodeMap &nodes,
   }
 }
 
-void appendPortNodes(NodeMap &nodes, const RTT::Service::shared_ptr &service,
-                     const std::string &owner_path,
-                     const std::shared_ptr<ComponentState> &state,
-                     std::size_t buffer_size) {
+void appendPortNodes(
+    NodeMap &nodes, const RTT::Service::shared_ptr &service,
+    const std::string &owner_path, const std::shared_ptr<ComponentState> &state,
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
+    std::size_t buffer_size) {
   const std::string ports_path = appendNodeSegment(owner_path, "ports");
   for (const std::string &name : service->getPortNames()) {
     RTT::base::PortInterface *port = service->getPort(name);
@@ -769,12 +780,12 @@ void appendPortNodes(NodeMap &nodes, const RTT::Service::shared_ptr &service,
                           port->getDescription()));
 
     if (dynamic_cast<RTT::base::InputPortInterface *>(port) != nullptr) {
-      insertNode(nodes, portMethodSpec(port_path, *port, state, buffer_size,
-                                       PortMethodKind::write));
+      insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
+                                       buffer_size, PortMethodKind::write));
     } else if (dynamic_cast<RTT::base::OutputPortInterface *>(port) !=
                nullptr) {
-      insertNode(nodes, portMethodSpec(port_path, *port, state, buffer_size,
-                                       PortMethodKind::read));
+      insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
+                                       buffer_size, PortMethodKind::read));
     }
   }
 }
@@ -784,6 +795,7 @@ void appendServiceContents(
     const std::string &service_path,
     const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
     std::size_t port_buffer_size, std::set<const RTT::Service *> &ancestry,
     std::size_t depth) {
   if (!service || depth > kMaximumServiceDepth ||
@@ -793,9 +805,10 @@ void appendServiceContents(
   ancestry.insert(service.get());
 
   appendResourceFolders(nodes, service_path, service->doc());
-  appendConfigurationNodes(nodes, service, service_path, state);
+  appendConfigurationNodes(nodes, service, service_path, state, type_registry);
   appendOperationNodes(nodes, service, service_path, state, dispatcher);
-  appendPortNodes(nodes, service, service_path, state, port_buffer_size);
+  appendPortNodes(nodes, service, service_path, state, type_registry,
+                  port_buffer_size);
 
   const std::string services_path = appendNodeSegment(service_path, "services");
   for (const std::string &name : service->getProviderNames()) {
@@ -810,17 +823,18 @@ void appendServiceContents(
     insertNode(nodes,
                objectSpec(child_path, services_path, name, child->doc()));
     appendServiceContents(nodes, child, child_path, state, dispatcher,
-                          port_buffer_size, ancestry, depth + 1U);
+                          type_registry, port_buffer_size, ancestry,
+                          depth + 1U);
   }
 
   ancestry.erase(service.get());
 }
 
-NodeMap
-snapshotComponent(const std::shared_ptr<ComponentState> &state,
-                  RTT::TaskContext &component,
-                  const std::shared_ptr<OperationDispatcher> &dispatcher,
-                  std::size_t port_buffer_size) {
+NodeMap snapshotComponent(
+    const std::shared_ptr<ComponentState> &state, RTT::TaskContext &component,
+    const std::shared_ptr<OperationDispatcher> &dispatcher,
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
+    std::size_t port_buffer_size) {
   NodeMap nodes;
   const std::string components_path = appendNodeSegment("rtt", "components");
   const std::string component_path =
@@ -832,7 +846,8 @@ snapshotComponent(const std::shared_ptr<ComponentState> &state,
 
   std::set<const RTT::Service *> ancestry;
   appendServiceContents(nodes, component.provides(), component_path, state,
-                        dispatcher, port_buffer_size, ancestry, 0U);
+                        dispatcher, type_registry, port_buffer_size, ancestry,
+                        0U);
   return nodes;
 }
 
@@ -857,8 +872,9 @@ class ObjectModelImpl final
 public:
   ObjectModelImpl(Server &model_server, ObjectModelOptions model_options)
       : server(model_server), options(std::move(model_options)),
-        dispatcher(
-            std::make_shared<OperationDispatcher>(options.operation_timeout)) {}
+        type_registry(model_server.typeRegistry()),
+        dispatcher(std::make_shared<OperationDispatcher>(
+            type_registry, options.operation_timeout)) {}
 
   ~ObjectModelImpl() { shutdown(); }
 
@@ -890,6 +906,10 @@ public:
       assignError(
           error,
           "OPC UA server must be running before components are registered");
+      return {};
+    }
+    if (!type_registry) {
+      assignError(error, "OPC UA server type registry is unavailable");
       return {};
     }
     if (options.reconcile_interval <= std::chrono::milliseconds::zero()) {
@@ -1005,9 +1025,9 @@ public:
             if (!lease) {
               continue;
             }
-            const NodeMap expected =
-                snapshotComponent(state, *lease.get(), self->dispatcher,
-                                  self->options.port_buffer_size);
+            const NodeMap expected = snapshotComponent(
+                state, *lease.get(), self->dispatcher, self->type_registry,
+                self->options.port_buffer_size);
             bool component_changed = false;
             if (!self->reconcileComponent(native, *namespace_index, state.get(),
                                           expected, &component_changed,
@@ -1266,6 +1286,7 @@ private:
 
   Server &server;
   ObjectModelOptions options;
+  std::shared_ptr<const EndpointTypeRegistry> type_registry;
   std::shared_ptr<OperationDispatcher> dispatcher;
   mutable std::mutex registry_mutex;
   std::map<std::string, std::shared_ptr<ComponentState>> components;
