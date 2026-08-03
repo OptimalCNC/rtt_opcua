@@ -8,6 +8,7 @@
 #include <rtt/OutputPort.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
+#include <rtt/rt_string.hpp>
 #include <rtt/types/TypeInfo.hpp>
 #include <rtt/types/Types.hpp>
 
@@ -18,6 +19,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace RTT::opcua {
 namespace {
@@ -35,13 +37,33 @@ bool fail(std::string *error, std::string message) {
 }
 
 template <typename T, typename Wire>
+Wire encodeScalar(const T &value) {
+  if constexpr (std::is_same_v<T, RTT::rt_string> &&
+                std::is_same_v<Wire, std::string>) {
+    return std::string(value.c_str());
+  } else {
+    return static_cast<Wire>(value);
+  }
+}
+
+template <typename T, typename Wire>
+T decodeScalarValue(const Wire &value) {
+  if constexpr (std::is_same_v<T, RTT::rt_string> &&
+                std::is_same_v<Wire, std::string>) {
+    return RTT::rt_string(value.c_str());
+  } else {
+    return static_cast<T>(value);
+  }
+}
+
+template <typename T, typename Wire>
 bool decodeScalar(const ::opcua::Variant &value,
                   const ::opcua::NodeId &data_type, T *decoded) noexcept {
   if (decoded == nullptr || !value.isScalar() || !value.isType(data_type)) {
     return false;
   }
   try {
-    *decoded = static_cast<T>(value.to<Wire>());
+    *decoded = decodeScalarValue<T, Wire>(value.to<Wire>());
     return true;
   } catch (const std::exception &) {
     return false;
@@ -127,7 +149,7 @@ public:
   void
   set(typename RTT::internal::AssignableDataSource<T>::param_t value) override {
     try {
-      const ::opcua::Variant encoded(static_cast<Wire>(value));
+      const ::opcua::Variant encoded(encodeScalar<T, Wire>(value));
       if (writer_ && writer_(encoded)) {
         last_value_ = value;
       }
@@ -176,6 +198,144 @@ private:
   mutable T last_value_{};
 };
 
+bool isCompatibleArray(const ::opcua::Variant &value,
+                       const ::opcua::NodeId &element_type) noexcept {
+  return value.isArray() && value.isType(element_type) &&
+         value.arrayDimensions().size() <= 1U;
+}
+
+template <typename T>
+class ArrayProxyDataSource final
+    : public RTT::internal::DataSource<std::vector<T>> {
+public:
+  using Value = std::vector<T>;
+
+  ArrayProxyDataSource(VariantReader reader, ::opcua::NodeId element_type)
+      : reader_(std::move(reader)), element_type_(std::move(element_type)) {}
+
+  Value get() const override {
+    refresh();
+    return last_value_;
+  }
+
+  Value value() const override { return last_value_; }
+
+  typename RTT::internal::DataSource<Value>::const_reference_t
+  rvalue() const override {
+    return last_value_;
+  }
+
+  bool evaluate() const override { return refresh(); }
+
+  ArrayProxyDataSource *clone() const override {
+    return new ArrayProxyDataSource(reader_, element_type_);
+  }
+
+  ArrayProxyDataSource *
+  copy(std::map<const RTT::base::DataSourceBase *, RTT::base::DataSourceBase *>
+           &already_cloned) const override {
+    auto *self = const_cast<ArrayProxyDataSource *>(this);
+    already_cloned[this] = self;
+    return self;
+  }
+
+private:
+  bool refresh() const {
+    ::opcua::Variant value;
+    try {
+      if (!reader_ || !reader_(&value) ||
+          !isCompatibleArray(value, element_type_)) {
+        return false;
+      }
+      last_value_ = value.to<Value>();
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  VariantReader reader_;
+  ::opcua::NodeId element_type_;
+  mutable Value last_value_;
+};
+
+template <typename T>
+class ArrayAssignableProxyDataSource final
+    : public RTT::internal::AssignableDataSource<std::vector<T>> {
+public:
+  using Value = std::vector<T>;
+
+  ArrayAssignableProxyDataSource(VariantReader reader, VariantWriter writer,
+                                 ::opcua::NodeId element_type)
+      : reader_(std::move(reader)), writer_(std::move(writer)),
+        element_type_(std::move(element_type)) {}
+
+  Value get() const override {
+    refresh();
+    return last_value_;
+  }
+
+  Value value() const override { return last_value_; }
+
+  typename RTT::internal::AssignableDataSource<Value>::const_reference_t
+  rvalue() const override {
+    return last_value_;
+  }
+
+  bool evaluate() const override { return refresh(); }
+
+  void set(typename RTT::internal::AssignableDataSource<Value>::param_t value)
+      override {
+    try {
+      const ::opcua::Variant encoded(value);
+      if (writer_ && writer_(encoded)) {
+        last_value_ = value;
+      }
+    } catch (const std::exception &) {
+    }
+  }
+
+  typename RTT::internal::AssignableDataSource<Value>::reference_t
+  set() override {
+    refresh();
+    return last_value_;
+  }
+
+  void updated() override { set(last_value_); }
+
+  ArrayAssignableProxyDataSource *clone() const override {
+    return new ArrayAssignableProxyDataSource(reader_, writer_, element_type_);
+  }
+
+  ArrayAssignableProxyDataSource *
+  copy(std::map<const RTT::base::DataSourceBase *, RTT::base::DataSourceBase *>
+           &already_cloned) const override {
+    auto *self = const_cast<ArrayAssignableProxyDataSource *>(this);
+    already_cloned[this] = self;
+    return self;
+  }
+
+private:
+  bool refresh() const {
+    ::opcua::Variant value;
+    try {
+      if (!reader_ || !reader_(&value) ||
+          !isCompatibleArray(value, element_type_)) {
+        return false;
+      }
+      last_value_ = value.to<Value>();
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  VariantReader reader_;
+  VariantWriter writer_;
+  ::opcua::NodeId element_type_;
+  mutable Value last_value_;
+};
+
 template <typename T, typename Wire = T>
 class ScalarTypeCodec final : public TypeCodec {
 public:
@@ -190,7 +350,7 @@ public:
       return false;
     }
     typed->evaluate();
-    *value = ::opcua::Variant(static_cast<Wire>(typed->value()));
+    *value = ::opcua::Variant(encodeScalar<T, Wire>(typed->value()));
     return true;
   }
 
@@ -204,7 +364,7 @@ public:
       return false;
     }
     try {
-      typed->set(static_cast<T>(value.to<Wire>()));
+      typed->set(decodeScalarValue<T, Wire>(value.to<Wire>()));
       return true;
     } catch (const std::exception &) {
       return false;
@@ -218,7 +378,7 @@ public:
     }
     try {
       return new RTT::internal::ValueDataSource<T>(
-          static_cast<T>(value.to<Wire>()));
+          decodeScalarValue<T, Wire>(value.to<Wire>()));
     } catch (const std::exception &) {
       return {};
     }
@@ -244,13 +404,88 @@ public:
     if (typed == nullptr || value == nullptr) {
       return false;
     }
-    *value = ::opcua::Variant(static_cast<Wire>(typed->getLastWrittenValue()));
+    *value = ::opcua::Variant(
+        encodeScalar<T, Wire>(typed->getLastWrittenValue()));
     return true;
   }
 
 private:
   bool isCompatible(const ::opcua::Variant &value) const noexcept {
     return value.isScalar() && value.isType(dataTypeNodeId());
+  }
+};
+
+template <typename T>
+class ArrayTypeCodec final : public TypeCodec {
+public:
+  using Value = std::vector<T>;
+
+  explicit ArrayTypeCodec(::opcua::NodeId element_type)
+      : TypeCodec(std::move(element_type),
+                  ::opcua::ValueRank::OneDimension, true) {}
+
+  bool toVariant(const RTT::base::DataSourceBase::shared_ptr &source,
+                 ::opcua::Variant *value) const override {
+    typename RTT::internal::DataSource<Value>::shared_ptr typed =
+        boost::dynamic_pointer_cast<RTT::internal::DataSource<Value>>(source);
+    if (!typed || value == nullptr) {
+      return false;
+    }
+    typed->evaluate();
+    *value = ::opcua::Variant(typed->value());
+    return true;
+  }
+
+  bool assignVariant(
+      const ::opcua::Variant &value,
+      const RTT::base::DataSourceBase::shared_ptr &destination) const override {
+    typename RTT::internal::AssignableDataSource<Value>::shared_ptr typed =
+        boost::dynamic_pointer_cast<RTT::internal::AssignableDataSource<Value>>(
+            destination);
+    if (!typed || !isCompatibleArray(value, dataTypeNodeId())) {
+      return false;
+    }
+    try {
+      typed->set(value.to<Value>());
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  RTT::base::DataSourceBase::shared_ptr
+  makeDataSource(const ::opcua::Variant &value) const override {
+    if (!isCompatibleArray(value, dataTypeNodeId())) {
+      return {};
+    }
+    try {
+      return new RTT::internal::ValueDataSource<Value>(value.to<Value>());
+    } catch (const std::exception &) {
+      return {};
+    }
+  }
+
+  RTT::base::DataSourceBase::shared_ptr
+  makeProxyDataSource(VariantReader reader,
+                      VariantWriter writer) const override {
+    if (!reader) {
+      return {};
+    }
+    if (writer) {
+      return new ArrayAssignableProxyDataSource<T>(
+          std::move(reader), std::move(writer), dataTypeNodeId());
+    }
+    return new ArrayProxyDataSource<T>(std::move(reader), dataTypeNodeId());
+  }
+
+  bool portValue(const RTT::base::OutputPortInterface *port,
+                 ::opcua::Variant *value) const override {
+    const auto *typed = dynamic_cast<const RTT::OutputPort<Value> *>(port);
+    if (typed == nullptr || value == nullptr) {
+      return false;
+    }
+    *value = ::opcua::Variant(typed->getLastWrittenValue());
+    return true;
   }
 };
 
@@ -312,6 +547,36 @@ public:
 
 private:
   ::opcua::NodeId data_type_;
+  std::string fingerprint_;
+};
+
+template <typename T>
+class ArrayTypeProtocol final : public TypeProtocol {
+public:
+  ArrayTypeProtocol(::opcua::NodeId element_type, std::string fingerprint)
+      : element_type_(std::move(element_type)),
+        fingerprint_(std::move(fingerprint)) {}
+
+  DataTypeReference dataType() const override { return element_type_; }
+
+  std::string registrationFingerprint() const override { return fingerprint_; }
+
+  std::unique_ptr<TypeCodec>
+  bind(const ::opcua::NodeId &data_type, const UA_DataType &native_type,
+       std::string *error) const override {
+    if (data_type != element_type_ ||
+        ::opcua::NodeId(native_type.typeId) != data_type) {
+      fail(error, "OPC UA array protocol element datatype mismatch");
+      return {};
+    }
+    if (error != nullptr) {
+      error->clear();
+    }
+    return std::make_unique<ArrayTypeCodec<T>>(data_type);
+  }
+
+private:
+  ::opcua::NodeId element_type_;
   std::string fingerprint_;
 };
 
@@ -401,6 +666,22 @@ makeCanonicalProtocol(std::string_view type_name) {
   }
   if (type_name == "String") {
     return std::make_unique<ScalarTypeProtocol<std::string>>(
+        descriptor->data_type, fingerprint);
+  }
+  if (type_name == "Float64Array") {
+    return std::make_unique<ArrayTypeProtocol<double>>(descriptor->data_type,
+                                                        fingerprint);
+  }
+  if (type_name == "Int32Array") {
+    return std::make_unique<ArrayTypeProtocol<std::int32_t>>(
+        descriptor->data_type, fingerprint);
+  }
+  if (type_name == "StringArray") {
+    return std::make_unique<ArrayTypeProtocol<std::string>>(
+        descriptor->data_type, fingerprint);
+  }
+  if (type_name == "RtString") {
+    return std::make_unique<ScalarTypeProtocol<RTT::rt_string, std::string>>(
         descriptor->data_type, fingerprint);
   }
   if (type_name == "Void") {

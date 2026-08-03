@@ -26,6 +26,10 @@ const std::vector<TypeDescriptor>& canonicalTypeDescriptors() {
        true},
       {"String", ::opcua::DataTypeId::String, true},
       {"Void", ::opcua::DataTypeId::BaseDataType, false},
+      {"Float64Array", ::opcua::DataTypeId::Double, true},
+      {"Int32Array", ::opcua::DataTypeId::Int32, true},
+      {"StringArray", ::opcua::DataTypeId::String, true},
+      {"RtString", ::opcua::DataTypeId::String, true},
   };
   return descriptors;
 }

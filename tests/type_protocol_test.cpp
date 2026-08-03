@@ -6,8 +6,12 @@
 #include <rtt/opcua/type_protocol.hpp>
 #include <rtt/opcua/type_transport_plugin.hpp>
 
+#include <open62541pp/ua/nodeids.hpp>
+
+#include <rtt/OutputPort.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
+#include <rtt/rt_string.hpp>
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/Types.hpp>
 
@@ -15,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -37,6 +42,68 @@ std::shared_ptr<RTT::opcua::EndpointTypeRegistry> makeRegistry() {
       &error);
   BOOST_REQUIRE_MESSAGE(registry, error);
   return registry;
+}
+
+template <typename T>
+void exerciseArrayCodec(std::string_view type_name,
+                        const ::opcua::NodeId &element_type,
+                        const std::vector<T> &initial,
+                        const std::vector<T> &replacement) {
+  const auto registry = makeRegistry();
+  const RTT::opcua::TypeCodec *codec = registry->codecForTypeName(type_name);
+  BOOST_REQUIRE_MESSAGE(codec != nullptr, type_name);
+  BOOST_CHECK(codec->dataTypeNodeId() == element_type);
+  BOOST_CHECK(codec->valueRank() == ::opcua::ValueRank::OneDimension);
+
+  typename RTT::internal::ValueDataSource<std::vector<T>>::shared_ptr source =
+      new RTT::internal::ValueDataSource<std::vector<T>>(initial);
+  ::opcua::Variant encoded;
+  BOOST_REQUIRE(codec->toVariant(source, &encoded));
+  BOOST_TEST(encoded.to<std::vector<T>>() == initial,
+             boost::test_tools::per_element());
+
+  BOOST_REQUIRE(codec->assignVariant(::opcua::Variant(replacement), source));
+  BOOST_TEST(source->get() == replacement, boost::test_tools::per_element());
+  BOOST_TEST(!codec->assignVariant(::opcua::Variant(T{}), source));
+
+  const auto decoded = codec->makeDataSource(::opcua::Variant(initial));
+  const auto typed = boost::dynamic_pointer_cast<
+      RTT::internal::DataSource<std::vector<T>>>(decoded);
+  BOOST_REQUIRE(typed);
+  BOOST_TEST(typed->get() == initial, boost::test_tools::per_element());
+
+  ::opcua::Variant remote(initial);
+  RTT::opcua::VariantReader reader = [&remote](::opcua::Variant *value) {
+    *value = remote;
+    return true;
+  };
+  RTT::opcua::VariantWriter writer =
+      [&remote](const ::opcua::Variant &value) {
+        remote = value;
+        return true;
+      };
+  const auto writable = boost::dynamic_pointer_cast<
+      RTT::internal::AssignableDataSource<std::vector<T>>>(
+      codec->makeProxyDataSource(reader, writer));
+  BOOST_REQUIRE(writable);
+  BOOST_TEST(writable->get() == initial, boost::test_tools::per_element());
+  writable->set(replacement);
+  BOOST_TEST(remote.to<std::vector<T>>() == replacement,
+             boost::test_tools::per_element());
+
+  const auto read_only = boost::dynamic_pointer_cast<
+      RTT::internal::DataSource<std::vector<T>>>(
+      codec->makeProxyDataSource(reader));
+  BOOST_REQUIRE(read_only);
+  BOOST_TEST(read_only->get() == replacement,
+             boost::test_tools::per_element());
+
+  RTT::OutputPort<std::vector<T>> port("values");
+  port.write(initial);
+  ::opcua::Variant port_value;
+  BOOST_REQUIRE(codec->portValue(&port, &port_value));
+  BOOST_TEST(port_value.to<std::vector<T>>() == initial,
+             boost::test_tools::per_element());
 }
 
 } // namespace
@@ -114,6 +181,72 @@ BOOST_AUTO_TEST_CASE(byte_and_character_protocols_preserve_numeric_values) {
   } else {
     BOOST_TEST(encoded_character.to<std::uint8_t>() == 65U);
   }
+}
+
+BOOST_AUTO_TEST_CASE(canonical_array_protocols_round_trip_all_surfaces) {
+  exerciseArrayCodec<double>("Float64Array", ::opcua::DataTypeId::Double,
+                             {1.5, 2.5}, {3.5, 4.5, 5.5});
+  exerciseArrayCodec<std::int32_t>("Int32Array", ::opcua::DataTypeId::Int32,
+                                   {1, 2}, {3, 4, 5});
+  exerciseArrayCodec<std::string>("StringArray", ::opcua::DataTypeId::String,
+                                  {"one", "two"}, {"three", "four"});
+}
+
+BOOST_AUTO_TEST_CASE(rt_string_protocol_round_trips_all_surfaces) {
+  const auto registry = makeRegistry();
+  const RTT::opcua::TypeCodec *codec = registry->codecForTypeName("RtString");
+  BOOST_REQUIRE(codec != nullptr);
+  BOOST_CHECK(codec->dataTypeNodeId() ==
+              ::opcua::NodeId(::opcua::DataTypeId::String));
+  BOOST_CHECK(codec->valueRank() == ::opcua::ValueRank::Scalar);
+
+  RTT::internal::ValueDataSource<RTT::rt_string>::shared_ptr source =
+      new RTT::internal::ValueDataSource<RTT::rt_string>(RTT::rt_string("one"));
+  ::opcua::Variant encoded;
+  BOOST_REQUIRE(codec->toVariant(source, &encoded));
+  BOOST_TEST(encoded.to<std::string>() == "one");
+  BOOST_REQUIRE(
+      codec->assignVariant(::opcua::Variant(std::string("two")), source));
+  BOOST_TEST(std::string(source->get().c_str()) == "two");
+  BOOST_TEST(!codec->assignVariant(
+      ::opcua::Variant(std::vector<std::string>{"wrong"}), source));
+
+  const auto decoded = codec->makeDataSource(
+      ::opcua::Variant(std::string("decoded")));
+  const auto typed = boost::dynamic_pointer_cast<
+      RTT::internal::DataSource<RTT::rt_string>>(decoded);
+  BOOST_REQUIRE(typed);
+  BOOST_TEST(std::string(typed->get().c_str()) == "decoded");
+
+  ::opcua::Variant remote(std::string("remote"));
+  RTT::opcua::VariantReader reader = [&remote](::opcua::Variant *value) {
+    *value = remote;
+    return true;
+  };
+  RTT::opcua::VariantWriter writer =
+      [&remote](const ::opcua::Variant &value) {
+        remote = value;
+        return true;
+      };
+  const auto writable = boost::dynamic_pointer_cast<
+      RTT::internal::AssignableDataSource<RTT::rt_string>>(
+      codec->makeProxyDataSource(reader, writer));
+  BOOST_REQUIRE(writable);
+  BOOST_TEST(std::string(writable->get().c_str()) == "remote");
+  writable->set(RTT::rt_string("written"));
+  BOOST_TEST(remote.to<std::string>() == "written");
+
+  const auto read_only = boost::dynamic_pointer_cast<
+      RTT::internal::DataSource<RTT::rt_string>>(
+      codec->makeProxyDataSource(reader));
+  BOOST_REQUIRE(read_only);
+  BOOST_TEST(std::string(read_only->get().c_str()) == "written");
+
+  RTT::OutputPort<RTT::rt_string> port("text");
+  port.write(RTT::rt_string("port"));
+  ::opcua::Variant port_value;
+  BOOST_REQUIRE(codec->portValue(&port, &port_value));
+  BOOST_TEST(port_value.to<std::string>() == "port");
 }
 
 BOOST_AUTO_TEST_CASE(transport_plugin_rejects_noncanonical_names) {

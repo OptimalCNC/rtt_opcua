@@ -54,10 +54,11 @@ BOOST_AUTO_TEST_CASE(server_rejects_unsafe_or_malformed_bindings) {
   BOOST_TEST(RTT::opcua::endpointUrl(options) == "opc.tcp://[::1]:4840/rtt");
 }
 
-BOOST_AUTO_TEST_CASE(canonical_scalar_catalog_is_exact) {
+BOOST_AUTO_TEST_CASE(canonical_builtin_catalog_is_exact) {
   const std::vector<std::string_view> expected {
       "Bool",   "Int8",    "UInt8",   "Int16",   "UInt16", "Int32", "UInt32",
-      "Int64",  "UInt64",  "Float32", "Float64", "Char",   "String", "Void"};
+      "Int64",  "UInt64",  "Float32", "Float64", "Char",   "String", "Void",
+      "Float64Array", "Int32Array", "StringArray", "RtString"};
   const auto& descriptors = RTT::opcua::canonicalTypeDescriptors();
 
   BOOST_REQUIRE_EQUAL(descriptors.size(), expected.size());
@@ -72,7 +73,7 @@ BOOST_AUTO_TEST_CASE(canonical_scalar_catalog_is_exact) {
   BOOST_CHECK(descriptors[9].data_type == ::opcua::NodeId(::opcua::DataTypeId::Float));
   BOOST_CHECK(descriptors[10].data_type == ::opcua::NodeId(::opcua::DataTypeId::Double));
   BOOST_CHECK(descriptors[12].data_type == ::opcua::NodeId(::opcua::DataTypeId::String));
-  BOOST_TEST(!descriptors.back().has_value);
+  BOOST_TEST(!descriptors[13].has_value);
   BOOST_TEST(RTT::opcua::descriptorForType("int") == nullptr);
   BOOST_TEST(RTT::opcua::descriptorForType("uint16") == nullptr);
 }
