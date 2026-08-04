@@ -60,6 +60,11 @@ std::size_t pathDepth(const std::string &path) {
   return static_cast<std::size_t>(std::count(path.begin(), path.end(), '/'));
 }
 
+bool isDescendantPath(std::string_view path, std::string_view ancestor) {
+  return path.size() > ancestor.size() && path.starts_with(ancestor) &&
+         path[ancestor.size()] == '/';
+}
+
 void assignError(std::string *output, std::string value) {
   if (output != nullptr) {
     *output = std::move(value);
@@ -1173,7 +1178,6 @@ public:
             return;
           }
 
-          bool changed = false;
           for (const auto &state : current) {
             ComponentLease lease(state);
             if (!lease) {
@@ -1193,10 +1197,9 @@ public:
                                           reconcile_error.get())) {
               return;
             }
-            changed = changed || component_changed;
-          }
-          if (changed) {
-            self->advanceRevision(native);
+            if (component_changed) {
+              self->advanceRevision(native);
+            }
           }
         },
         std::chrono::seconds(5), &server_error);
@@ -1425,14 +1428,26 @@ private:
       }
     }
 
-    std::vector<std::string> old_remove_paths;
+    std::set<std::string> old_remove_set;
     for (const auto &[path, existing] : previous) {
       const auto replacement = expected.find(path);
       if (replacement == expected.end() ||
           replacement->second.fingerprint != existing.fingerprint) {
-        old_remove_paths.push_back(path);
+        old_remove_set.insert(path);
       }
     }
+    const std::vector<std::string> direct_remove_paths(old_remove_set.begin(),
+                                                       old_remove_set.end());
+    for (const auto &[path, spec] : previous) {
+      static_cast<void>(spec);
+      if (std::ranges::any_of(direct_remove_paths, [&](const auto &ancestor) {
+            return isDescendantPath(path, ancestor);
+          })) {
+        old_remove_set.insert(path);
+      }
+    }
+    std::vector<std::string> old_remove_paths(old_remove_set.begin(),
+                                              old_remove_set.end());
     std::sort(old_remove_paths.begin(), old_remove_paths.end(),
               [](const auto &left, const auto &right) {
                 const std::size_t left_depth = pathDepth(left);
@@ -1445,7 +1460,8 @@ private:
     for (const auto &[path, spec] : committed) {
       const auto existing = previous.find(path);
       if (existing == previous.end() ||
-          existing->second.fingerprint != spec.fingerprint) {
+          existing->second.fingerprint != spec.fingerprint ||
+          old_remove_set.contains(path)) {
         candidate_specs.push_back(&spec);
       }
     }
@@ -1470,8 +1486,6 @@ private:
                                                  : left_depth > right_depth;
               });
 
-    const std::set<std::string> old_remove_set(old_remove_paths.begin(),
-                                               old_remove_paths.end());
     std::vector<const NodeSpec *> rollback_specs;
     rollback_specs.reserve(old_remove_paths.size());
     for (const auto &[path, spec] : previous) {
@@ -1515,12 +1529,27 @@ private:
       deleted_old_paths.insert(path);
     }
 
+    std::set<std::string> created_candidate_paths;
     for (const NodeSpec *spec : candidate_specs) {
+      const bool existed_before = static_cast<bool>(
+          ::opcua::services::readNodeClass(
+              native, nodeId(namespace_index, spec->path)));
       if (!spec->create(native, namespace_index, error)) {
+        std::set<std::string> affected_candidate_paths =
+            created_candidate_paths;
+        if (!existed_before) {
+          affected_candidate_paths.insert(spec->path);
+        }
+        std::vector<std::string> cleanup_paths;
+        cleanup_paths.reserve(affected_candidate_paths.size());
+        std::ranges::copy_if(
+            candidate_cleanup_paths, std::back_inserter(cleanup_paths),
+            [&](const auto &path) {
+              return affected_candidate_paths.contains(path);
+            });
         std::string cleanup_error;
         const bool removed = deleteNodes(native, namespace_index,
-                                         candidate_cleanup_paths,
-                                         &cleanup_error);
+                                         cleanup_paths, &cleanup_error);
         std::string restore_error;
         const bool old_restored =
             restore_old(deleted_old_paths, &restore_error);
@@ -1535,6 +1564,7 @@ private:
         appendRollbackError(error, rollback_error, restored);
         return false;
       }
+      created_candidate_paths.insert(spec->path);
     }
 
     published.insert_or_assign(state, std::move(committed));

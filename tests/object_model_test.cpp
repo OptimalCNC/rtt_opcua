@@ -9,6 +9,8 @@
 #include <open62541pp/client.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
 #include <open62541pp/services/method.hpp>
+#include <open62541pp/services/nodemanagement.hpp>
+#include <open62541pp/services/view.hpp>
 
 #include <rtt/InputPort.hpp>
 #include <rtt/OutputPort.hpp>
@@ -24,6 +26,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -83,6 +86,19 @@ bool waitUntil(const std::function<bool()> &predicate,
   const std::vector<std::string_view> path_segments(segments);
   return ::opcua::NodeId(namespace_index,
                          RTT::opcua::makeNodePath(path_segments));
+}
+
+bool hasObjectChild(::opcua::Client &client, const ::opcua::NodeId &parent,
+                    std::string_view browse_name) {
+  const ::opcua::BrowseDescription browse(
+      parent, ::opcua::BrowseDirection::Forward,
+      ::opcua::ReferenceTypeId::HasComponent, true, ::opcua::NodeClass::Object,
+      ::opcua::BrowseResultMask::All);
+  const auto result = ::opcua::services::browseAll(client, browse);
+  return result &&
+         std::ranges::any_of(result.value(), [&](const auto &reference) {
+           return reference.browseName().name() == browse_name;
+         });
 }
 
 struct CanonicalTypesFixture {
@@ -221,10 +237,16 @@ public:
 
 class RollbackComponent final : public RTT::TaskContext {
 public:
-  RollbackComponent() : RTT::TaskContext("rollback-component") {
+  explicit RollbackComponent(bool publish_failing = true,
+                             std::string name = "rollback-component")
+      : RTT::TaskContext(std::move(name)) {
     addProperty("OrdinaryProperty", ordinary_property);
-    addPort(failing_input);
+    if (publish_failing) {
+      addFailingPort();
+    }
   }
+
+  void addFailingPort() { addPort(failing_input); }
 
   std::int32_t ordinary_property{17};
   FailingInputPort failing_input{"FailingInput"};
@@ -421,6 +443,122 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(model.revision() == last_good_revision);
   BOOST_TEST(static_cast<bool>(
       ::opcua::services::readBrowseName(client, known_good_node_id)));
+
+  client.disconnect();
+  registration->reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    earlier_component_commit_advances_revision_before_later_rollback,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::seconds(30);
+  RTT::opcua::ObjectModel model(server, model_options);
+
+  RTT::TaskContext successful("a-success");
+  std::int32_t stable_value{11};
+  successful.addProperty("Stable", stable_value);
+  RollbackComponent failing(false, "b-failure");
+  auto successful_registration = model.registerComponent(successful, &error);
+  BOOST_REQUIRE_MESSAGE(successful_registration.has_value(), error);
+  auto failing_registration = model.registerComponent(failing, &error);
+  BOOST_REQUIRE_MESSAGE(failing_registration.has_value(), error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto successful_dynamic_id = modelNodeId(
+      namespace_index,
+      {"components", successful.getName(), "properties", "Dynamic"});
+  const auto failing_root_id =
+      modelNodeId(namespace_index, {"components", failing.getName()});
+  const auto failing_property_id = modelNodeId(
+      namespace_index,
+      {"components", failing.getName(), "properties", "OrdinaryProperty"});
+  const auto failing_port_id = modelNodeId(
+      namespace_index,
+      {"components", failing.getName(), "ports", "FailingInput"});
+
+  const std::uint64_t revision_before = model.revision();
+  std::int32_t dynamic_value{23};
+  successful.addProperty("Dynamic", dynamic_value);
+  failing.provides()->doc("replacement candidate");
+  failing.addFailingPort();
+
+  BOOST_TEST(!model.reconcile(&error));
+  BOOST_TEST(error.find("rollback succeeded") != std::string::npos);
+  BOOST_TEST(model.revision() == revision_before + 1U);
+  BOOST_TEST(::opcua::services::readValue(client, successful_dynamic_id)
+                 .value()
+                 .to<std::int32_t>() == dynamic_value);
+  BOOST_TEST(hasObjectChild(client, failing_root_id, "Properties"));
+  BOOST_TEST(::opcua::services::readValue(client, failing_property_id)
+                 .value()
+                 .to<std::int32_t>() == failing.ordinary_property);
+  BOOST_TEST(!::opcua::services::readBrowseName(client, failing_port_id));
+
+  client.disconnect();
+  failing_registration->reset();
+  successful_registration->reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    component_collision_rollback_preserves_the_foreign_node,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::seconds(30);
+  RTT::opcua::ObjectModel model(server, model_options);
+  RTT::TaskContext component("collision-component");
+  std::int32_t supported_value{7};
+  component.addProperty("Supported", supported_value);
+  auto registration = model.registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  const auto properties_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "properties"});
+  const auto foreign_id = modelNodeId(
+      namespace_index,
+      {"components", component.getName(), "properties", "Foreign"});
+  bool seeded = false;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
+    attributes.setValue(::opcua::Variant(std::int32_t{99}));
+    attributes.setDataType(::opcua::DataTypeId::Int32);
+    attributes.setValueRank(::opcua::ValueRank::Scalar);
+    seeded = static_cast<bool>(::opcua::services::addVariable(
+        native, properties_id, foreign_id, "Foreign", attributes,
+        ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::HasComponent));
+  }));
+  BOOST_REQUIRE(seeded);
+
+  const std::uint64_t revision_before = model.revision();
+  std::int32_t colliding_value{42};
+  component.addProperty("Foreign", colliding_value);
+  BOOST_TEST(!model.reconcile(&error));
+  BOOST_TEST(model.revision() == revision_before);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto foreign_value = ::opcua::services::readValue(client, foreign_id);
+  BOOST_REQUIRE(foreign_value);
+  BOOST_TEST(foreign_value.value().to<std::int32_t>() == 99);
 
   client.disconnect();
   registration->reset();
