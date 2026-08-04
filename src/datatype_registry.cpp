@@ -221,20 +221,20 @@ DataTypeFactoryContext::dataType(const LogicalDataTypeId &id) const noexcept {
 bool registerDataTypeProvider(DataTypeProvider provider, std::string *error) {
   RegistryState &state = registry();
   std::lock_guard<std::mutex> lock(state.mutex);
+  std::sort(provider.dependencies.begin(), provider.dependencies.end());
+  const auto existing = state.providers.find(provider.name);
+  if (existing != state.providers.end() &&
+      sameProvider(existing->second, provider)) {
+    if (error != nullptr) {
+      error->clear();
+    }
+    return true;
+  }
   if (state.frozen) {
     return fail(error, "late OPC UA datatype provider registration: '" +
                            provider.name + "'");
   }
-
-  std::sort(provider.dependencies.begin(), provider.dependencies.end());
-  const auto existing = state.providers.find(provider.name);
   if (existing != state.providers.end()) {
-    if (sameProvider(existing->second, provider)) {
-      if (error != nullptr) {
-        error->clear();
-      }
-      return true;
-    }
     return fail(error, "conflicting OPC UA datatype provider: '" +
                            provider.name + "'");
   }

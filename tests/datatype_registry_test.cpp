@@ -80,6 +80,10 @@ BOOST_AUTO_TEST_CASE(lifecycle) {
              boost::test_tools::per_element());
   BOOST_TEST(RTT::opcua::dataTypeRegistryFrozen());
 
+  BOOST_TEST(RTT::opcua::registerDataTypeProvider(identical_dependent,
+                                                   &error));
+  BOOST_TEST(error.empty());
+
   auto late = provider("late", {},
                        definition("Late", "LateType", "LateBinary", "late-v1"));
   BOOST_TEST(!RTT::opcua::registerDataTypeProvider(std::move(late), &error));
