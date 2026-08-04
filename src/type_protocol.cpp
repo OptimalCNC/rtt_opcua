@@ -1,5 +1,7 @@
 #include <rtt/opcua/type_protocol.hpp>
 
+#include "conn_policy_protocol.hpp"
+
 #include <rtt/opcua/type_descriptor.hpp>
 
 #include <open62541pp/datatype.hpp>
@@ -756,6 +758,9 @@ bool registerTypeProtocol(RTT::types::TypeInfo *type_info,
 bool registerCanonicalTypeProtocol(std::string_view type_name,
                                    RTT::types::TypeInfo *type_info,
                                    std::string *error) {
+  if (type_name == "ConnPolicy") {
+    return registerConnPolicyProtocol(type_info, error);
+  }
   if (type_info == nullptr || type_info->getTypeName() != type_name ||
       descriptorForType(type_name) == nullptr) {
     return fail(error, "invalid canonical OPC UA type protocol registration");
@@ -766,20 +771,15 @@ bool registerCanonicalTypeProtocol(std::string_view type_name,
 }
 
 bool registerCanonicalTypeProtocols(std::string *error) {
-  std::lock_guard<std::mutex> lock(registrationMutex());
   for (const TypeDescriptor &descriptor : canonicalTypeDescriptors()) {
     RTT::types::TypeInfo *type_info =
         RTT::types::Types()->type(std::string(descriptor.rtt_name));
-    if (type_info == nullptr ||
-        !registerTypeProtocolUnlocked(
-            type_info, makeCanonicalProtocol(descriptor.rtt_name), error)) {
+    if (!registerCanonicalTypeProtocol(descriptor.rtt_name, type_info, error)) {
       return false;
     }
   }
-  if (error != nullptr) {
-    error->clear();
-  }
-  return true;
+  return registerConnPolicyProtocol(RTT::types::Types()->type("ConnPolicy"),
+                                    error);
 }
 
 } // namespace RTT::opcua

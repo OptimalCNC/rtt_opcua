@@ -8,6 +8,7 @@
 
 #include <open62541pp/ua/nodeids.hpp>
 
+#include <rtt/ConnPolicy.hpp>
 #include <rtt/OutputPort.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
@@ -42,6 +43,21 @@ std::shared_ptr<RTT::opcua::EndpointTypeRegistry> makeRegistry() {
       &error);
   BOOST_REQUIRE_MESSAGE(registry, error);
   return registry;
+}
+
+void checkConnPolicy(const RTT::ConnPolicy &actual,
+                     const RTT::ConnPolicy &expected) {
+  BOOST_TEST(actual.type == expected.type);
+  BOOST_TEST(actual.size == expected.size);
+  BOOST_TEST(actual.lock_policy == expected.lock_policy);
+  BOOST_TEST(actual.init == expected.init);
+  BOOST_TEST(actual.pull == expected.pull);
+  BOOST_TEST(actual.buffer_policy == expected.buffer_policy);
+  BOOST_TEST(actual.max_threads == expected.max_threads);
+  BOOST_TEST(actual.mandatory == expected.mandatory);
+  BOOST_TEST(actual.transport == expected.transport);
+  BOOST_TEST(actual.data_size == expected.data_size);
+  BOOST_TEST(actual.name_id == expected.name_id);
 }
 
 template <typename T>
@@ -111,6 +127,23 @@ void exerciseArrayCodec(std::string_view type_name,
 BOOST_GLOBAL_FIXTURE(CanonicalTypeFixture);
 
 BOOST_AUTO_TEST_SUITE(type_protocol_suite)
+
+BOOST_AUTO_TEST_CASE(transport_plugin_rejects_noncanonical_names) {
+  RTT::opcua::TypeTransportPlugin plugin;
+  BOOST_TEST(plugin.getTransportName() == "OPCUA");
+  BOOST_TEST(plugin.getTypekitName() == "rtt-types");
+  BOOST_TEST(plugin.getName() == "OPCUA://rtt-types");
+
+  RTT::types::TypeInfo *int32 = RTT::types::Types()->type("Int32");
+  BOOST_REQUIRE(int32 != nullptr);
+  BOOST_TEST(plugin.registerTransport("Int32", int32));
+  BOOST_TEST(!plugin.registerTransport("int", int32));
+
+  RTT::types::TypeInfo *conn_policy = RTT::types::Types()->type("ConnPolicy");
+  BOOST_REQUIRE(conn_policy != nullptr);
+  BOOST_TEST(plugin.registerTransport("ConnPolicy", conn_policy));
+  BOOST_TEST(!plugin.registerTransport("connpolicy", conn_policy));
+}
 
 BOOST_AUTO_TEST_CASE(all_canonical_types_receive_the_opcua_transport) {
   const auto registry = makeRegistry();
@@ -249,16 +282,86 @@ BOOST_AUTO_TEST_CASE(rt_string_protocol_round_trips_all_surfaces) {
   BOOST_TEST(port_value.to<std::string>() == "port");
 }
 
-BOOST_AUTO_TEST_CASE(transport_plugin_rejects_noncanonical_names) {
-  RTT::opcua::TypeTransportPlugin plugin;
-  BOOST_TEST(plugin.getTransportName() == "OPCUA");
-  BOOST_TEST(plugin.getTypekitName() == "rtt-types");
-  BOOST_TEST(plugin.getName() == "OPCUA://rtt-types");
+BOOST_AUTO_TEST_CASE(conn_policy_protocol_round_trips_every_public_field) {
+  RTT::ConnPolicy expected;
+  expected.type = RTT::ConnPolicy::BUFFER;
+  expected.size = 17;
+  expected.lock_policy = RTT::ConnPolicy::LOCKED;
+  expected.init = true;
+  expected.pull = true;
+  expected.buffer_policy = RTT::PerInputPort;
+  expected.max_threads = 6;
+  expected.mandatory = false;
+  expected.transport = 42;
+  expected.data_size = 4096;
+  expected.name_id = "fixture/channel";
 
-  RTT::types::TypeInfo *int32 = RTT::types::Types()->type("Int32");
-  BOOST_REQUIRE(int32 != nullptr);
-  BOOST_TEST(plugin.registerTransport("Int32", int32));
-  BOOST_TEST(!plugin.registerTransport("int", int32));
+  RTT::types::TypeInfo *type_info = RTT::types::Types()->type("ConnPolicy");
+  BOOST_REQUIRE(type_info != nullptr);
+  BOOST_TEST(type_info->hasProtocol(RTT::opcua::kTransportProtocolId));
+
+  const auto registry = makeRegistry();
+  const RTT::opcua::TypeCodec *codec = registry->codecForTypeName("ConnPolicy");
+  BOOST_REQUIRE(codec != nullptr);
+  BOOST_CHECK(codec->dataTypeNodeId() ==
+              ::opcua::NodeId(1, "types/ConnPolicy"));
+  BOOST_CHECK(codec->valueRank() == ::opcua::ValueRank::Scalar);
+  BOOST_TEST(codec->hasValue());
+
+  bool found_custom_type = false;
+  for (const ::opcua::DataType &data_type : registry->customDataTypes()) {
+    if (data_type.typeId() == ::opcua::NodeId(1, "types/ConnPolicy")) {
+      found_custom_type = true;
+      BOOST_CHECK(data_type.binaryEncodingId() ==
+                  ::opcua::NodeId(1, "encodings/ConnPolicy/Binary"));
+    }
+  }
+  BOOST_TEST(found_custom_type);
+
+  RTT::internal::ValueDataSource<RTT::ConnPolicy>::shared_ptr source =
+      new RTT::internal::ValueDataSource<RTT::ConnPolicy>(expected);
+  ::opcua::Variant encoded;
+  BOOST_REQUIRE(codec->toVariant(source, &encoded));
+  BOOST_REQUIRE(codec->assignVariant(encoded, source));
+  checkConnPolicy(source->get(), expected);
+
+  const auto decoded = codec->makeDataSource(encoded);
+  const auto typed =
+      boost::dynamic_pointer_cast<RTT::internal::DataSource<RTT::ConnPolicy>>(
+          decoded);
+  BOOST_REQUIRE(typed);
+  checkConnPolicy(typed->get(), expected);
+
+  ::opcua::Variant remote = encoded;
+  RTT::opcua::VariantReader reader = [&remote](::opcua::Variant *value) {
+    *value = remote;
+    return true;
+  };
+  RTT::opcua::VariantWriter writer = [&remote](const ::opcua::Variant &value) {
+    remote = value;
+    return true;
+  };
+  const auto writable = boost::dynamic_pointer_cast<
+      RTT::internal::AssignableDataSource<RTT::ConnPolicy>>(
+      codec->makeProxyDataSource(reader, writer));
+  BOOST_REQUIRE(writable);
+  checkConnPolicy(writable->get(), expected);
+  writable->set(expected);
+  BOOST_REQUIRE(codec->assignVariant(remote, source));
+  checkConnPolicy(source->get(), expected);
+
+  const auto read_only =
+      boost::dynamic_pointer_cast<RTT::internal::DataSource<RTT::ConnPolicy>>(
+          codec->makeProxyDataSource(reader));
+  BOOST_REQUIRE(read_only);
+  checkConnPolicy(read_only->get(), expected);
+
+  RTT::OutputPort<RTT::ConnPolicy> port("policy");
+  port.write(expected);
+  ::opcua::Variant port_value;
+  BOOST_REQUIRE(codec->portValue(&port, &port_value));
+  BOOST_REQUIRE(codec->assignVariant(port_value, source));
+  checkConnPolicy(source->get(), expected);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

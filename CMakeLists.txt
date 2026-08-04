@@ -21,6 +21,7 @@ orocos_library(
   orocos-rtt-opcua
   src/node_id.cpp
   src/client_session.cpp
+  src/conn_policy_protocol.cpp
   src/datatype_registry.cpp
   src/endpoint_type_registry.cpp
   src/object_model.cpp
