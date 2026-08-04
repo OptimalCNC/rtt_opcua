@@ -79,6 +79,8 @@ namespaceTable(::opcua::Server &server) {
 
 class Server::Impl {
 public:
+  enum class QueuedTaskState { queued, running, cancelled };
+
   struct Completion {
     std::mutex mutex;
     std::condition_variable condition;
@@ -89,7 +91,7 @@ public:
   struct QueuedTask {
     Task callback;
     std::shared_ptr<Completion> completion;
-    std::atomic_bool cancelled{false};
+    std::atomic<QueuedTaskState> state{QueuedTaskState::queued};
   };
 
   explicit Impl(ServerOptions configured_options)
@@ -230,9 +232,14 @@ public:
     if (!completion->condition.wait_for(
             completion_lock, timeout,
             [&completion] { return completion->done; })) {
-      queued->cancelled.store(true);
-      assignError(output_error, "OPC UA server task timed out");
-      return false;
+      QueuedTaskState expected = QueuedTaskState::queued;
+      if (queued->state.compare_exchange_strong(
+              expected, QueuedTaskState::cancelled)) {
+        assignError(output_error, "OPC UA server task timed out");
+        return false;
+      }
+      completion->condition.wait(completion_lock,
+                                 [&completion] { return completion->done; });
     }
     assignError(output_error, completion->error);
     return completion->error.empty();
@@ -366,7 +373,9 @@ private:
 
     for (const auto &queued : pending) {
       std::string task_error;
-      if (queued->cancelled.load()) {
+      QueuedTaskState expected = QueuedTaskState::queued;
+      if (!queued->state.compare_exchange_strong(
+              expected, QueuedTaskState::running)) {
         task_error = "OPC UA server task cancelled";
       } else {
         try {

@@ -50,6 +50,8 @@ public:
   std::string lastError() const;
 
   bool post(Task task);
+  // The timeout cancels only a queued task. Once execution starts, invoke()
+  // waits for the callback's result so synchronous captures remain valid.
   bool invoke(Task task,
               std::chrono::milliseconds timeout = std::chrono::seconds(5),
               std::string *error = nullptr);

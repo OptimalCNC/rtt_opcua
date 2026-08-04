@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -200,6 +201,45 @@ BOOST_AUTO_TEST_CASE(loopback_server_exposes_namespace_and_serialized_tasks) {
   server.stop();
   BOOST_CHECK(server.state() == RTT::opcua::ServerState::stopped);
   BOOST_TEST(!server.isRunning());
+  server.stop();
+}
+
+BOOST_AUTO_TEST_CASE(
+    started_invoke_waits_for_callback_completion_after_timeout) {
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  std::promise<void> callback_started;
+  std::future<void> callback_started_future = callback_started.get_future();
+  std::promise<void> release_callback;
+  std::shared_future<void> release_callback_future =
+      release_callback.get_future().share();
+  std::string invocation_error;
+  std::future<bool> invocation = std::async(std::launch::async, [&] {
+    return server.invoke(
+        [&callback_started,
+         release_callback_future](::opcua::Server &) mutable {
+          callback_started.set_value();
+          release_callback_future.wait();
+        },
+        std::chrono::milliseconds(10), &invocation_error);
+  });
+
+  BOOST_REQUIRE(static_cast<bool>(
+      callback_started_future.wait_for(std::chrono::seconds(1)) ==
+      std::future_status::ready));
+  BOOST_TEST(static_cast<bool>(
+      invocation.wait_for(std::chrono::milliseconds(50)) ==
+      std::future_status::timeout));
+
+  release_callback.set_value();
+  BOOST_TEST(invocation.get());
+  BOOST_TEST(invocation_error.empty());
+
   server.stop();
 }
 
