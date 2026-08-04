@@ -10,6 +10,7 @@
 #include <open62541pp/plugin/nodestore.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
 #include <open62541pp/services/nodemanagement.hpp>
+#include <open62541pp/services/view.hpp>
 #include <open62541pp/ua/nodeids.hpp>
 
 #include <rtt/Logger.hpp>
@@ -239,6 +240,87 @@ struct NodeSpec {
 };
 
 using NodeMap = std::map<std::string, NodeSpec>;
+
+bool implicitMethodArgument(const ::opcua::ReferenceDescription &reference) {
+  const auto browse_name = reference.browseName();
+  return reference.nodeClass() == ::opcua::NodeClass::Variable &&
+         browse_name.namespaceIndex() == 0U &&
+         (browse_name.name() == "InputArguments" ||
+          browse_name.name() == "OutputArguments");
+}
+
+bool removalSubtreesAreOwned(::opcua::Server &native,
+                             std::uint16_t namespace_index,
+                             const NodeMap &previous,
+                             const std::vector<std::string> &roots,
+                             std::string *error) {
+  std::map<::opcua::NodeId, NodeKind> owned_nodes;
+  for (const auto &[path, spec] : previous) {
+    owned_nodes.emplace(nodeId(namespace_index, path), spec.kind);
+  }
+
+  struct PendingNode {
+    ::opcua::NodeId id;
+    bool method{false};
+    std::string root_path;
+  };
+  std::vector<PendingNode> pending;
+  for (const std::string &path : roots) {
+    const auto spec = previous.find(path);
+    if (spec == previous.end() ||
+        !::opcua::services::readNodeClass(
+            native, nodeId(namespace_index, path))) {
+      continue;
+    }
+    pending.push_back(PendingNode{nodeId(namespace_index, path),
+                                  spec->second.kind == NodeKind::method, path});
+  }
+
+  std::set<::opcua::NodeId> visited;
+  while (!pending.empty()) {
+    PendingNode current = std::move(pending.back());
+    pending.pop_back();
+    if (!visited.insert(current.id).second) {
+      continue;
+    }
+
+    const ::opcua::BrowseDescription browse(
+        current.id, ::opcua::BrowseDirection::Forward,
+        ::opcua::ReferenceTypeId::HierarchicalReferences, true,
+        ::opcua::NodeClass::Unspecified, ::opcua::BrowseResultMask::All);
+    const auto references = ::opcua::services::browseAll(native, browse);
+    if (!references) {
+      assignError(error, "failed to inspect OPC UA replacement subtree '" +
+                             current.root_path + "': " +
+                             statusName(references.code()));
+      return false;
+    }
+
+    for (const auto &reference : references.value()) {
+      if (!reference.nodeId().isLocal()) {
+        continue;
+      }
+      const ::opcua::NodeId child = reference.nodeId().nodeId();
+      const auto owned = owned_nodes.find(child);
+      if (owned != owned_nodes.end()) {
+        pending.push_back(PendingNode{
+            child, owned->second == NodeKind::method, current.root_path});
+        continue;
+      }
+      if (current.method && implicitMethodArgument(reference)) {
+        pending.push_back(PendingNode{child, false, current.root_path});
+        continue;
+      }
+
+      assignError(error,
+                  "refusing to replace OPC UA node '" + current.root_path +
+                      "' because it contains unowned child '" +
+                      std::string(reference.browseName().name()) + "'");
+      return false;
+    }
+  }
+  return true;
+}
 
 struct ComponentSnapshot {
   NodeMap nodes;
@@ -1501,6 +1583,30 @@ private:
                                                  : left_depth < right_depth;
               });
 
+    if (!removalSubtreesAreOwned(native, namespace_index, previous,
+                                 direct_remove_paths, error)) {
+      return false;
+    }
+    for (const NodeSpec *spec : candidate_specs) {
+      if (!previous.contains(spec->path) &&
+          ::opcua::services::readNodeClass(
+              native, nodeId(namespace_index, spec->path))) {
+        assignError(error, "OPC UA candidate node collision at '" +
+                               spec->path + "' before reconciliation");
+        return false;
+      }
+    }
+
+    const auto missing_old_paths = [&] {
+      std::set<std::string> missing;
+      for (const std::string &path : old_remove_paths) {
+        if (!::opcua::services::readNodeClass(
+                native, nodeId(namespace_index, path))) {
+          missing.insert(path);
+        }
+      }
+      return missing;
+    };
     const auto restore_old = [&](const std::set<std::string> &paths,
                                  std::string *rollback_error) {
       bool restored = true;
@@ -1514,7 +1620,6 @@ private:
       return restored;
     };
 
-    std::set<std::string> deleted_old_paths;
     for (const std::string &path : old_remove_paths) {
       const ::opcua::StatusCode result = ::opcua::services::deleteNode(
           native, nodeId(namespace_index, path), true);
@@ -1522,11 +1627,11 @@ private:
         assignError(error, "failed to delete OPC UA node '" + path + "': " +
                                statusName(result));
         std::string rollback_error;
-        const bool restored = restore_old(deleted_old_paths, &rollback_error);
+        const bool restored =
+            restore_old(missing_old_paths(), &rollback_error);
         appendRollbackError(error, rollback_error, restored);
         return false;
       }
-      deleted_old_paths.insert(path);
     }
 
     std::set<std::string> created_candidate_paths;
@@ -1552,7 +1657,7 @@ private:
                                          cleanup_paths, &cleanup_error);
         std::string restore_error;
         const bool old_restored =
-            restore_old(deleted_old_paths, &restore_error);
+            restore_old(missing_old_paths(), &restore_error);
         std::string rollback_error = cleanup_error;
         if (!restore_error.empty()) {
           if (!rollback_error.empty()) {

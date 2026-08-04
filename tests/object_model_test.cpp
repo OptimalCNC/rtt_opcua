@@ -241,6 +241,7 @@ public:
                              std::string name = "rollback-component")
       : RTT::TaskContext(std::move(name)) {
     addProperty("OrdinaryProperty", ordinary_property);
+    addPort(stable_output);
     if (publish_failing) {
       addFailingPort();
     }
@@ -249,6 +250,7 @@ public:
   void addFailingPort() { addPort(failing_input); }
 
   std::int32_t ordinary_property{17};
+  RTT::OutputPort<double> stable_output{"StableOutput"};
   FailingInputPort failing_input{"FailingInput"};
 };
 
@@ -485,6 +487,12 @@ BOOST_FIXTURE_TEST_CASE(
   const auto failing_port_id = modelNodeId(
       namespace_index,
       {"components", failing.getName(), "ports", "FailingInput"});
+  const auto stable_output_id = modelNodeId(
+      namespace_index,
+      {"components", failing.getName(), "ports", "StableOutput"});
+  const auto stable_output_read_id = modelNodeId(
+      namespace_index,
+      {"components", failing.getName(), "ports", "StableOutput", "read"});
 
   const std::uint64_t revision_before = model.revision();
   std::int32_t dynamic_value{23};
@@ -503,6 +511,14 @@ BOOST_FIXTURE_TEST_CASE(
                  .value()
                  .to<std::int32_t>() == failing.ordinary_property);
   BOOST_TEST(!::opcua::services::readBrowseName(client, failing_port_id));
+  BOOST_TEST(failing.stable_output.write(9.5) == RTT::WriteSuccess);
+  const auto restored_port_result = ::opcua::services::call(
+      client, stable_output_id, stable_output_read_id, {});
+  BOOST_REQUIRE(restored_port_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(restored_port_result.outputArguments().size(), 2U);
+  BOOST_TEST(restored_port_result.outputArguments()[0].to<std::string>() ==
+             "NewData");
+  BOOST_TEST(restored_port_result.outputArguments()[1].to<double>() == 9.5);
 
   client.disconnect();
   failing_registration->reset();
@@ -534,6 +550,9 @@ BOOST_FIXTURE_TEST_CASE(
   const auto foreign_id = modelNodeId(
       namespace_index,
       {"components", component.getName(), "properties", "Foreign"});
+  const auto supported_id = modelNodeId(
+      namespace_index,
+      {"components", component.getName(), "properties", "Supported"});
   bool seeded = false;
   BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
     ::opcua::VariableAttributes attributes;
@@ -550,8 +569,10 @@ BOOST_FIXTURE_TEST_CASE(
 
   const std::uint64_t revision_before = model.revision();
   std::int32_t colliding_value{42};
+  component.provides()->doc("replacement candidate");
   component.addProperty("Foreign", colliding_value);
   BOOST_TEST(!model.reconcile(&error));
+  BOOST_TEST(error.find("unowned child") != std::string::npos);
   BOOST_TEST(model.revision() == revision_before);
 
   ::opcua::Client client;
@@ -559,6 +580,9 @@ BOOST_FIXTURE_TEST_CASE(
   const auto foreign_value = ::opcua::services::readValue(client, foreign_id);
   BOOST_REQUIRE(foreign_value);
   BOOST_TEST(foreign_value.value().to<std::int32_t>() == 99);
+  BOOST_TEST(::opcua::services::readValue(client, supported_id)
+                 .value()
+                 .to<std::int32_t>() == supported_value);
 
   client.disconnect();
   registration->reset();
@@ -735,6 +759,20 @@ BOOST_FIXTURE_TEST_CASE(
           .value()
           .to<std::uint64_t>();
   BOOST_TEST(first_revision > 0U);
+
+  component.provides()->doc("Updated component documentation");
+  BOOST_REQUIRE_MESSAGE(model.reconcile(&error), error);
+  BOOST_TEST(model.revision() > first_revision);
+  BOOST_TEST(feedback.write(8.25) == RTT::WriteSuccess);
+  const auto reconciled_feedback_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(reconciled_feedback_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(reconciled_feedback_result.outputArguments().size(), 2U);
+  BOOST_TEST(
+      reconciled_feedback_result.outputArguments()[0].to<std::string>() ==
+      "NewData");
+  BOOST_TEST(reconciled_feedback_result.outputArguments()[1].to<double>() ==
+             8.25);
 
   std::int32_t dynamic_value = 23;
   RTT::Property<std::int32_t> &dynamic =
