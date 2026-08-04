@@ -76,6 +76,27 @@ std::string statusName(::opcua::StatusCode status) {
   return std::string(status.name());
 }
 
+bool componentNodeCreated(
+    const ::opcua::Result<::opcua::NodeId> &result, const std::string &path,
+    std::string *error) {
+  if (result) {
+    return true;
+  }
+  assignError(error, "failed to create OPC UA component node '" + path +
+                         "': " + statusName(result.code()));
+  return false;
+}
+
+bool sharedRootEnsured(const ::opcua::Result<::opcua::NodeId> &result,
+                       const std::string &path, std::string *error) {
+  if (result || result.code() == UA_STATUSCODE_BADNODEIDEXISTS) {
+    return true;
+  }
+  assignError(error, "failed to ensure OPC UA root node '" + path + "': " +
+                         statusName(result.code()));
+  return false;
+}
+
 std::string taskStateName(RTT::base::TaskCore::TaskState state) {
   switch (state) {
   case RTT::base::TaskCore::Init:
@@ -280,12 +301,7 @@ bool addObjectNode(::opcua::Server &server, std::uint16_t namespace_index,
       nodeId(namespace_index, path), browse_name, attributes,
       ::opcua::ObjectTypeId::BaseObjectType,
       ::opcua::ReferenceTypeId::HasComponent);
-  if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-    assignError(error, "failed to create OPC UA object node '" + path +
-                           "': " + statusName(result.code()));
-    return false;
-  }
-  return true;
+  return componentNodeCreated(result, path, error);
 }
 
 NodeSpec objectSpec(std::string path, std::string parent_path,
@@ -328,12 +344,7 @@ bool addStaticStringVariable(
       ::opcua::VariableTypeId::BaseDataVariableType,
       property ? ::opcua::ReferenceTypeId::HasProperty
                : ::opcua::ReferenceTypeId::HasComponent);
-  if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-    assignError(error, "failed to create OPC UA variable node '" + path +
-                           "': " + statusName(result.code()));
-    return false;
-  }
-  return true;
+  return componentNodeCreated(result, path, error);
 }
 
 NodeSpec staticStringSpec(std::string path, std::string parent_path,
@@ -399,12 +410,7 @@ NodeSpec staticArrayPropertySpec(std::string path, std::string parent_path,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         name, attributes, ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasProperty);
-    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-      assignError(error, "failed to create RTT metadata node '" + path +
-                             "': " + statusName(result.code()));
-      return false;
-    }
-    return true;
+    return componentNodeCreated(result, path, error);
   };
   return spec;
 }
@@ -445,9 +451,7 @@ NodeSpec lifecycleSpec(const std::string &component_path,
         "lifecycleState", attributes,
         ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-      assignError(error, "failed to create lifecycle state node: " +
-                             statusName(result.code()));
+    if (!componentNodeCreated(result, path, error)) {
       return false;
     }
     ::opcua::setVariableNodeValueBackend(
@@ -506,9 +510,7 @@ dataSourceSpec(const std::string &parent_path, const std::string &name,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         name, attributes, ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-      assignError(error, "failed to create RTT value node '" + path +
-                             "': " + statusName(result.code()));
+    if (!componentNodeCreated(result, path, error)) {
       return false;
     }
     ::opcua::setVariableNodeValueBackend(
@@ -571,12 +573,7 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         name, std::move(callback), schema.inputs, schema.outputs, attributes,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-      assignError(error, "failed to create RTT operation node '" + path +
-                             "': " + statusName(result.code()));
-      return false;
-    }
-    return true;
+    return componentNodeCreated(result, path, error);
   };
   return spec;
 }
@@ -675,14 +672,10 @@ portMethodSpec(const std::string &port_path, RTT::base::PortInterface &port,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         method_name, std::move(callback), inputs, outputs, attributes,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!result && result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-      assignError(error, "failed to create RTT port method node '" + path +
-                             "': " + statusName(result.code()));
+    if (!componentNodeCreated(result, path, error)) {
       return false;
     }
-    if (result) {
-      *bridge_slot = bridge;
-    }
+    *bridge_slot = bridge;
     return true;
   };
   return spec;
@@ -967,6 +960,15 @@ bool deleteNodes(::opcua::Server &server, std::uint16_t namespace_index,
   return true;
 }
 
+void appendRollbackError(std::string *error, const std::string &rollback_error,
+                         bool restored) {
+  if (error == nullptr) {
+    return;
+  }
+  *error += restored ? "; rollback succeeded"
+                     : "; rollback failed: " + rollback_error;
+}
+
 } // namespace
 
 class ObjectModelImpl final
@@ -1180,16 +1182,18 @@ public:
             const ComponentSnapshot expected = snapshotComponent(
                 state, *lease.get(), self->dispatcher, self->type_registry,
                 self->options.port_buffer_size);
+            self->updateDiagnostics(state->component_name, expected.unsupported,
+                                    *diagnostic_events);
+            if (!expected.unsupported.empty()) {
+              continue;
+            }
             bool component_changed = false;
             if (!self->reconcileComponent(native, *namespace_index, state.get(),
                                           expected.nodes, &component_changed,
                                           reconcile_error.get())) {
               return;
             }
-            const bool diagnostics_changed = self->updateDiagnostics(
-                state->component_name, expected.unsupported,
-                *diagnostic_events);
-            changed = changed || component_changed || diagnostics_changed;
+            changed = changed || component_changed;
           }
           if (changed) {
             self->advanceRevision(native);
@@ -1354,17 +1358,30 @@ private:
         nodeId(namespace_index, "rtt"), "RTT", root_attributes,
         ::opcua::ObjectTypeId::BaseObjectType,
         ::opcua::ReferenceTypeId::Organizes);
-    if (!root_result && root_result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-      assignError(error, "failed to create the OPC UA RTT root: " +
-                             statusName(root_result.code()));
+    if (!sharedRootEnsured(root_result, "rtt", error)) {
       return false;
     }
-    if (!addObjectNode(native, namespace_index, "rtt",
-                       appendNodeSegment("rtt", "components"), "Components",
-                       "Registered RTT components.", error) ||
-        !addObjectNode(native, namespace_index, "rtt",
-                       appendNodeSegment("rtt", "model"), "Model",
-                       "RTT model metadata.", error)) {
+
+    const auto ensure_object = [&](const std::string &path,
+                                   const std::string &browse_name,
+                                   const std::string &description) {
+      ::opcua::ObjectAttributes attributes;
+      attributes.setDisplayName(
+          ::opcua::LocalizedText("en-US", browse_name));
+      attributes.setDescription(
+          ::opcua::LocalizedText("en-US", description));
+      const auto result = ::opcua::services::addObject(
+          native, nodeId(namespace_index, "rtt"),
+          nodeId(namespace_index, path), browse_name, attributes,
+          ::opcua::ObjectTypeId::BaseObjectType,
+          ::opcua::ReferenceTypeId::HasComponent);
+      return sharedRootEnsured(result, path, error);
+    };
+    const std::string components_path = appendNodeSegment("rtt", "components");
+    const std::string model_path = appendNodeSegment("rtt", "model");
+    if (!ensure_object(components_path, "Components",
+                       "Registered RTT components.") ||
+        !ensure_object(model_path, "Model", "RTT model metadata.")) {
       return false;
     }
 
@@ -1379,16 +1396,13 @@ private:
     revision_attributes.setAccessLevel(readOnlyAccess());
     revision_attributes.setUserAccessLevel(readOnlyAccess());
     const std::string revision_path =
-        appendNodeSegment(appendNodeSegment("rtt", "model"), "revision");
+        appendNodeSegment(model_path, "revision");
     const auto revision_result = ::opcua::services::addVariable(
-        native, nodeId(namespace_index, appendNodeSegment("rtt", "model")),
+        native, nodeId(namespace_index, model_path),
         nodeId(namespace_index, revision_path), "revision", revision_attributes,
         ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!revision_result &&
-        revision_result.code() != UA_STATUSCODE_BADNODEIDEXISTS) {
-      assignError(error, "failed to create the OPC UA model revision: " +
-                             statusName(revision_result.code()));
+    if (!sharedRootEnsured(revision_result, revision_path, error)) {
       return false;
     }
     roots_ready = true;
@@ -1399,48 +1413,132 @@ private:
                           std::uint16_t namespace_index,
                           const ComponentState *state, const NodeMap &expected,
                           bool *changed, std::string *error) {
-    NodeMap &current = published[state];
-    std::vector<std::string> removals;
-    for (const auto &[path, existing] : current) {
+    const auto current = published.find(state);
+    const NodeMap previous =
+        current == published.end() ? NodeMap{} : current->second;
+    NodeMap committed = expected;
+    for (const auto &[path, existing] : previous) {
+      const auto candidate = committed.find(path);
+      if (candidate != committed.end() &&
+          candidate->second.fingerprint == existing.fingerprint) {
+        candidate->second = existing;
+      }
+    }
+
+    std::vector<std::string> old_remove_paths;
+    for (const auto &[path, existing] : previous) {
       const auto replacement = expected.find(path);
       if (replacement == expected.end() ||
           replacement->second.fingerprint != existing.fingerprint) {
-        removals.push_back(path);
+        old_remove_paths.push_back(path);
       }
     }
-    std::sort(removals.begin(), removals.end(),
+    std::sort(old_remove_paths.begin(), old_remove_paths.end(),
               [](const auto &left, const auto &right) {
-                return pathDepth(left) > pathDepth(right);
+                const std::size_t left_depth = pathDepth(left);
+                const std::size_t right_depth = pathDepth(right);
+                return left_depth == right_depth ? left < right
+                                                 : left_depth > right_depth;
               });
-    if (!deleteNodes(native, namespace_index, removals, error)) {
-      return false;
-    }
-    for (const std::string &path : removals) {
-      current.erase(path);
-      *changed = true;
-    }
 
-    std::vector<const NodeSpec *> additions;
-    for (const auto &[path, spec] : expected) {
-      const auto existing = current.find(path);
-      if (existing == current.end()) {
-        additions.push_back(&spec);
+    std::vector<const NodeSpec *> candidate_specs;
+    for (const auto &[path, spec] : committed) {
+      const auto existing = previous.find(path);
+      if (existing == previous.end() ||
+          existing->second.fingerprint != spec.fingerprint) {
+        candidate_specs.push_back(&spec);
       }
     }
-    std::sort(additions.begin(), additions.end(),
+    std::sort(candidate_specs.begin(), candidate_specs.end(),
               [](const NodeSpec *left, const NodeSpec *right) {
                 const std::size_t left_depth = pathDepth(left->path);
                 const std::size_t right_depth = pathDepth(right->path);
                 return left_depth == right_depth ? left->path < right->path
                                                  : left_depth < right_depth;
               });
-    for (const NodeSpec *spec : additions) {
-      if (!spec->create(native, namespace_index, error)) {
+
+    std::vector<std::string> candidate_cleanup_paths;
+    candidate_cleanup_paths.reserve(candidate_specs.size());
+    for (const NodeSpec *spec : candidate_specs) {
+      candidate_cleanup_paths.push_back(spec->path);
+    }
+    std::sort(candidate_cleanup_paths.begin(), candidate_cleanup_paths.end(),
+              [](const auto &left, const auto &right) {
+                const std::size_t left_depth = pathDepth(left);
+                const std::size_t right_depth = pathDepth(right);
+                return left_depth == right_depth ? left < right
+                                                 : left_depth > right_depth;
+              });
+
+    const std::set<std::string> old_remove_set(old_remove_paths.begin(),
+                                               old_remove_paths.end());
+    std::vector<const NodeSpec *> rollback_specs;
+    rollback_specs.reserve(old_remove_paths.size());
+    for (const auto &[path, spec] : previous) {
+      if (old_remove_set.contains(path)) {
+        rollback_specs.push_back(&spec);
+      }
+    }
+    std::sort(rollback_specs.begin(), rollback_specs.end(),
+              [](const NodeSpec *left, const NodeSpec *right) {
+                const std::size_t left_depth = pathDepth(left->path);
+                const std::size_t right_depth = pathDepth(right->path);
+                return left_depth == right_depth ? left->path < right->path
+                                                 : left_depth < right_depth;
+              });
+
+    const auto restore_old = [&](const std::set<std::string> &paths,
+                                 std::string *rollback_error) {
+      bool restored = true;
+      for (const NodeSpec *spec : rollback_specs) {
+        if (!paths.contains(spec->path)) {
+          continue;
+        }
+        restored = spec->create(native, namespace_index, rollback_error) &&
+                   restored;
+      }
+      return restored;
+    };
+
+    std::set<std::string> deleted_old_paths;
+    for (const std::string &path : old_remove_paths) {
+      const ::opcua::StatusCode result = ::opcua::services::deleteNode(
+          native, nodeId(namespace_index, path), true);
+      if (result.isBad() && result != UA_STATUSCODE_BADNODEIDUNKNOWN) {
+        assignError(error, "failed to delete OPC UA node '" + path + "': " +
+                               statusName(result));
+        std::string rollback_error;
+        const bool restored = restore_old(deleted_old_paths, &rollback_error);
+        appendRollbackError(error, rollback_error, restored);
         return false;
       }
-      current.insert_or_assign(spec->path, *spec);
-      *changed = true;
+      deleted_old_paths.insert(path);
     }
+
+    for (const NodeSpec *spec : candidate_specs) {
+      if (!spec->create(native, namespace_index, error)) {
+        std::string cleanup_error;
+        const bool removed = deleteNodes(native, namespace_index,
+                                         candidate_cleanup_paths,
+                                         &cleanup_error);
+        std::string restore_error;
+        const bool old_restored =
+            restore_old(deleted_old_paths, &restore_error);
+        std::string rollback_error = cleanup_error;
+        if (!restore_error.empty()) {
+          if (!rollback_error.empty()) {
+            rollback_error += "; ";
+          }
+          rollback_error += restore_error;
+        }
+        const bool restored = removed && old_restored;
+        appendRollbackError(error, rollback_error, restored);
+        return false;
+      }
+    }
+
+    published.insert_or_assign(state, std::move(committed));
+    *changed = !old_remove_paths.empty() || !candidate_specs.empty();
     return true;
   }
 

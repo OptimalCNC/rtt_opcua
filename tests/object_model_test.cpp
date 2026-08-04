@@ -175,7 +175,7 @@ void registerUnsupportedValueType() {
 
 class UnsupportedResourceComponent final : public RTT::TaskContext {
 public:
-  UnsupportedResourceComponent()
+  explicit UnsupportedResourceComponent(bool publish_unsupported = true)
       : RTT::TaskContext("unsupported-component"),
         unsupported_service(RTT::Service::Create("unsupported")) {
     unsupported_service
@@ -190,8 +190,16 @@ public:
     unsupported_service->addPort(input);
     unsupported_service->addPort(output);
     provides()->addProperty("SupportedProperty", supported_property);
+    if (publish_unsupported) {
+      addUnsupportedService();
+    }
+  }
+
+  void addUnsupportedService() {
     BOOST_REQUIRE(provides()->addService(unsupported_service));
   }
+
+  void removeUnsupportedService() { provides()->removeService("unsupported"); }
 
   bool consume(UnsupportedValue) const { return true; }
   UnsupportedValue produce() const { return UnsupportedValue{42}; }
@@ -202,6 +210,24 @@ public:
   std::int32_t supported_property{3};
   RTT::InputPort<UnsupportedValue> input{"UnsupportedInput"};
   RTT::OutputPort<UnsupportedValue> output{"UnsupportedOutput"};
+};
+
+class FailingInputPort final : public RTT::InputPort<std::int32_t> {
+public:
+  using RTT::InputPort<std::int32_t>::InputPort;
+
+  RTT::base::PortInterface *antiClone() const override { return nullptr; }
+};
+
+class RollbackComponent final : public RTT::TaskContext {
+public:
+  RollbackComponent() : RTT::TaskContext("rollback-component") {
+    addProperty("OrdinaryProperty", ordinary_property);
+    addPort(failing_input);
+  }
+
+  std::int32_t ordinary_property{17};
+  FailingInputPort failing_input{"FailingInput"};
 };
 
 } // namespace
@@ -312,6 +338,92 @@ BOOST_FIXTURE_TEST_CASE(
       !::opcua::services::readBrowseName(client, supported_property_id));
 
   client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    failed_initial_publication_rollback_removes_every_component_node,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModel model(server);
+  RollbackComponent component;
+  const std::uint64_t revision_before = model.revision();
+  auto registration = model.registerComponent(component, &error);
+  BOOST_TEST(!registration.has_value());
+  BOOST_TEST(!error.empty());
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == revision_before);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto ordinary_property_id = modelNodeId(
+      namespace_index,
+      {"components", component.getName(), "properties", "OrdinaryProperty"});
+  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, ordinary_property_id));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    unsupported_runtime_candidate_preserves_the_last_good_revision,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::milliseconds(20);
+  RTT::opcua::ObjectModel model(server, model_options);
+  UnsupportedResourceComponent component(false);
+  auto registration = model.registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto known_good_node_id = modelNodeId(
+      namespace_index,
+      {"components", component.getName(), "properties", "SupportedProperty"});
+  const auto unsupported_service_node_id = modelNodeId(
+      namespace_index,
+      {"components", component.getName(), "services", "unsupported"});
+  BOOST_REQUIRE(::opcua::services::readBrowseName(client, known_good_node_id));
+
+  const std::uint64_t last_good_revision = model.revision();
+  component.addUnsupportedService();
+  BOOST_REQUIRE(waitUntil([&] {
+    return !model.unsupportedResources(component.getName()).empty();
+  }));
+  BOOST_TEST(model.revision() == last_good_revision);
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readBrowseName(client, known_good_node_id)));
+  BOOST_TEST(
+      !::opcua::services::readBrowseName(client, unsupported_service_node_id));
+
+  component.removeUnsupportedService();
+  BOOST_REQUIRE(waitUntil([&] {
+    return model.unsupportedResources(component.getName()).empty();
+  }));
+  BOOST_TEST(model.revision() == last_good_revision);
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readBrowseName(client, known_good_node_id)));
+
+  client.disconnect();
+  registration->reset();
   server.stop();
 }
 
