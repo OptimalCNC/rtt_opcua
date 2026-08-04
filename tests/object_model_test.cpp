@@ -35,6 +35,8 @@
 #include <thread>
 #include <vector>
 
+BOOST_TEST_DONT_PRINT_LOG_VALUE(RTT::opcua::UnsupportedResource)
+
 namespace {
 
 std::uint16_t unusedLoopbackPort() {
@@ -187,6 +189,7 @@ public:
     unsupported_service->addAttribute("UnsupportedAttribute", attribute);
     unsupported_service->addPort(input);
     unsupported_service->addPort(output);
+    provides()->addProperty("SupportedProperty", supported_property);
     BOOST_REQUIRE(provides()->addService(unsupported_service));
   }
 
@@ -196,6 +199,7 @@ public:
   RTT::Service::shared_ptr unsupported_service;
   UnsupportedValue property{1};
   UnsupportedValue attribute{2};
+  std::int32_t supported_property{3};
   RTT::InputPort<UnsupportedValue> input{"UnsupportedInput"};
   RTT::OutputPort<UnsupportedValue> output{"UnsupportedOutput"};
 };
@@ -244,7 +248,7 @@ BOOST_FIXTURE_TEST_CASE(canonical_array_value_nodes_publish_and_remain_writable,
 }
 
 BOOST_FIXTURE_TEST_CASE(
-    unsupported_resources_are_queryable_deduplicated_and_recover,
+    unsupported_resources_reject_the_complete_initial_component,
     CanonicalTypesFixture) {
   registerUnsupportedValueType();
 
@@ -264,15 +268,19 @@ BOOST_FIXTURE_TEST_CASE(
   RTT::opcua::ObjectModel model(server, model_options);
 
   UnsupportedResourceComponent component;
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  BOOST_REQUIRE_MESSAGE(model.reconcile(&error), error);
-
-  const std::vector<RTT::opcua::UnsupportedResource> diagnostics =
-      model.unsupportedResources(component.getName());
+  const std::uint64_t revision_before = model.revision();
+  std::vector<RTT::opcua::UnsupportedResource> diagnostics;
+  auto registration = model.registerComponent(component, &error, &diagnostics);
+  BOOST_TEST(!registration.has_value());
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == revision_before);
+  BOOST_TEST(diagnostics.size() == 6U);
   BOOST_REQUIRE_EQUAL(diagnostics.size(), 6U);
+  BOOST_TEST(model.unsupportedResources(component.getName()) == diagnostics,
+             boost::test_tools::per_element());
   BOOST_TEST(std::ranges::is_sorted(diagnostics));
   BOOST_TEST(messages.size() == diagnostics.size());
+  BOOST_TEST(error.starts_with("strict OPC UA publication rejected component"));
 
   const std::vector<std::pair<std::string, std::string>> expected_resources{
       {"unsupported.UnsupportedAttribute", "attribute"},
@@ -294,26 +302,16 @@ BOOST_FIXTURE_TEST_CASE(
 
   ::opcua::Client client;
   client.connect(server.endpointUrl());
-  const auto unsupported_input_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "services",
-                        "unsupported", "ports", "UnsupportedInput"});
-  BOOST_TEST(!::opcua::services::readBrowseName(client, unsupported_input_id));
-
-  component.provides()->removeService("unsupported");
-  BOOST_REQUIRE_MESSAGE(model.reconcile(&error), error);
-  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
-  BOOST_REQUIRE_EQUAL(messages.size(), 12U);
-  for (std::size_t index = 0U; index < diagnostics.size(); ++index) {
-    const auto &diagnostic = diagnostics[index];
-    const std::string expected = "OPC UA: component '" + diagnostic.component +
-                                 "' now publishes " + diagnostic.kind + " '" +
-                                 diagnostic.path + "' with RTT type '" +
-                                 diagnostic.type_name + "'.";
-    BOOST_TEST(messages[index + diagnostics.size()] == expected);
-  }
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto supported_property_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "properties", "SupportedProperty"});
+  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
+  BOOST_TEST(
+      !::opcua::services::readBrowseName(client, supported_property_id));
 
   client.disconnect();
-  registration->reset();
   server.stop();
 }
 

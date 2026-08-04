@@ -78,7 +78,9 @@ public:
   ObjectModel &operator=(ObjectModel &&) = delete;
 
   std::optional<ComponentRegistration>
-  registerComponent(RTT::TaskContext &component, std::string *error = nullptr);
+  registerComponent(
+      RTT::TaskContext &component, std::string *error = nullptr,
+      std::vector<UnsupportedResource> *unsupported = nullptr);
   bool reconcile(std::string *error = nullptr);
 
   std::uint64_t revision() const noexcept;

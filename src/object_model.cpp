@@ -1002,8 +1002,9 @@ public:
     });
   }
 
-  std::shared_ptr<ComponentState> registerComponent(RTT::TaskContext &component,
-                                                    std::string *error) {
+  std::shared_ptr<ComponentState>
+  registerComponent(RTT::TaskContext &component, std::string *error,
+                    std::vector<UnsupportedResource> *unsupported) {
     if (!server.isRunning()) {
       assignError(
           error,
@@ -1041,16 +1042,60 @@ public:
                                "' is already registered");
         return {};
       }
-      components.emplace(state->component_name, state);
     }
 
-    if (!reconcile(error)) {
-      {
-        std::lock_guard<std::mutex> lock(registry_mutex);
-        components.erase(state->component_name);
+    ComponentSnapshot snapshot =
+        snapshotComponent(state, component, dispatcher, type_registry,
+                          options.port_buffer_size);
+    const bool rejected = !snapshot.unsupported.empty();
+    bool published_snapshot = false;
+    {
+      std::lock_guard<std::mutex> lock(registry_mutex);
+      if (shutdown_started.load()) {
+        assignError(error, "OPC UA object model is shutting down");
+        return {};
       }
+      if (components.contains(state->component_name)) {
+        assignError(error, "an RTT component named '" + state->component_name +
+                               "' is already registered");
+        return {};
+      }
+
+      if (rejected) {
+        std::lock_guard<std::mutex> model_lock(model_mutex);
+        failed_publications[state->component_name] = snapshot.unsupported;
+      } else {
+        components.emplace(state->component_name, state);
+        published_snapshot = publishSnapshot(state, snapshot, error);
+        if (!published_snapshot) {
+          components.erase(state->component_name);
+        }
+      }
+    }
+
+    if (rejected) {
+      if (unsupported != nullptr) {
+        *unsupported = snapshot.unsupported;
+      }
+      assignError(error, "strict OPC UA publication rejected component '" +
+                             state->component_name + "'");
+      std::vector<DiagnosticEvent> events;
+      events.reserve(snapshot.unsupported.size());
+      for (const UnsupportedResource &resource : snapshot.unsupported) {
+        events.push_back(DiagnosticEvent{false, resource});
+      }
+      emitDiagnosticEvents(events);
+      return {};
+    }
+
+    if (!published_snapshot) {
       deactivate(state);
       return {};
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(model_mutex);
+      failed_publications.erase(state->component_name);
     }
     worker_condition.notify_all();
     return state;
@@ -1091,6 +1136,7 @@ public:
       std::lock_guard<std::mutex> lock(model_mutex);
       published.erase(state.get());
       unsupported.erase(state->component_name);
+      failed_publications.erase(state->component_name);
     }
   }
 
@@ -1183,10 +1229,7 @@ public:
 
   std::vector<UnsupportedResource>
   unsupportedResources(std::string_view component) const {
-    std::lock_guard<std::mutex> lock(model_mutex);
-    const auto found = unsupported.find(component);
-    return found == unsupported.end() ? std::vector<UnsupportedResource>{}
-                                      : found->second;
+    return diagnosticsFor(component);
   }
 
   std::string lastError() const {
@@ -1247,15 +1290,55 @@ public:
             }
             self->published.clear();
             self->unsupported.clear();
+            self->failed_publications.clear();
           },
           std::chrono::seconds(5));
     }
     std::lock_guard<std::mutex> lock(model_mutex);
     published.clear();
     unsupported.clear();
+    failed_publications.clear();
   }
 
 private:
+  bool publishSnapshot(const std::shared_ptr<ComponentState> &state,
+                       const ComponentSnapshot &snapshot, std::string *error) {
+    bool component_changed = false;
+    bool published_snapshot = false;
+    const bool invoked = server.invoke(
+        [this, &state, &snapshot, &component_changed, &published_snapshot,
+         error](::opcua::Server &native) {
+          std::lock_guard<std::mutex> lock(model_mutex);
+          const auto index = server.namespaceIndex();
+          if (!index || !ensureRoots(native, *index, error) ||
+              !reconcileComponent(native, *index, state.get(), snapshot.nodes,
+                                  &component_changed, error)) {
+            return;
+          }
+          if (component_changed) {
+            advanceRevision(native);
+          }
+          published_snapshot = true;
+        });
+    if (!invoked && (error == nullptr || error->empty())) {
+      assignError(error, "failed to invoke initial OPC UA component publication");
+    }
+    return invoked && published_snapshot;
+  }
+
+  std::vector<UnsupportedResource>
+  diagnosticsFor(std::string_view component_name) const {
+    std::lock_guard<std::mutex> lock(model_mutex);
+    const auto active = unsupported.find(component_name);
+    if (active != unsupported.end()) {
+      return active->second;
+    }
+    const auto rejected = failed_publications.find(component_name);
+    return rejected == failed_publications.end()
+               ? std::vector<UnsupportedResource>{}
+               : rejected->second;
+  }
+
   bool ensureRoots(::opcua::Server &native, std::uint16_t namespace_index,
                    std::string *error) {
     if (roots_ready) {
@@ -1413,8 +1496,12 @@ private:
   bool removePublishedComponent(::opcua::Server &native,
                                 const ComponentState *state,
                                 std::string *error) {
-    const bool diagnostics_removed =
+    const bool active_diagnostics_removed =
         unsupported.erase(state->component_name) != 0U;
+    const bool failed_diagnostics_removed =
+        failed_publications.erase(state->component_name) != 0U;
+    const bool diagnostics_removed =
+        active_diagnostics_removed || failed_diagnostics_removed;
     const auto found = published.find(state);
     if (found == published.end()) {
       return diagnostics_removed;
@@ -1468,6 +1555,8 @@ private:
   std::map<const ComponentState *, NodeMap> published;
   std::map<std::string, std::vector<UnsupportedResource>, std::less<>>
       unsupported;
+  std::map<std::string, std::vector<UnsupportedResource>, std::less<>>
+      failed_publications;
   bool roots_ready{false};
   std::atomic<std::uint64_t> revision{0U};
   mutable std::mutex error_mutex;
@@ -1539,8 +1628,9 @@ ObjectModel::~ObjectModel() { impl_->shutdown(); }
 
 std::optional<ComponentRegistration>
 ObjectModel::registerComponent(RTT::TaskContext &component,
-                               std::string *error) {
-  const auto state = impl_->registerComponent(component, error);
+                               std::string *error,
+                               std::vector<UnsupportedResource> *unsupported) {
+  const auto state = impl_->registerComponent(component, error, unsupported);
   if (!state) {
     return std::nullopt;
   }
