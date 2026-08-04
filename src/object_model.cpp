@@ -28,6 +28,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -270,6 +271,19 @@ struct NodeSpec {
 };
 
 using NodeMap = std::map<std::string, NodeSpec>;
+
+bool createNode(::opcua::Server &native, std::uint16_t namespace_index,
+                const NodeSpec &spec, std::string *error) noexcept {
+  try {
+    return spec.create(native, namespace_index, error);
+  } catch (const std::exception &exception) {
+    assignError(error, "OPC UA node creator threw for '" + spec.path +
+                           "': " + exception.what());
+  } catch (...) {
+    assignError(error, "OPC UA node creator threw for '" + spec.path + "'");
+  }
+  return false;
+}
 
 ::opcua::NodeClass nodeClass(NodeKind kind) {
   switch (kind) {
@@ -611,6 +625,40 @@ bool removalSubtreesAreOwned(::opcua::Server &native,
     }
   }
   return deletionSetIsOwned(native, namespace_index, specs, error);
+}
+
+bool unchangedCandidateParentsAreOwned(
+    ::opcua::Server &native, const NodeMap &previous,
+    const std::set<std::string> &old_remove_set,
+    const std::vector<const NodeSpec *> &candidate_specs, std::string *error) {
+  std::set<std::string> checked;
+  for (const NodeSpec *candidate : candidate_specs) {
+    if (!checked.insert(candidate->parent_path).second ||
+        old_remove_set.contains(candidate->parent_path)) {
+      continue;
+    }
+    const auto parent = previous.find(candidate->parent_path);
+    if (parent == previous.end()) {
+      continue;
+    }
+    const auto primary = std::ranges::find_if(
+        parent->second.ownership->identities,
+        [](const OwnedNodeIdentity &identity) { return identity.primary; });
+    if (primary == parent->second.ownership->identities.end()) {
+      assignError(error,
+                  "missing ownership proof for unchanged OPC UA candidate "
+                  "parent '" +
+                      candidate->parent_path + "'");
+      return false;
+    }
+    if (identityState(native, *primary) != IdentityState::owned ||
+        !hasExpectedParentReference(native, *primary)) {
+      assignError(error, "OPC UA ownership changed for candidate parent '" +
+                             candidate->parent_path + "'");
+      return false;
+    }
+  }
+  return true;
 }
 
 struct ComponentSnapshot {
@@ -1986,6 +2034,10 @@ private:
                                  old_remove_paths, error)) {
       return false;
     }
+    if (!unchangedCandidateParentsAreOwned(native, previous, old_remove_set,
+                                           candidate_specs, error)) {
+      return false;
+    }
     for (const NodeSpec *spec : candidate_specs) {
       if (!previous.contains(spec->path) &&
           ::opcua::services::readNodeClass(
@@ -2007,7 +2059,7 @@ private:
         return false;
       }
       for (const NodeSpec *spec : rollback_specs) {
-        if (!spec->create(native, namespace_index, &creation_error) ||
+        if (!createNode(native, namespace_index, *spec, &creation_error) ||
             !captureOwnership(native, namespace_index, *spec,
                               &creation_error)) {
           restored = false;
@@ -2034,7 +2086,7 @@ private:
       const bool existed_before = static_cast<bool>(
           ::opcua::services::readNodeClass(
               native, nodeId(namespace_index, spec->path)));
-      const bool created = spec->create(native, namespace_index, error);
+      const bool created = createNode(native, namespace_index, *spec, error);
       const bool captured =
           created && captureOwnership(native, namespace_index, *spec, error);
       if (!created || !captured) {

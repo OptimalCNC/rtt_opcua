@@ -285,6 +285,15 @@ public:
   RTT::base::PortInterface *antiClone() const override { return nullptr; }
 };
 
+class ThrowingInputPort final : public RTT::InputPort<std::int32_t> {
+public:
+  using RTT::InputPort<std::int32_t>::InputPort;
+
+  RTT::base::PortInterface *antiClone() const override {
+    throw std::runtime_error("intentional antiClone failure");
+  }
+};
+
 class RollbackComponent final : public RTT::TaskContext {
 public:
   explicit RollbackComponent(bool publish_failing = true,
@@ -299,9 +308,12 @@ public:
 
   void addFailingPort() { addPort(failing_input); }
 
+  void addThrowingPort() { addPort(throwing_input); }
+
   std::int32_t ordinary_property{17};
   RTT::OutputPort<double> stable_output{"StableOutput"};
   FailingInputPort failing_input{"FailingInput"};
+  ThrowingInputPort throwing_input{"ThrowingInput"};
 };
 
 } // namespace
@@ -449,6 +461,44 @@ BOOST_FIXTURE_TEST_CASE(
 }
 
 BOOST_FIXTURE_TEST_CASE(
+    exceptional_initial_publication_rollback_removes_every_component_node,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModel model(server);
+  RollbackComponent component(false);
+  component.addThrowingPort();
+  const std::uint64_t revision_before = model.revision();
+  auto registration = model.registerComponent(component, &error);
+  BOOST_TEST(!registration.has_value());
+  BOOST_TEST(!error.empty());
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == revision_before);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto ordinary_property_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "properties", "OrdinaryProperty"});
+  const auto throwing_port_id =
+      modelNodeId(namespace_index, {"components", component.getName(), "ports",
+                                    "ThrowingInput"});
+  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, ordinary_property_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, throwing_port_id));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
     unsupported_runtime_candidate_preserves_the_last_good_revision,
     CanonicalTypesFixture) {
   registerUnsupportedValueType();
@@ -576,6 +626,58 @@ BOOST_FIXTURE_TEST_CASE(
   client.disconnect();
   failing_registration->reset();
   successful_registration->reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    exceptional_replacement_restores_the_last_good_component,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::seconds(30);
+  RTT::opcua::ObjectModel model(server, model_options);
+  RollbackComponent component(false);
+  component.provides()->doc("last good component");
+  auto registration = model.registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto ordinary_property_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "properties", "OrdinaryProperty"});
+  const auto throwing_port_id =
+      modelNodeId(namespace_index, {"components", component.getName(), "ports",
+                                    "ThrowingInput"});
+
+  const std::uint64_t revision_before = model.revision();
+  component.provides()->doc("replacement candidate");
+  component.addThrowingPort();
+  const bool reconciled = model.reconcile(&error);
+  BOOST_TEST_CONTEXT(error) {
+    BOOST_TEST(!reconciled);
+    BOOST_TEST(error.find("rollback succeeded") != std::string::npos);
+  }
+  BOOST_TEST(model.revision() == revision_before);
+  const auto restored_description =
+      ::opcua::services::readDescription(client, component_root_id);
+  BOOST_REQUIRE(restored_description);
+  BOOST_TEST(restored_description.value().text() == "last good component");
+  BOOST_TEST(::opcua::services::readValue(client, ordinary_property_id)
+                 .value()
+                 .to<std::int32_t>() == component.ordinary_property);
+  BOOST_TEST(!::opcua::services::readBrowseName(client, throwing_port_id));
+
+  client.disconnect();
+  registration->reset();
   server.stop();
 }
 
@@ -750,6 +852,87 @@ BOOST_FIXTURE_TEST_CASE(
 
   registration->reset();
   client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    recreated_candidate_parent_blocks_child_creation_before_mutation,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions model_options;
+  model_options.reconcile_interval = std::chrono::seconds(30);
+  RTT::opcua::ObjectModel model(server, model_options);
+  RTT::TaskContext component("recreated-parent-component");
+  std::int32_t supported_value{7};
+  component.addProperty("Supported", supported_value);
+  auto registration = model.registerComponent(component, &error);
+  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto properties_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "properties"});
+  const auto foreign_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "properties", "Foreign"});
+  const auto dynamic_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "properties", "Dynamic"});
+  bool recreated = false;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    const auto removed =
+        ::opcua::services::deleteNode(native, properties_id, true);
+
+    ::opcua::ObjectAttributes folder_attributes;
+    folder_attributes.setDisplayName(
+        ::opcua::LocalizedText("en-US", "Properties"));
+    folder_attributes.setDescription(
+        ::opcua::LocalizedText("en-US", "foreign properties folder"));
+    const auto folder = ::opcua::services::addObject(
+        native, component_root_id, properties_id, "Properties",
+        folder_attributes, ::opcua::ObjectTypeId::BaseObjectType,
+        ::opcua::ReferenceTypeId::HasComponent);
+
+    ::opcua::VariableAttributes value_attributes;
+    value_attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
+    value_attributes.setValue(::opcua::Variant(std::int32_t{99}));
+    value_attributes.setDataType(::opcua::DataTypeId::Int32);
+    value_attributes.setValueRank(::opcua::ValueRank::Scalar);
+    const auto foreign = ::opcua::services::addVariable(
+        native, properties_id, foreign_id, "Foreign", value_attributes,
+        ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::HasComponent);
+    recreated = removed.isGood() && static_cast<bool>(folder) &&
+                static_cast<bool>(foreign);
+  }));
+  BOOST_REQUIRE(recreated);
+
+  const std::uint64_t revision_before = model.revision();
+  std::int32_t dynamic_value{23};
+  component.addProperty("Dynamic", dynamic_value);
+  BOOST_TEST(!model.reconcile(&error));
+  BOOST_TEST(error.find("ownership") != std::string::npos);
+  BOOST_TEST(model.revision() == revision_before);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto foreign_description =
+      ::opcua::services::readDescription(client, properties_id);
+  BOOST_REQUIRE(foreign_description);
+  BOOST_TEST(foreign_description.value().text() == "foreign properties folder");
+  BOOST_TEST(::opcua::services::readValue(client, foreign_id)
+                 .value()
+                 .to<std::int32_t>() == 99);
+  BOOST_TEST(!::opcua::services::readNodeClass(client, dynamic_id));
+
+  client.disconnect();
+  registration->reset();
   server.stop();
 }
 
