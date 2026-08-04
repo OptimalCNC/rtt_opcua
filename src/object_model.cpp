@@ -12,6 +12,7 @@
 #include <open62541pp/services/nodemanagement.hpp>
 #include <open62541pp/services/view.hpp>
 #include <open62541pp/ua/nodeids.hpp>
+#include <open62541/server.h>
 
 #include <rtt/Logger.hpp>
 #include <rtt/OperationInterfacePart.hpp>
@@ -230,18 +231,43 @@ private:
 
 enum class NodeKind { object, variable, method };
 
+struct OwnedNodeIdentity {
+  ::opcua::NodeId id;
+  ::opcua::NodeClass node_class;
+  void *context{nullptr};
+  bool marker_context{false};
+  bool primary{false};
+};
+
+struct NodeOwnership {
+  std::vector<OwnedNodeIdentity> identities;
+};
+
 struct NodeSpec {
   NodeKind kind;
   std::string path;
   std::string parent_path;
   std::string browse_name;
   std::string fingerprint;
+  std::shared_ptr<NodeOwnership> ownership{std::make_shared<NodeOwnership>()};
   std::function<bool(::opcua::Server &, std::uint16_t, std::string *)> create;
 };
 
 using NodeMap = std::map<std::string, NodeSpec>;
 
-bool implicitMethodArgument(const ::opcua::ReferenceDescription &reference) {
+::opcua::NodeClass nodeClass(NodeKind kind) {
+  switch (kind) {
+  case NodeKind::object:
+    return ::opcua::NodeClass::Object;
+  case NodeKind::variable:
+    return ::opcua::NodeClass::Variable;
+  case NodeKind::method:
+    return ::opcua::NodeClass::Method;
+  }
+  return ::opcua::NodeClass::Unspecified;
+}
+
+bool isMethodArgument(const ::opcua::ReferenceDescription &reference) {
   const auto browse_name = reference.browseName();
   return reference.nodeClass() == ::opcua::NodeClass::Variable &&
          browse_name.namespaceIndex() == 0U &&
@@ -249,31 +275,154 @@ bool implicitMethodArgument(const ::opcua::ReferenceDescription &reference) {
           browse_name.name() == "OutputArguments");
 }
 
+bool captureIdentity(::opcua::Server &native, const ::opcua::NodeId &id,
+                     ::opcua::NodeClass expected_class,
+                     const std::shared_ptr<NodeOwnership> &ownership,
+                     bool primary, std::string *error) {
+  const auto actual_class = ::opcua::services::readNodeClass(native, id);
+  if (!actual_class || actual_class.value() != expected_class) {
+    assignError(error, "failed to capture OPC UA node ownership");
+    return false;
+  }
+
+  void *context = nullptr;
+  const ::opcua::StatusCode context_status(
+      UA_Server_getNodeContext(native.handle(), id, &context));
+  if (context_status.isBad()) {
+    assignError(error, "failed to read OPC UA node ownership context: " +
+                           statusName(context_status));
+    return false;
+  }
+
+  const bool marker_context = context == nullptr;
+  if (marker_context) {
+    context = ownership.get();
+    const ::opcua::StatusCode marker_status(
+        UA_Server_setNodeContext(native.handle(), id, context));
+    if (marker_status.isBad()) {
+      assignError(error, "failed to mark OPC UA node ownership: " +
+                             statusName(marker_status));
+      return false;
+    }
+  }
+  ownership->identities.push_back(
+      OwnedNodeIdentity{id, expected_class, context, marker_context, primary});
+  return true;
+}
+
+bool captureOwnership(::opcua::Server &native, std::uint16_t namespace_index,
+                      const NodeSpec &spec, std::string *error) {
+  spec.ownership->identities.clear();
+  const ::opcua::NodeId primary_id = nodeId(namespace_index, spec.path);
+  if (!captureIdentity(native, primary_id, nodeClass(spec.kind), spec.ownership,
+                       true, error)) {
+    return false;
+  }
+  if (spec.kind != NodeKind::method) {
+    return true;
+  }
+
+  const ::opcua::BrowseDescription browse(
+      primary_id, ::opcua::BrowseDirection::Forward,
+      ::opcua::ReferenceTypeId::HasProperty, true,
+      ::opcua::NodeClass::Variable, ::opcua::BrowseResultMask::All);
+  const auto references = ::opcua::services::browseAll(native, browse);
+  if (!references) {
+    assignError(error, "failed to inspect OPC UA method arguments for '" +
+                           spec.path + "': " + statusName(references.code()));
+    return false;
+  }
+  for (const auto &reference : references.value()) {
+    if (!reference.nodeId().isLocal() || !isMethodArgument(reference)) {
+      assignError(error, "unexpected OPC UA method property while capturing '" +
+                             spec.path + "'");
+      return false;
+    }
+    if (!captureIdentity(native, reference.nodeId().nodeId(),
+                         ::opcua::NodeClass::Variable, spec.ownership, false,
+                         error)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+enum class IdentityState { missing, owned, foreign };
+
+IdentityState identityState(::opcua::Server &native,
+                            const OwnedNodeIdentity &identity) {
+  const auto actual_class =
+      ::opcua::services::readNodeClass(native, identity.id);
+  if (!actual_class) {
+    return actual_class.code() == UA_STATUSCODE_BADNODEIDUNKNOWN
+               ? IdentityState::missing
+               : IdentityState::foreign;
+  }
+  if (actual_class.value() != identity.node_class) {
+    return IdentityState::foreign;
+  }
+  void *context = nullptr;
+  if (UA_Server_getNodeContext(native.handle(), identity.id, &context) !=
+      UA_STATUSCODE_GOOD) {
+    return IdentityState::foreign;
+  }
+  return context == identity.context ? IdentityState::owned
+                                     : IdentityState::foreign;
+}
+
+void releaseOwnershipMarkers(::opcua::Server &native,
+                             const NodeMap &nodes) noexcept {
+  for (const auto &[path, spec] : nodes) {
+    static_cast<void>(path);
+    for (const OwnedNodeIdentity &identity : spec.ownership->identities) {
+      if (!identity.marker_context ||
+          identityState(native, identity) != IdentityState::owned) {
+        continue;
+      }
+      static_cast<void>(
+          UA_Server_setNodeContext(native.handle(), identity.id, nullptr));
+    }
+  }
+}
+
 bool removalSubtreesAreOwned(::opcua::Server &native,
                              std::uint16_t namespace_index,
                              const NodeMap &previous,
                              const std::vector<std::string> &roots,
                              std::string *error) {
-  std::map<::opcua::NodeId, NodeKind> owned_nodes;
+  std::map<::opcua::NodeId, const OwnedNodeIdentity *> owned_nodes;
   for (const auto &[path, spec] : previous) {
-    owned_nodes.emplace(nodeId(namespace_index, path), spec.kind);
+    static_cast<void>(path);
+    for (const OwnedNodeIdentity &identity : spec.ownership->identities) {
+      owned_nodes.emplace(identity.id, &identity);
+    }
   }
 
   struct PendingNode {
     ::opcua::NodeId id;
-    bool method{false};
     std::string root_path;
   };
   std::vector<PendingNode> pending;
   for (const std::string &path : roots) {
     const auto spec = previous.find(path);
-    if (spec == previous.end() ||
-        !::opcua::services::readNodeClass(
-            native, nodeId(namespace_index, path))) {
+    if (spec == previous.end()) {
       continue;
     }
-    pending.push_back(PendingNode{nodeId(namespace_index, path),
-                                  spec->second.kind == NodeKind::method, path});
+    const ::opcua::NodeId root_id = nodeId(namespace_index, path);
+    const auto owned = owned_nodes.find(root_id);
+    if (owned == owned_nodes.end()) {
+      assignError(error, "missing OPC UA ownership proof for '" + path + "'");
+      return false;
+    }
+    const IdentityState state = identityState(native, *owned->second);
+    if (state == IdentityState::missing) {
+      continue;
+    }
+    if (state == IdentityState::foreign) {
+      assignError(error, "OPC UA ownership changed for node '" + path + "'");
+      return false;
+    }
+    pending.push_back(PendingNode{root_id, path});
   }
 
   std::set<::opcua::NodeId> visited;
@@ -303,12 +452,12 @@ bool removalSubtreesAreOwned(::opcua::Server &native,
       const ::opcua::NodeId child = reference.nodeId().nodeId();
       const auto owned = owned_nodes.find(child);
       if (owned != owned_nodes.end()) {
-        pending.push_back(PendingNode{
-            child, owned->second == NodeKind::method, current.root_path});
-        continue;
-      }
-      if (current.method && implicitMethodArgument(reference)) {
-        pending.push_back(PendingNode{child, false, current.root_path});
+        if (identityState(native, *owned->second) != IdentityState::owned) {
+          assignError(error, "OPC UA ownership changed below node '" +
+                                 current.root_path + "'");
+          return false;
+        }
+        pending.push_back(PendingNode{child, current.root_path});
         continue;
       }
 
@@ -1033,14 +1182,61 @@ ComponentSnapshot snapshotComponent(
   return snapshot;
 }
 
-bool deleteNodes(::opcua::Server &server, std::uint16_t namespace_index,
-                 const std::vector<std::string> &paths, std::string *error) {
-  for (const std::string &path : paths) {
-    const ::opcua::StatusCode result = ::opcua::services::deleteNode(
-        server, nodeId(namespace_index, path), true);
+bool deleteOwnedNodes(::opcua::Server &server, std::uint16_t namespace_index,
+                      std::vector<const NodeSpec *> specs,
+                      std::string *error) {
+  std::sort(specs.begin(), specs.end(),
+            [](const NodeSpec *left, const NodeSpec *right) {
+              const std::size_t left_depth = pathDepth(left->path);
+              const std::size_t right_depth = pathDepth(right->path);
+              return left_depth == right_depth ? left->path < right->path
+                                               : left_depth > right_depth;
+            });
+
+  std::set<::opcua::NodeId> handled;
+  const auto remove_identity = [&](const OwnedNodeIdentity &identity) {
+    if (!handled.insert(identity.id).second) {
+      return true;
+    }
+    const IdentityState state = identityState(server, identity);
+    if (state == IdentityState::missing) {
+      return true;
+    }
+    if (state == IdentityState::foreign) {
+      assignError(error, "refusing to delete OPC UA node after ownership changed");
+      return false;
+    }
+    const ::opcua::StatusCode result =
+        ::opcua::services::deleteNode(server, identity.id, true);
     if (result.isBad() && result != UA_STATUSCODE_BADNODEIDUNKNOWN) {
-      assignError(error, "failed to delete OPC UA node '" + path +
-                             "': " + statusName(result));
+      assignError(error, "failed to delete owned OPC UA node: " +
+                             statusName(result));
+      return false;
+    }
+    return true;
+  };
+
+  for (const NodeSpec *spec : specs) {
+    for (const OwnedNodeIdentity &identity : spec->ownership->identities) {
+      if (!identity.primary && !remove_identity(identity)) {
+        return false;
+      }
+    }
+  }
+  for (const NodeSpec *spec : specs) {
+    const auto primary = std::ranges::find_if(
+        spec->ownership->identities,
+        [](const OwnedNodeIdentity &identity) { return identity.primary; });
+    if (primary == spec->ownership->identities.end()) {
+      if (::opcua::services::readNodeClass(
+              server, nodeId(namespace_index, spec->path))) {
+        assignError(error, "missing ownership proof for OPC UA node '" +
+                               spec->path + "'");
+        return false;
+      }
+      continue;
+    }
+    if (!remove_identity(*primary)) {
       return false;
     }
   }
@@ -1366,16 +1562,19 @@ public:
             for (auto &[state, nodes] : self->published) {
               static_cast<void>(state);
               std::vector<std::string> paths;
+              std::vector<const NodeSpec *> specs;
               paths.reserve(nodes.size());
+              specs.reserve(nodes.size());
               for (const auto &[path, spec] : nodes) {
-                static_cast<void>(spec);
                 paths.push_back(path);
+                specs.push_back(&spec);
               }
-              std::sort(paths.begin(), paths.end(),
-                        [](const auto &left, const auto &right) {
-                          return pathDepth(left) > pathDepth(right);
-                        });
-              deleteNodes(native, *namespace_index, paths, nullptr);
+              if (!removalSubtreesAreOwned(native, *namespace_index, nodes,
+                                           paths, nullptr) ||
+                  !deleteOwnedNodes(native, *namespace_index, std::move(specs),
+                                    nullptr)) {
+                releaseOwnershipMarkers(native, nodes);
+              }
             }
             self->published.clear();
             self->unsupported.clear();
@@ -1555,19 +1754,6 @@ private:
                                                  : left_depth < right_depth;
               });
 
-    std::vector<std::string> candidate_cleanup_paths;
-    candidate_cleanup_paths.reserve(candidate_specs.size());
-    for (const NodeSpec *spec : candidate_specs) {
-      candidate_cleanup_paths.push_back(spec->path);
-    }
-    std::sort(candidate_cleanup_paths.begin(), candidate_cleanup_paths.end(),
-              [](const auto &left, const auto &right) {
-                const std::size_t left_depth = pathDepth(left);
-                const std::size_t right_depth = pathDepth(right);
-                return left_depth == right_depth ? left < right
-                                                 : left_depth > right_depth;
-              });
-
     std::vector<const NodeSpec *> rollback_specs;
     rollback_specs.reserve(old_remove_paths.size());
     for (const auto &[path, spec] : previous) {
@@ -1584,7 +1770,7 @@ private:
               });
 
     if (!removalSubtreesAreOwned(native, namespace_index, previous,
-                                 direct_remove_paths, error)) {
+                                 old_remove_paths, error)) {
       return false;
     }
     for (const NodeSpec *spec : candidate_specs) {
@@ -1597,67 +1783,70 @@ private:
       }
     }
 
-    const auto missing_old_paths = [&] {
-      std::set<std::string> missing;
-      for (const std::string &path : old_remove_paths) {
-        if (!::opcua::services::readNodeClass(
-                native, nodeId(namespace_index, path))) {
-          missing.insert(path);
-        }
+    const auto restore_old = [&](std::string *rollback_error) {
+      std::string cleanup_error;
+      const bool removed = deleteOwnedNodes(native, namespace_index,
+                                            rollback_specs, &cleanup_error);
+      bool restored = removed;
+      std::string creation_error;
+      if (!removed) {
+        assignError(rollback_error, std::move(cleanup_error));
+        return false;
       }
-      return missing;
-    };
-    const auto restore_old = [&](const std::set<std::string> &paths,
-                                 std::string *rollback_error) {
-      bool restored = true;
       for (const NodeSpec *spec : rollback_specs) {
-        if (!paths.contains(spec->path)) {
-          continue;
+        if (!spec->create(native, namespace_index, &creation_error) ||
+            !captureOwnership(native, namespace_index, *spec,
+                              &creation_error)) {
+          restored = false;
+          break;
         }
-        restored = spec->create(native, namespace_index, rollback_error) &&
-                   restored;
       }
+      if (!cleanup_error.empty() && !creation_error.empty()) {
+        cleanup_error += "; ";
+      }
+      cleanup_error += creation_error;
+      assignError(rollback_error, std::move(cleanup_error));
       return restored;
     };
 
-    for (const std::string &path : old_remove_paths) {
-      const ::opcua::StatusCode result = ::opcua::services::deleteNode(
-          native, nodeId(namespace_index, path), true);
-      if (result.isBad() && result != UA_STATUSCODE_BADNODEIDUNKNOWN) {
-        assignError(error, "failed to delete OPC UA node '" + path + "': " +
-                               statusName(result));
-        std::string rollback_error;
-        const bool restored =
-            restore_old(missing_old_paths(), &rollback_error);
-        appendRollbackError(error, rollback_error, restored);
-        return false;
-      }
+    if (!deleteOwnedNodes(native, namespace_index, rollback_specs, error)) {
+      std::string rollback_error;
+      const bool restored = restore_old(&rollback_error);
+      appendRollbackError(error, rollback_error, restored);
+      return false;
     }
 
-    std::set<std::string> created_candidate_paths;
+    std::vector<const NodeSpec *> created_candidate_specs;
     for (const NodeSpec *spec : candidate_specs) {
       const bool existed_before = static_cast<bool>(
           ::opcua::services::readNodeClass(
               native, nodeId(namespace_index, spec->path)));
-      if (!spec->create(native, namespace_index, error)) {
-        std::set<std::string> affected_candidate_paths =
-            created_candidate_paths;
-        if (!existed_before) {
-          affected_candidate_paths.insert(spec->path);
+      const bool created = spec->create(native, namespace_index, error);
+      const bool captured =
+          created && captureOwnership(native, namespace_index, *spec, error);
+      if (!created || !captured) {
+        std::vector<const NodeSpec *> cleanup_specs = created_candidate_specs;
+        std::string ownership_error;
+        if (!existed_before &&
+            ::opcua::services::readNodeClass(
+                native, nodeId(namespace_index, spec->path)) &&
+            (!spec->ownership->identities.empty() ||
+             captureOwnership(native, namespace_index, *spec,
+                              &ownership_error))) {
+          cleanup_specs.push_back(spec);
         }
-        std::vector<std::string> cleanup_paths;
-        cleanup_paths.reserve(affected_candidate_paths.size());
-        std::ranges::copy_if(
-            candidate_cleanup_paths, std::back_inserter(cleanup_paths),
-            [&](const auto &path) {
-              return affected_candidate_paths.contains(path);
-            });
         std::string cleanup_error;
-        const bool removed = deleteNodes(native, namespace_index,
-                                         cleanup_paths, &cleanup_error);
+        const bool removed = deleteOwnedNodes(native, namespace_index,
+                                              std::move(cleanup_specs),
+                                              &cleanup_error);
+        if (!ownership_error.empty()) {
+          if (!cleanup_error.empty()) {
+            cleanup_error += "; ";
+          }
+          cleanup_error += ownership_error;
+        }
         std::string restore_error;
-        const bool old_restored =
-            restore_old(missing_old_paths(), &restore_error);
+        const bool old_restored = restore_old(&restore_error);
         std::string rollback_error = cleanup_error;
         if (!restore_error.empty()) {
           if (!rollback_error.empty()) {
@@ -1669,7 +1858,7 @@ private:
         appendRollbackError(error, rollback_error, restored);
         return false;
       }
-      created_candidate_paths.insert(spec->path);
+      created_candidate_specs.push_back(spec);
     }
 
     published.insert_or_assign(state, std::move(committed));
@@ -1745,16 +1934,21 @@ private:
       return true;
     }
     std::vector<std::string> paths;
+    std::vector<const NodeSpec *> specs;
     paths.reserve(found->second.size());
+    specs.reserve(found->second.size());
     for (const auto &[path, spec] : found->second) {
-      static_cast<void>(spec);
       paths.push_back(path);
+      specs.push_back(&spec);
     }
-    std::sort(paths.begin(), paths.end(),
-              [](const auto &left, const auto &right) {
-                return pathDepth(left) > pathDepth(right);
-              });
-    const bool deleted = deleteNodes(native, *namespace_index, paths, error);
+    const bool owned = removalSubtreesAreOwned(
+        native, *namespace_index, found->second, paths, error);
+    const bool deleted =
+        owned && deleteOwnedNodes(native, *namespace_index, std::move(specs),
+                                  error);
+    if (!deleted) {
+      releaseOwnershipMarkers(native, found->second);
+    }
     published.erase(found);
     return deleted || diagnostics_removed;
   }
