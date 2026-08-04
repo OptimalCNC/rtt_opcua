@@ -16,6 +16,10 @@ namespace RTT::opcua {
 
 class EndpointTypeRegistry;
 
+namespace detail {
+class ObjectModelImpl;
+}
+
 enum class ServerState {
   stopped,
   starting,
@@ -57,6 +61,10 @@ public:
               std::string *error = nullptr);
 
 private:
+  friend class detail::ObjectModelImpl;
+
+  void retainUntilStopped(std::shared_ptr<void> owner);
+
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
