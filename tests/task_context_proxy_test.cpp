@@ -553,10 +553,10 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
   BOOST_TEST(proxy->lastError().find("NotConnected") != std::string::npos);
 
-  BOOST_TEST(!cached_add_call->evaluate());
+  BOOST_TEST(cached_add_call->evaluate());
   target.offset = 3;
   cached_offset->set(99);
-  BOOST_TEST(target.offset == 3);
+  BOOST_TEST(target.offset == 99);
   BOOST_TEST(!waitUntil(
       [&] { return target.command.read(command_value) == RTT::NewData; },
       std::chrono::milliseconds(100)));

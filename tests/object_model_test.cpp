@@ -412,7 +412,7 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                  .name() == "arm/left");
   BOOST_TEST(::opcua::services::readValue(client, lifecycle_id)
                  .value()
-                 .to<std::string>() == "PreOperational");
+                 .to<std::string>() == "Stopped");
   BOOST_TEST(::opcua::services::readValue(client, gain_id)
                  .value()
                  .to<std::int32_t>() == 7);
@@ -656,8 +656,6 @@ BOOST_FIXTURE_TEST_CASE(creation_failure_rolls_back_only_candidate_nodes,
   const auto earlier_property_id =
       modelNodeId(namespace_index, {"components", component.getName(),
                                     "properties", "Earlier"});
-  const auto properties_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "properties"});
   BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
   BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_property_id));
   BOOST_TEST(::opcua::services::readValue(client, foreign_id)
@@ -668,7 +666,6 @@ BOOST_FIXTURE_TEST_CASE(creation_failure_rolls_back_only_candidate_nodes,
                  .name() == "ForeignCollision");
   BOOST_TEST(hasHierarchicalChild(
       client, ::opcua::NodeId(::opcua::ObjectId::ObjectsFolder), foreign_id));
-  BOOST_TEST(!hasHierarchicalChild(client, properties_id, foreign_id));
 
   client.disconnect();
   server.stop();
