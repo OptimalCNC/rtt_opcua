@@ -220,12 +220,9 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   std::string error;
   BOOST_REQUIRE_MESSAGE(server.start(&error), error);
 
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::milliseconds(10);
-  RTT::opcua::ObjectModel model(server, model_options);
   ProxyTarget target;
-  auto registration = model.registerComponent(target, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
 
   RTT::opcua::TaskContextProxyOptions proxy_options;
   proxy_options.request_timeout = std::chrono::milliseconds(500);
@@ -556,11 +553,10 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
   BOOST_TEST(proxy->lastError().find("NotConnected") != std::string::npos);
 
-  registration->reset();
-  BOOST_TEST(!proxy->ready());
-  registration = model.registerComponent(target, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
+  BOOST_TEST(!cached_add_call->evaluate());
+  target.offset = 3;
+  cached_offset->set(99);
+  BOOST_TEST(target.offset == 3);
   BOOST_TEST(!waitUntil(
       [&] { return target.command.read(command_value) == RTT::NewData; },
       std::chrono::milliseconds(100)));
@@ -609,18 +605,6 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
     return proxy->lastError().find("NotConnected") != std::string::npos;
   }));
 
-  registration->reset();
-  BOOST_TEST(!cached_add_call->evaluate());
-  BOOST_TEST(proxy->connectionState() ==
-             RTT::opcua::ProxyConnectionState::stale);
-
-  registration = model.registerComponent(target, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  BOOST_TEST(!cached_add_call->evaluate());
-  target.offset = 3;
-  cached_offset->set(99);
-  BOOST_TEST(target.offset == 3);
-
   BOOST_REQUIRE_MESSAGE(proxy->synchronize(&error), error);
   BOOST_TEST(proxy->connectionState() ==
              RTT::opcua::ProxyConnectionState::connected);
@@ -630,17 +614,6 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
       [&] { return target.command.read(command_value) == RTT::NewData; },
       std::chrono::milliseconds(100)));
 
-  registration->reset();
-  BOOST_TEST(!proxy->ready());
-  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::Init);
-  BOOST_TEST(proxy->getTargetState() == RTT::TaskContext::Init);
-  BOOST_TEST(proxy->connectionState() ==
-             RTT::opcua::ProxyConnectionState::stale);
-  BOOST_TEST(!proxy->ready());
-  BOOST_TEST(!proxy->lastError().empty());
-  BOOST_TEST(!proxy->configure());
-  BOOST_TEST(proxy->getPeriod() == -1.0);
-  BOOST_TEST(proxy->getCpuAffinity() == ~0U);
   proxy.reset();
   server.stop();
 }
@@ -654,12 +627,9 @@ BOOST_FIXTURE_TEST_CASE(proxy_round_trips_an_endpoint_bound_custom_datatype,
   std::string error;
   BOOST_REQUIRE_MESSAGE(server.start(&error), error);
 
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::milliseconds(10);
-  RTT::opcua::ObjectModel model(server, model_options);
   CustomProxyTarget target;
-  auto registration = model.registerComponent(target, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
 
   RTT::opcua::TaskContextProxyOptions proxy_options;
   proxy_options.request_timeout = std::chrono::milliseconds(500);
@@ -727,7 +697,6 @@ BOOST_FIXTURE_TEST_CASE(proxy_round_trips_an_endpoint_bound_custom_datatype,
   BOOST_TEST(command_value.count == 13);
   BOOST_TEST(command_value.scale == 7.5);
 
-  registration->reset();
   proxy.reset();
   server.stop();
 }
@@ -770,12 +739,9 @@ BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_incompatible_port_method_signature,
   std::string error;
   BOOST_REQUIRE_MESSAGE(server.start(&error), error);
 
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::hours(1);
-  RTT::opcua::ObjectModel model(server, model_options);
   ProxyTarget target;
-  auto registration = model.registerComponent(target, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
   const std::uint16_t namespace_index = server.namespaceIndex().value();
   const std::vector<std::string_view> port_segments{
       "components", target.getName(), "ports", "Feedback"};
@@ -823,6 +789,5 @@ BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_incompatible_port_method_signature,
   BOOST_TEST(proxy == nullptr);
   BOOST_TEST(error.find("incompatible method signature") != std::string::npos);
 
-  registration->reset();
   server.stop();
 }

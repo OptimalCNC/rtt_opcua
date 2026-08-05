@@ -26,11 +26,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <functional>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -39,7 +37,6 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -61,11 +58,6 @@ std::string appendNodeSegment(std::string path, std::string_view segment) {
 
 std::size_t pathDepth(const std::string &path) {
   return static_cast<std::size_t>(std::count(path.begin(), path.end(), '/'));
-}
-
-bool isDescendantPath(std::string_view path, std::string_view ancestor) {
-  return path.size() > ancestor.size() && path.starts_with(ancestor) &&
-         path[ancestor.size()] == '/';
 }
 
 void assignError(std::string *output, std::string value) {
@@ -96,8 +88,9 @@ std::string statusName(::opcua::StatusCode status) {
 
 bool componentNodeCreated(
     const ::opcua::Result<::opcua::NodeId> &result, const std::string &path,
-    std::string *error) {
+    bool *created, std::string *error) {
   if (result) {
+    *created = true;
     return true;
   }
   assignError(error, "failed to create OPC UA component node '" + path +
@@ -242,18 +235,9 @@ private:
 
 enum class NodeKind { object, variable, method };
 
-struct OwnedNodeIdentity {
+struct CreatedNode {
   ::opcua::NodeId id;
-  ::opcua::NodeClass node_class;
-  void *context{nullptr};
-  bool marker_context{false};
-  bool primary{false};
-  ::opcua::NodeId parent_id;
-  bool requires_parent_reference{false};
-};
-
-struct NodeOwnership {
-  std::vector<OwnedNodeIdentity> identities;
+  bool recursive_root{false};
 };
 
 struct NodeSpec {
@@ -266,16 +250,18 @@ struct NodeSpec {
   bool expects_output_arguments{false};
   std::vector<::opcua::Argument> expected_input_arguments;
   std::vector<::opcua::Argument> expected_output_arguments;
-  std::shared_ptr<NodeOwnership> ownership{std::make_shared<NodeOwnership>()};
-  std::function<bool(::opcua::Server &, std::uint16_t, std::string *)> create;
+  std::function<bool(::opcua::Server &, std::uint16_t, bool *, std::string *)>
+      create;
 };
 
 using NodeMap = std::map<std::string, NodeSpec>;
 
 bool createNode(::opcua::Server &native, std::uint16_t namespace_index,
-                const NodeSpec &spec, std::string *error) noexcept {
+                const NodeSpec &spec, bool *created,
+                std::string *error) noexcept {
+  *created = false;
   try {
-    return spec.create(native, namespace_index, error);
+    return spec.create(native, namespace_index, created, error);
   } catch (const std::exception &exception) {
     assignError(error, "OPC UA node creator threw for '" + spec.path +
                            "': " + exception.what());
@@ -283,18 +269,6 @@ bool createNode(::opcua::Server &native, std::uint16_t namespace_index,
     assignError(error, "OPC UA node creator threw for '" + spec.path + "'");
   }
   return false;
-}
-
-::opcua::NodeClass nodeClass(NodeKind kind) {
-  switch (kind) {
-  case NodeKind::object:
-    return ::opcua::NodeClass::Object;
-  case NodeKind::variable:
-    return ::opcua::NodeClass::Variable;
-  case NodeKind::method:
-    return ::opcua::NodeClass::Method;
-  }
-  return ::opcua::NodeClass::Unspecified;
 }
 
 bool isMethodArgument(const ::opcua::ReferenceDescription &reference) {
@@ -344,59 +318,12 @@ bool validateMethodArguments(::opcua::Server &native, const ::opcua::NodeId &id,
   return true;
 }
 
-bool captureIdentity(::opcua::Server &native, const ::opcua::NodeId &id,
-                     ::opcua::NodeClass expected_class,
-                     const std::shared_ptr<NodeOwnership> &ownership,
-                     bool primary, const ::opcua::NodeId *parent_id,
-                     std::string *error) {
-  const auto actual_class = ::opcua::services::readNodeClass(native, id);
-  if (!actual_class || actual_class.value() != expected_class) {
-    assignError(error, "failed to capture OPC UA node ownership");
-    return false;
-  }
-
-  void *context = nullptr;
-  const ::opcua::StatusCode context_status(
-      UA_Server_getNodeContext(native.handle(), id, &context));
-  if (context_status.isBad()) {
-    assignError(error, "failed to read OPC UA node ownership context: " +
-                           statusName(context_status));
-    return false;
-  }
-
-  const bool marker_context = context == nullptr;
-  if (marker_context) {
-    context = ownership.get();
-    const ::opcua::StatusCode marker_status(
-        UA_Server_setNodeContext(native.handle(), id, context));
-    if (marker_status.isBad()) {
-      assignError(error, "failed to mark OPC UA node ownership: " +
-                             statusName(marker_status));
-      return false;
-    }
-  }
-  OwnedNodeIdentity identity{
-      id, expected_class, context, marker_context, primary, {}, false};
-  if (parent_id != nullptr) {
-    identity.parent_id = *parent_id;
-    identity.requires_parent_reference = true;
-  }
-  ownership->identities.push_back(std::move(identity));
-  return true;
-}
-
-bool captureOwnership(::opcua::Server &native, std::uint16_t namespace_index,
-                      const NodeSpec &spec, std::string *error) {
-  spec.ownership->identities.clear();
+bool recordMethodArgumentNodes(::opcua::Server &native,
+                               std::uint16_t namespace_index,
+                               const NodeSpec &spec,
+                               std::vector<CreatedNode> &ledger,
+                               std::string *error) {
   const ::opcua::NodeId primary_id = nodeId(namespace_index, spec.path);
-  if (!captureIdentity(native, primary_id, nodeClass(spec.kind), spec.ownership,
-                       true, nullptr, error)) {
-    return false;
-  }
-  if (spec.kind != NodeKind::method) {
-    return true;
-  }
-
   const ::opcua::BrowseDescription browse(
       primary_id, ::opcua::BrowseDirection::Forward,
       ::opcua::ReferenceTypeId::HasProperty, true,
@@ -407,14 +334,26 @@ bool captureOwnership(::opcua::Server &native, std::uint16_t namespace_index,
                            spec.path + "': " + statusName(references.code()));
     return false;
   }
+
   std::map<std::string, ::opcua::NodeId, std::less<>> arguments;
+  bool unexpected_property = false;
   for (const auto &reference : references.value()) {
     if (!reference.nodeId().isLocal() || !isMethodArgument(reference)) {
-      assignError(error, "unexpected OPC UA method property while capturing '" +
-                             spec.path + "'");
-      return false;
+      unexpected_property = true;
+      continue;
     }
+    const ::opcua::NodeId argument_id = reference.nodeId().nodeId();
+    ledger.push_back(CreatedNode{argument_id, false});
+  }
+  if (unexpected_property) {
+    assignError(error, "unexpected OPC UA method property while recording '" +
+                           spec.path + "'");
+    return false;
+  }
+
+  for (const auto &reference : references.value()) {
     const std::string name(reference.browseName().name());
+    const ::opcua::NodeId argument_id = reference.nodeId().nodeId();
     const std::vector<::opcua::Argument> *expected = nullptr;
     if (name == "InputArguments" && spec.expects_input_arguments) {
       expected = &spec.expected_input_arguments;
@@ -422,241 +361,26 @@ bool captureOwnership(::opcua::Server &native, std::uint16_t namespace_index,
       expected = &spec.expected_output_arguments;
     }
     if (expected == nullptr ||
-        !arguments.emplace(name, reference.nodeId().nodeId()).second ||
-        !validateMethodArguments(native, reference.nodeId().nodeId(), *expected,
-                                 spec.path, error)) {
+        !arguments.emplace(name, argument_id).second ||
+        !validateMethodArguments(native, argument_id, *expected, spec.path,
+                                 error)) {
       if (error != nullptr && error->empty()) {
         assignError(error,
-                    "unexpected OPC UA method property while capturing '" +
+                    "unexpected OPC UA method property while recording '" +
                         spec.path + "'");
       }
       return false;
     }
   }
+
   const std::size_t expected_count =
       static_cast<std::size_t>(spec.expects_input_arguments) +
       static_cast<std::size_t>(spec.expects_output_arguments);
   if (arguments.size() != expected_count) {
     assignError(error,
-                "missing OPC UA method argument property while capturing '" +
+                "missing OPC UA method argument property while recording '" +
                     spec.path + "'");
     return false;
-  }
-  for (const auto &[name, id] : arguments) {
-    static_cast<void>(name);
-    if (!captureIdentity(native, id, ::opcua::NodeClass::Variable,
-                         spec.ownership, false, &primary_id, error)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-enum class IdentityState { missing, owned, foreign };
-
-IdentityState identityState(::opcua::Server &native,
-                            const OwnedNodeIdentity &identity) {
-  const auto actual_class =
-      ::opcua::services::readNodeClass(native, identity.id);
-  if (!actual_class) {
-    return actual_class.code() == UA_STATUSCODE_BADNODEIDUNKNOWN
-               ? IdentityState::missing
-               : IdentityState::foreign;
-  }
-  if (actual_class.value() != identity.node_class) {
-    return IdentityState::foreign;
-  }
-  void *context = nullptr;
-  if (UA_Server_getNodeContext(native.handle(), identity.id, &context) !=
-      UA_STATUSCODE_GOOD) {
-    return IdentityState::foreign;
-  }
-  return context == identity.context ? IdentityState::owned
-                                     : IdentityState::foreign;
-}
-
-bool releaseOwnershipMarkers(::opcua::Server &native,
-                             const NodeOwnership &ownership,
-                             std::string *error) noexcept {
-  bool released = true;
-  for (const OwnedNodeIdentity &identity : ownership.identities) {
-    if (!identity.marker_context ||
-        identityState(native, identity) != IdentityState::owned) {
-      continue;
-    }
-    const ::opcua::StatusCode result(
-        UA_Server_setNodeContext(native.handle(), identity.id, nullptr));
-    if (result.isBad()) {
-      appendError(error, "failed to release OPC UA ownership marker: " +
-                             statusName(result));
-      released = false;
-    }
-  }
-  return released;
-}
-
-bool hasExpectedParentReference(::opcua::Server &native,
-                                const OwnedNodeIdentity &identity) {
-  if (!identity.requires_parent_reference) {
-    return true;
-  }
-  const ::opcua::BrowseDescription browse(
-      identity.parent_id, ::opcua::BrowseDirection::Forward,
-      ::opcua::ReferenceTypeId::HasProperty, false,
-      ::opcua::NodeClass::Variable, ::opcua::BrowseResultMask::All);
-  const auto references = ::opcua::services::browseAll(native, browse);
-  return references &&
-         std::ranges::any_of(references.value(), [&](const auto &reference) {
-           return reference.nodeId().isLocal() &&
-                  reference.nodeId().nodeId() == identity.id;
-         });
-}
-
-bool deletionSetIsOwned(::opcua::Server &native, std::uint16_t namespace_index,
-                        const std::vector<const NodeSpec *> &specs,
-                        std::string *error) {
-  struct OwnedNode {
-    const OwnedNodeIdentity *identity;
-    std::string path;
-  };
-  std::map<::opcua::NodeId, OwnedNode> owned_nodes;
-  for (const NodeSpec *spec : specs) {
-    const auto primary = std::ranges::find_if(
-        spec->ownership->identities,
-        [](const OwnedNodeIdentity &identity) { return identity.primary; });
-    if (primary == spec->ownership->identities.end()) {
-      if (::opcua::services::readNodeClass(
-              native, nodeId(namespace_index, spec->path))) {
-        assignError(error, "missing ownership proof for OPC UA node '" +
-                               spec->path + "'");
-        return false;
-      }
-    }
-    for (const OwnedNodeIdentity &identity : spec->ownership->identities) {
-      if (!owned_nodes.emplace(identity.id, OwnedNode{&identity, spec->path})
-               .second) {
-        assignError(error, "duplicate OPC UA ownership proof for node '" +
-                               spec->path + "'");
-        return false;
-      }
-    }
-  }
-
-  std::vector<OwnedNode> live_nodes;
-  live_nodes.reserve(owned_nodes.size());
-  for (const auto &[id, owned] : owned_nodes) {
-    static_cast<void>(id);
-    const IdentityState state = identityState(native, *owned.identity);
-    if (state == IdentityState::missing) {
-      continue;
-    }
-    if (state == IdentityState::foreign) {
-      assignError(error,
-                  "OPC UA ownership changed for node '" + owned.path + "'");
-      return false;
-    }
-    live_nodes.push_back(owned);
-  }
-
-  std::vector<OwnedNode> pending = live_nodes;
-  std::set<::opcua::NodeId> visited;
-  while (!pending.empty()) {
-    OwnedNode current = std::move(pending.back());
-    pending.pop_back();
-    if (!visited.insert(current.identity->id).second) {
-      continue;
-    }
-
-    const ::opcua::BrowseDescription browse(
-        current.identity->id, ::opcua::BrowseDirection::Forward,
-        ::opcua::ReferenceTypeId::HierarchicalReferences, true,
-        ::opcua::NodeClass::Unspecified, ::opcua::BrowseResultMask::All);
-    const auto references = ::opcua::services::browseAll(native, browse);
-    if (!references) {
-      assignError(error, "failed to inspect OPC UA replacement subtree '" +
-                             current.path +
-                             "': " + statusName(references.code()));
-      return false;
-    }
-
-    for (const auto &reference : references.value()) {
-      if (!reference.nodeId().isLocal()) {
-        continue;
-      }
-      const auto owned = owned_nodes.find(reference.nodeId().nodeId());
-      if (owned == owned_nodes.end()) {
-        assignError(error, "refusing to replace OPC UA node '" + current.path +
-                               "' because it contains unowned child '" +
-                               std::string(reference.browseName().name()) +
-                               "'");
-        return false;
-      }
-      if (identityState(native, *owned->second.identity) !=
-          IdentityState::owned) {
-        assignError(error, "OPC UA ownership changed below node '" +
-                               current.path + "'");
-        return false;
-      }
-      pending.push_back(owned->second);
-    }
-  }
-
-  for (const OwnedNode &owned : live_nodes) {
-    if (!hasExpectedParentReference(native, *owned.identity)) {
-      assignError(error, "OPC UA ownership parent changed for node '" +
-                             owned.path + "'");
-      return false;
-    }
-  }
-  return true;
-}
-
-bool removalSubtreesAreOwned(::opcua::Server &native,
-                             std::uint16_t namespace_index,
-                             const NodeMap &previous,
-                             const std::vector<std::string> &roots,
-                             std::string *error) {
-  std::vector<const NodeSpec *> specs;
-  specs.reserve(roots.size());
-  for (const std::string &path : roots) {
-    const auto spec = previous.find(path);
-    if (spec != previous.end()) {
-      specs.push_back(&spec->second);
-    }
-  }
-  return deletionSetIsOwned(native, namespace_index, specs, error);
-}
-
-bool unchangedCandidateParentsAreOwned(
-    ::opcua::Server &native, const NodeMap &previous,
-    const std::set<std::string> &old_remove_set,
-    const std::vector<const NodeSpec *> &candidate_specs, std::string *error) {
-  std::set<std::string> checked;
-  for (const NodeSpec *candidate : candidate_specs) {
-    if (!checked.insert(candidate->parent_path).second ||
-        old_remove_set.contains(candidate->parent_path)) {
-      continue;
-    }
-    const auto parent = previous.find(candidate->parent_path);
-    if (parent == previous.end()) {
-      continue;
-    }
-    const auto primary = std::ranges::find_if(
-        parent->second.ownership->identities,
-        [](const OwnedNodeIdentity &identity) { return identity.primary; });
-    if (primary == parent->second.ownership->identities.end()) {
-      assignError(error,
-                  "missing ownership proof for unchanged OPC UA candidate "
-                  "parent '" +
-                      candidate->parent_path + "'");
-      return false;
-    }
-    if (identityState(native, *primary) != IdentityState::owned ||
-        !hasExpectedParentReference(native, *primary)) {
-      assignError(error, "OPC UA ownership changed for candidate parent '" +
-                             candidate->parent_path + "'");
-      return false;
-    }
   }
   return true;
 }
@@ -664,11 +388,7 @@ bool unchangedCandidateParentsAreOwned(
 struct ComponentSnapshot {
   NodeMap nodes;
   std::vector<UnsupportedResource> unsupported;
-};
-
-struct DiagnosticEvent {
-  bool recovered{false};
-  UnsupportedResource resource;
+  std::string fingerprint;
 };
 
 std::string appendDiagnosticSegment(std::string_view path,
@@ -716,7 +436,8 @@ void appendUnsupported(std::vector<UnsupportedResource> &unsupported,
 bool addObjectNode(::opcua::Server &server, std::uint16_t namespace_index,
                    const std::string &parent_path, const std::string &path,
                    const std::string &browse_name,
-                   const std::string &description, std::string *error) {
+                   const std::string &description, bool *created,
+                   std::string *error) {
   ::opcua::ObjectAttributes attributes;
   attributes.setDisplayName(::opcua::LocalizedText("en-US", browse_name));
   if (!description.empty()) {
@@ -727,7 +448,7 @@ bool addObjectNode(::opcua::Server &server, std::uint16_t namespace_index,
       nodeId(namespace_index, path), browse_name, attributes,
       ::opcua::ObjectTypeId::BaseObjectType,
       ::opcua::ReferenceTypeId::HasComponent);
-  return componentNodeCreated(result, path, error);
+  return componentNodeCreated(result, path, created, error);
 }
 
 NodeSpec objectSpec(std::string path, std::string parent_path,
@@ -742,9 +463,9 @@ NodeSpec objectSpec(std::string path, std::string parent_path,
   spec.create = [path = spec.path, parent = spec.parent_path,
                  name = spec.browse_name, description = std::move(description)](
                     ::opcua::Server &server, std::uint16_t namespace_index,
-                    std::string *error) {
+                    bool *created, std::string *error) {
     return addObjectNode(server, namespace_index, parent, path, name,
-                         description, error);
+                         description, created, error);
   };
   return spec;
 }
@@ -753,7 +474,8 @@ bool addStaticStringVariable(
     ::opcua::Server &server, std::uint16_t namespace_index,
     const std::string &parent_path, const std::string &path,
     const std::string &browse_name, const std::string &description,
-    const std::string &value, bool property, std::string *error) {
+    const std::string &value, bool property, bool *created,
+    std::string *error) {
   ::opcua::VariableAttributes attributes;
   attributes.setDisplayName(::opcua::LocalizedText("en-US", browse_name));
   if (!description.empty()) {
@@ -770,7 +492,7 @@ bool addStaticStringVariable(
       ::opcua::VariableTypeId::BaseDataVariableType,
       property ? ::opcua::ReferenceTypeId::HasProperty
                : ::opcua::ReferenceTypeId::HasComponent);
-  return componentNodeCreated(result, path, error);
+  return componentNodeCreated(result, path, created, error);
 }
 
 NodeSpec staticStringSpec(std::string path, std::string parent_path,
@@ -788,9 +510,10 @@ NodeSpec staticStringSpec(std::string path, std::string parent_path,
                  name = spec.browse_name, description = std::move(description),
                  value = std::move(value),
                  property](::opcua::Server &server,
-                           std::uint16_t namespace_index, std::string *error) {
+                           std::uint16_t namespace_index, bool *created,
+                           std::string *error) {
     return addStaticStringVariable(server, namespace_index, parent, path, name,
-                                   description, value, property, error);
+                                   description, value, property, created, error);
   };
   return spec;
 }
@@ -816,7 +539,7 @@ NodeSpec staticArrayPropertySpec(std::string path, std::string parent_path,
                  name = spec.browse_name, description = std::move(description),
                  values = std::move(values), data_type = std::move(data_type)](
                     ::opcua::Server &server, std::uint16_t namespace_index,
-                    std::string *error) {
+                    bool *created, std::string *error) {
     ::opcua::VariableAttributes attributes;
     attributes.setDisplayName(::opcua::LocalizedText("en-US", name));
     attributes.setDescription(::opcua::LocalizedText("en-US", description));
@@ -836,7 +559,7 @@ NodeSpec staticArrayPropertySpec(std::string path, std::string parent_path,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         name, attributes, ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasProperty);
-    return componentNodeCreated(result, path, error);
+    return componentNodeCreated(result, path, created, error);
   };
   return spec;
 }
@@ -852,7 +575,7 @@ NodeSpec lifecycleSpec(const std::string &component_path,
   spec.create = [path = spec.path, parent = spec.parent_path,
                  weak_state = std::weak_ptr<ComponentState>(state)](
                     ::opcua::Server &server, std::uint16_t namespace_index,
-                    std::string *error) {
+                    bool *created, std::string *error) {
     const auto current_state = weak_state.lock();
     ComponentLease lease(current_state);
     if (!lease) {
@@ -877,7 +600,7 @@ NodeSpec lifecycleSpec(const std::string &component_path,
         "lifecycleState", attributes,
         ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!componentNodeCreated(result, path, error)) {
+    if (!componentNodeCreated(result, path, created, error)) {
       return false;
     }
     ::opcua::setVariableNodeValueBackend(
@@ -908,7 +631,7 @@ dataSourceSpec(const std::string &parent_path, const std::string &name,
                  source, type_registry = std::move(type_registry), codec,
                  writable, weak_state = std::weak_ptr<ComponentState>(state)](
                     ::opcua::Server &server, std::uint16_t namespace_index,
-                    std::string *error) {
+                    bool *created, std::string *error) {
     ::opcua::Variant value;
     const auto current_state = weak_state.lock();
     ComponentLease lease(current_state);
@@ -936,7 +659,7 @@ dataSourceSpec(const std::string &parent_path, const std::string &name,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         name, attributes, ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!componentNodeCreated(result, path, error)) {
+    if (!componentNodeCreated(result, path, created, error)) {
       return false;
     }
     ::opcua::setVariableNodeValueBackend(
@@ -971,6 +694,7 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
                  weak_state = std::weak_ptr<ComponentState>(state), dispatcher,
                  schema = std::move(schema)](::opcua::Server &server,
                                              std::uint16_t namespace_index,
+                                             bool *created,
                                              std::string *error) {
     ::opcua::MethodAttributes attributes;
     attributes.setDisplayName(::opcua::LocalizedText("en-US", name));
@@ -1003,7 +727,7 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         name, std::move(callback), schema.inputs, schema.outputs, attributes,
         ::opcua::ReferenceTypeId::HasComponent);
-    return componentNodeCreated(result, path, error);
+    return componentNodeCreated(result, path, created, error);
   };
   return spec;
 }
@@ -1063,7 +787,7 @@ portMethodSpec(const std::string &port_path, RTT::base::PortInterface &port,
                  inputs = spec.expected_input_arguments,
                  outputs = spec.expected_output_arguments](
                     ::opcua::Server &server, std::uint16_t namespace_index,
-                    std::string *error) {
+                    bool *created, std::string *error) {
     const auto current_state = weak_state.lock();
     ComponentLease lease(current_state);
     if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
@@ -1119,7 +843,7 @@ portMethodSpec(const std::string &port_path, RTT::base::PortInterface &port,
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         method_name, std::move(callback), inputs, outputs, attributes,
         ::opcua::ReferenceTypeId::HasComponent);
-    if (!componentNodeCreated(result, path, error)) {
+    if (!componentNodeCreated(result, path, created, error)) {
       return false;
     }
     *bridge_slot = bridge;
@@ -1390,86 +1114,122 @@ ComponentSnapshot snapshotComponent(
   snapshot.unsupported.erase(
       std::unique(snapshot.unsupported.begin(), snapshot.unsupported.end()),
       snapshot.unsupported.end());
+  std::ostringstream fingerprint;
+  for (const auto &[path, spec] : snapshot.nodes) {
+    fingerprint << path.size() << ':' << path << spec.fingerprint.size() << ':'
+                << spec.fingerprint;
+  }
+  snapshot.fingerprint = fingerprint.str();
   return snapshot;
 }
 
-bool deleteOwnedNodes(::opcua::Server &server, std::uint16_t namespace_index,
-                      std::vector<const NodeSpec *> specs,
-                      std::string *error) {
-  if (!deletionSetIsOwned(server, namespace_index, specs, error)) {
-    return false;
-  }
-  std::sort(specs.begin(), specs.end(),
-            [](const NodeSpec *left, const NodeSpec *right) {
-              const std::size_t left_depth = pathDepth(left->path);
-              const std::size_t right_depth = pathDepth(right->path);
-              return left_depth == right_depth ? left->path < right->path
-                                               : left_depth > right_depth;
-            });
-
-  std::set<::opcua::NodeId> handled;
-  const auto remove_identity = [&](const OwnedNodeIdentity &identity) {
-    if (!handled.insert(identity.id).second) {
-      return true;
-    }
-    const IdentityState state = identityState(server, identity);
-    if (state == IdentityState::missing) {
-      return true;
-    }
-    if (state == IdentityState::foreign) {
-      assignError(error, "refusing to delete OPC UA node after ownership changed");
+bool collectDescendantNodeIds(::opcua::Server &native,
+                              const ::opcua::NodeId &root,
+                              std::set<::opcua::NodeId> &descendants,
+                              std::string *error) {
+  std::vector<::opcua::NodeId> pending{root};
+  while (!pending.empty()) {
+    const ::opcua::NodeId current = std::move(pending.back());
+    pending.pop_back();
+    const ::opcua::BrowseDescription browse(
+        current, ::opcua::BrowseDirection::Forward,
+        ::opcua::ReferenceTypeId::HierarchicalReferences, true,
+        ::opcua::NodeClass::Unspecified, ::opcua::BrowseResultMask::All);
+    const auto references = ::opcua::services::browseAll(native, browse);
+    if (!references) {
+      appendError(error, "failed to inspect an OPC UA rollback subtree: " +
+                             statusName(references.code()));
       return false;
     }
-    const ::opcua::StatusCode result =
-        ::opcua::services::deleteNode(server, identity.id, true);
-    if (result.isBad() && result != UA_STATUSCODE_BADNODEIDUNKNOWN) {
-      assignError(error, "failed to delete owned OPC UA node: " +
-                             statusName(result));
-      return false;
-    }
-    return true;
-  };
-
-  for (const NodeSpec *spec : specs) {
-    for (const OwnedNodeIdentity &identity : spec->ownership->identities) {
-      if (!identity.primary && !remove_identity(identity)) {
-        return false;
+    for (const auto &reference : references.value()) {
+      if (!reference.nodeId().isLocal()) {
+        continue;
+      }
+      ::opcua::NodeId child = reference.nodeId().nodeId();
+      if (descendants.insert(child).second) {
+        pending.push_back(std::move(child));
       }
     }
   }
-  for (const NodeSpec *spec : specs) {
-    const auto primary = std::ranges::find_if(
-        spec->ownership->identities,
-        [](const OwnedNodeIdentity &identity) { return identity.primary; });
-    if (primary == spec->ownership->identities.end()) {
-      if (::opcua::services::readNodeClass(
-              server, nodeId(namespace_index, spec->path))) {
-        assignError(error, "missing ownership proof for OPC UA node '" +
-                               spec->path + "'");
-        return false;
-      }
-      continue;
-    }
-    if (!remove_identity(*primary)) {
-      return false;
-    }
-  }
+  descendants.erase(root);
   return true;
 }
 
-void appendRollbackError(std::string *error, const std::string &rollback_error,
-                         bool restored) {
-  if (error == nullptr) {
-    return;
+bool rollbackCreatedNodes(::opcua::Server &native,
+                          const std::vector<CreatedNode> &ledger,
+                          std::string *error) {
+  bool complete = true;
+  std::set<::opcua::NodeId> recursively_removed;
+  for (auto created = ledger.rbegin(); created != ledger.rend(); ++created) {
+    std::set<::opcua::NodeId> descendants;
+    if (created->recursive_root &&
+        !collectDescendantNodeIds(native, created->id, descendants, error)) {
+      complete = false;
+    }
+
+    for (const auto &descendant : descendants) {
+      const ::opcua::StatusCode descendant_result =
+          ::opcua::services::deleteNode(native, descendant, true);
+      if (descendant_result.isBad() &&
+          descendant_result != UA_STATUSCODE_BADNODEIDUNKNOWN) {
+        appendError(error,
+                    "failed to delete an OPC UA rollback descendant: " +
+                        statusName(descendant_result));
+        complete = false;
+        continue;
+      }
+      recursively_removed.insert(descendant);
+    }
+
+    const ::opcua::StatusCode result =
+        ::opcua::services::deleteNode(native, created->id, true);
+    if (result == UA_STATUSCODE_BADNODEIDUNKNOWN) {
+      if (!recursively_removed.contains(created->id)) {
+        appendError(error,
+                    "an OPC UA rollback node disappeared before deletion");
+        complete = false;
+      }
+      continue;
+    }
+    if (result.isBad()) {
+      appendError(error, "failed to delete an OPC UA rollback node: " +
+                             statusName(result));
+      complete = false;
+      continue;
+    }
+    recursively_removed.insert(descendants.begin(), descendants.end());
   }
-  *error += restored ? "; rollback succeeded"
-                     : "; rollback failed: " + rollback_error;
+  return complete;
 }
 
 } // namespace
 
-class ObjectModelImpl final
-    : public std::enable_shared_from_this<ObjectModelImpl> {
+struct PublishedComponent {
+  PublishedComponent(RTT::TaskContext &original,
+                     std::shared_ptr<ComponentState> callback_state,
+                     NodeMap snapshot_nodes, std::string fingerprint)
+      : component(&original), state(std::move(callback_state)),
+        nodes(std::move(snapshot_nodes)),
+        snapshot_fingerprint(std::move(fingerprint)) {}
+
+  PublishedComponent(PublishedComponent &&) noexcept = default;
+  PublishedComponent &operator=(PublishedComponent &&) = delete;
+  PublishedComponent(const PublishedComponent &) = delete;
+  PublishedComponent &operator=(const PublishedComponent &) = delete;
+
+  RTT::TaskContext *const component;
+  std::shared_ptr<ComponentState> state;
+  NodeMap nodes;
+  const std::string snapshot_fingerprint;
+};
+
+struct AbandonedResources {
+  std::shared_ptr<ComponentState> closed_state;
+  NodeMap nodes;
+  const std::string snapshot_fingerprint;
+};
+
+class ObjectModelImpl final {
 public:
   ObjectModelImpl(Server &model_server, ObjectModelOptions model_options)
       : server(model_server), options(std::move(model_options)),
@@ -1479,247 +1239,153 @@ public:
 
   ~ObjectModelImpl() { shutdown(); }
 
-  void startWorker() {
-    worker = std::jthread([weak = weak_from_this()](std::stop_token stop) {
-      while (!stop.stop_requested()) {
-        const auto self = weak.lock();
-        if (!self) {
-          return;
-        }
-        std::unique_lock<std::mutex> lock(self->worker_mutex);
-        self->worker_condition.wait_for(
-            lock, self->options.reconcile_interval, [&stop, &self] {
-              return stop.stop_requested() || self->shutdown_started.load();
-            });
-        lock.unlock();
-        if (stop.stop_requested() || self->shutdown_started.load()) {
-          return;
-        }
-        self->dispatcher->reapPending();
-        self->reconcile(nullptr);
-      }
-    });
-  }
+  bool publishComponent(
+      RTT::TaskContext &component, std::string *error,
+      std::vector<UnsupportedResource> *unsupported_output) {
+    std::unique_lock<std::mutex> lock(command_mutex);
+    if (unsupported_output != nullptr) {
+      unsupported_output->clear();
+    }
 
-  std::shared_ptr<ComponentState>
-  registerComponent(RTT::TaskContext &component, std::string *error,
-                    std::vector<UnsupportedResource> *unsupported) {
+    const std::string component_name = component.getName();
+    const auto existing = components.find(component_name);
+    if (existing != components.end()) {
+      if (existing->second.component == &component) {
+        failed_publications.erase(component_name);
+        setSuccess(error);
+        return true;
+      }
+      return setFailure(
+          "RTT component name '" + component_name +
+              "' is already published by a different RTT component instance",
+          error);
+    }
+
+    if (shutdown_started.load()) {
+      return setFailure("OPC UA object model is shutting down", error);
+    }
     if (!server.isRunning()) {
-      assignError(
-          error,
-          "OPC UA server must be running before components are registered");
-      return {};
+      return setFailure(
+          "OPC UA server must be running before components are published",
+          error);
     }
     if (!type_registry) {
-      assignError(error, "OPC UA server type registry is unavailable");
-      return {};
-    }
-    if (options.reconcile_interval <= std::chrono::milliseconds::zero()) {
-      assignError(error, "object model reconcile interval must be positive");
-      return {};
+      return setFailure("OPC UA server type registry is unavailable", error);
     }
     if (options.operation_timeout <= std::chrono::milliseconds::zero()) {
-      assignError(error, "object model operation timeout must be positive");
-      return {};
+      return setFailure("object model operation timeout must be positive",
+                        error);
     }
     if (options.port_buffer_size == 0U ||
         options.port_buffer_size >
             static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      assignError(error, "object model port buffer size is out of range");
-      return {};
+      return setFailure("object model port buffer size is out of range", error);
     }
 
     auto state = std::make_shared<ComponentState>(component);
-    {
-      std::lock_guard<std::mutex> lock(registry_mutex);
-      if (shutdown_started.load()) {
-        assignError(error, "OPC UA object model is shutting down");
-        return {};
-      }
-      if (components.contains(state->component_name)) {
-        assignError(error, "an RTT component named '" + state->component_name +
-                               "' is already registered");
-        return {};
-      }
-    }
-
     ComponentSnapshot snapshot =
         snapshotComponent(state, component, dispatcher, type_registry,
                           options.port_buffer_size);
-    const bool rejected = !snapshot.unsupported.empty();
-    bool published_snapshot = false;
-    {
-      std::lock_guard<std::mutex> lock(registry_mutex);
-      if (shutdown_started.load()) {
-        assignError(error, "OPC UA object model is shutting down");
-        return {};
+    if (!snapshot.unsupported.empty()) {
+      failed_publications.insert_or_assign(component_name,
+                                           snapshot.unsupported);
+      if (unsupported_output != nullptr) {
+        *unsupported_output = snapshot.unsupported;
       }
-      if (components.contains(state->component_name)) {
-        assignError(error, "an RTT component named '" + state->component_name +
-                               "' is already registered");
-        return {};
-      }
-
-      if (rejected) {
-        std::lock_guard<std::mutex> model_lock(model_mutex);
-        failed_publications[state->component_name] = snapshot.unsupported;
-      } else {
-        components.emplace(state->component_name, state);
-        published_snapshot = publishSnapshot(state, snapshot, error);
-        if (!published_snapshot) {
-          components.erase(state->component_name);
-        }
-      }
-    }
-
-    if (rejected) {
-      if (unsupported != nullptr) {
-        *unsupported = snapshot.unsupported;
-      }
-      assignError(error, "strict OPC UA publication rejected component '" +
-                             state->component_name + "'");
-      std::vector<DiagnosticEvent> events;
-      events.reserve(snapshot.unsupported.size());
-      for (const UnsupportedResource &resource : snapshot.unsupported) {
-        events.push_back(DiagnosticEvent{false, resource});
-      }
-      emitDiagnosticEvents(events);
-      return {};
-    }
-
-    if (!published_snapshot) {
       deactivate(state);
-      return {};
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(model_mutex);
-      failed_publications.erase(state->component_name);
-    }
-    worker_condition.notify_all();
-    return state;
-  }
-
-  void
-  unregisterComponent(const std::shared_ptr<ComponentState> &state) noexcept {
-    if (!state) {
-      return;
-    }
-    bool removed = false;
-    {
-      std::lock_guard<std::mutex> lock(registry_mutex);
-      const auto found = components.find(state->component_name);
-      if (found != components.end() && found->second == state) {
-        components.erase(found);
-        removed = true;
-      }
-    }
-    deactivate(state);
-    if (!removed) {
-      return;
-    }
-
-    const auto self = shared_from_this();
-    const auto remove_publication = [self, state](::opcua::Server &native) {
-      std::lock_guard<std::mutex> lock(self->model_mutex);
-      if (self->removePublishedComponent(native, state.get(), nullptr)) {
-        self->advanceRevision(native);
-      }
-    };
-    const bool invoked =
-        server.invoke(remove_publication, std::chrono::seconds(5));
-    if (!invoked && !server.post(remove_publication)) {
-      std::lock_guard<std::mutex> lock(model_mutex);
-      const auto publication = published.find(state.get());
-      if (publication != published.end()) {
-        retainOwnershipUntilServerStops(publication->second);
-      }
-      published.erase(state.get());
-      unsupported.erase(state->component_name);
-      failed_publications.erase(state->component_name);
-    }
-  }
-
-  bool reconcile(std::string *error) {
-    if (!server.isRunning()) {
-      assignError(error, "OPC UA server is not running");
+      const std::string failure =
+          "strict OPC UA publication rejected component '" + component_name +
+          "'";
+      last_error = failure;
+      assignError(error, failure);
+      const auto diagnostics = snapshot.unsupported;
+      lock.unlock();
+      emitDiagnostics(diagnostics);
       return false;
     }
 
-    std::vector<std::shared_ptr<ComponentState>> current;
-    {
-      std::lock_guard<std::mutex> lock(registry_mutex);
-      current.reserve(components.size());
-      for (const auto &[name, state] : components) {
-        static_cast<void>(name);
-        current.push_back(state);
-      }
-    }
-
-    const auto self = shared_from_this();
-    const auto reconcile_error = std::make_shared<std::string>();
-    const auto diagnostic_events =
-        std::make_shared<std::vector<DiagnosticEvent>>();
+    PublishedComponent candidate(component, state, std::move(snapshot.nodes),
+                                 std::move(snapshot.fingerprint));
+    std::vector<CreatedNode> ledger;
+    std::string transaction_error;
     std::string server_error;
-    const bool success = server.invoke(
-        [self, current, reconcile_error,
-         diagnostic_events](::opcua::Server &native) {
-          std::lock_guard<std::mutex> lock(self->model_mutex);
-          const auto namespace_index = self->server.namespaceIndex();
-          if (!namespace_index || !self->ensureRoots(native, *namespace_index,
-                                                     reconcile_error.get())) {
-            return;
-          }
-
-          for (const auto &state : current) {
-            ComponentLease lease(state);
-            if (!lease) {
-              continue;
-            }
-            const ComponentSnapshot expected = snapshotComponent(
-                state, *lease.get(), self->dispatcher, self->type_registry,
-                self->options.port_buffer_size);
-            self->updateDiagnostics(state->component_name, expected.unsupported,
-                                    *diagnostic_events);
-            if (!expected.unsupported.empty()) {
-              continue;
-            }
-            bool component_changed = false;
-            if (!self->reconcileComponent(native, *namespace_index, state.get(),
-                                          expected.nodes, &component_changed,
-                                          reconcile_error.get())) {
+    bool committed = false;
+    bool rollback_complete = true;
+    const bool invoked = server.invoke(
+        [this, &candidate, &ledger, &transaction_error, &committed,
+         &rollback_complete](::opcua::Server &native) {
+          try {
+            const auto namespace_index = server.namespaceIndex();
+            if (!namespace_index ||
+                !ensureRoots(native, *namespace_index, &transaction_error) ||
+                !createCandidate(native, *namespace_index, candidate, ledger,
+                                 &transaction_error)) {
+              closeAndRollback(native, candidate.state, ledger,
+                               rollback_complete, &transaction_error);
               return;
             }
-            if (component_changed) {
-              self->advanceRevision(native);
+
+            const std::string name = candidate.state->component_name;
+            const auto [published, inserted] =
+                components.try_emplace(name, std::move(candidate));
+            static_cast<void>(published);
+            if (!inserted) {
+              assignError(&transaction_error,
+                          "RTT component publication changed during commit");
+              closeAndRollback(native, candidate.state, ledger,
+                               rollback_complete, &transaction_error);
+              return;
             }
+            committed = true;
+            advanceRevision(native);
+          } catch (const std::exception &exception) {
+            if (committed) {
+              return;
+            }
+            if (transaction_error.empty()) {
+              transaction_error =
+                  "OPC UA component publication threw: " +
+                  std::string(exception.what());
+            }
+            closeAndRollback(native, candidate.state, ledger,
+                             rollback_complete, &transaction_error);
+          } catch (...) {
+            if (committed) {
+              return;
+            }
+            if (transaction_error.empty()) {
+              transaction_error = "OPC UA component publication threw";
+            }
+            closeAndRollback(native, candidate.state, ledger,
+                             rollback_complete, &transaction_error);
           }
         },
         std::chrono::seconds(5), &server_error);
 
-    if (success) {
-      emitDiagnosticEvents(*diagnostic_events);
+    if (!invoked || !committed) {
+      deactivate(state);
+      if (!rollback_complete) {
+        abandoned.push_back(AbandonedResources{
+            state, std::move(candidate.nodes), candidate.snapshot_fingerprint});
+      }
+      std::string failure =
+          server_error.empty() ? std::move(transaction_error)
+                               : std::move(server_error);
+      if (failure.empty()) {
+        failure = "failed to publish the OPC UA component";
+      }
+      return setFailure(std::move(failure), error);
     }
 
-    std::string failure =
-        server_error.empty() ? *reconcile_error : server_error;
-    if (!success || !failure.empty()) {
-      if (failure.empty()) {
-        failure = "failed to reconcile the OPC UA object model";
-      }
-      setLastError(failure);
-      assignError(error, failure);
-      return false;
-    }
-    setLastError({});
-    assignError(error, {});
+    failed_publications.erase(component_name);
+    setSuccess(error);
     return true;
   }
 
   std::uint64_t currentRevision() const noexcept { return revision.load(); }
 
   std::size_t componentCount() const noexcept {
-    std::lock_guard<std::mutex> lock(registry_mutex);
+    std::lock_guard<std::mutex> lock(command_mutex);
     return components.size();
   }
 
@@ -1728,163 +1394,150 @@ public:
   }
 
   std::vector<UnsupportedResource>
-  unsupportedResources(std::string_view component) const {
-    return diagnosticsFor(component);
+  unsupportedResources(std::string_view component_name) const {
+    std::lock_guard<std::mutex> lock(command_mutex);
+    const auto found = failed_publications.find(component_name);
+    return found == failed_publications.end()
+               ? std::vector<UnsupportedResource>{}
+               : found->second;
   }
 
   std::string lastError() const {
-    std::lock_guard<std::mutex> lock(error_mutex);
+    std::lock_guard<std::mutex> lock(command_mutex);
     return last_error;
   }
 
   void shutdown() noexcept {
+    std::unique_lock<std::mutex> lock(command_mutex);
     bool expected = false;
     if (!shutdown_started.compare_exchange_strong(expected, true)) {
       return;
     }
-    worker.request_stop();
-    worker_condition.notify_all();
-    if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {
-      worker.join();
-    }
+
     dispatcher->drainPending();
-
-    std::vector<std::shared_ptr<ComponentState>> states;
-    {
-      std::lock_guard<std::mutex> lock(registry_mutex);
-      for (const auto &[name, state] : components) {
-        static_cast<void>(name);
-        states.push_back(state);
-      }
-      components.clear();
+    for (auto &[name, publication] : components) {
+      static_cast<void>(name);
+      deactivate(publication.state);
     }
-    for (const auto &state : states) {
-      deactivate(state);
+    for (auto &resources : abandoned) {
+      deactivate(resources.closed_state);
     }
-
-    const auto self = shared_from_this();
-    const auto cleanup = [self](::opcua::Server &native) {
-      std::lock_guard<std::mutex> lock(self->model_mutex);
-      self->cleanupPublishedComponents(native);
-    };
-    if (server.isRunning()) {
-      const bool invoked = server.invoke(cleanup, std::chrono::seconds(5));
-      if (invoked || server.post(cleanup)) {
-        return;
-      }
-    }
-
-    std::lock_guard<std::mutex> lock(model_mutex);
-    for (const auto &[state, nodes] : published) {
-      static_cast<void>(state);
-      retainOwnershipUntilServerStops(nodes);
-    }
-    published.clear();
-    unsupported.clear();
+    components.clear();
+    abandoned.clear();
     failed_publications.clear();
   }
 
 private:
-  bool publishSnapshot(const std::shared_ptr<ComponentState> &state,
-                       const ComponentSnapshot &snapshot, std::string *error) {
-    bool component_changed = false;
-    bool published_snapshot = false;
-    const bool invoked = server.invoke(
-        [this, &state, &snapshot, &component_changed, &published_snapshot,
-         error](::opcua::Server &native) {
-          std::lock_guard<std::mutex> lock(model_mutex);
-          const auto index = server.namespaceIndex();
-          if (!index || !ensureRoots(native, *index, error) ||
-              !reconcileComponent(native, *index, state.get(), snapshot.nodes,
-                                  &component_changed, error)) {
-            return;
-          }
-          if (component_changed) {
-            advanceRevision(native);
-          }
-          published_snapshot = true;
-        });
-    if (!invoked && (error == nullptr || error->empty())) {
-      assignError(error, "failed to invoke initial OPC UA component publication");
-    }
-    return invoked && published_snapshot;
+  bool setFailure(std::string failure, std::string *error) {
+    last_error = failure;
+    assignError(error, std::move(failure));
+    return false;
   }
 
-  std::vector<UnsupportedResource>
-  diagnosticsFor(std::string_view component_name) const {
-    std::lock_guard<std::mutex> lock(model_mutex);
-    const auto active = unsupported.find(component_name);
-    if (active != unsupported.end()) {
-      return active->second;
-    }
-    const auto rejected = failed_publications.find(component_name);
-    return rejected == failed_publications.end()
-               ? std::vector<UnsupportedResource>{}
-               : rejected->second;
+  void setSuccess(std::string *error) {
+    last_error.clear();
+    assignError(error, {});
   }
 
-  void
-  retainOwnershipUntilServerStops(const std::vector<const NodeSpec *> &specs) {
-    std::set<const NodeOwnership *> retained;
-    for (const NodeSpec *spec : specs) {
-      if (retained.insert(spec->ownership.get()).second) {
-        server.retainUntilStopped(spec->ownership);
+  void emitDiagnostics(
+      const std::vector<UnsupportedResource> &diagnostics) const noexcept {
+    for (const UnsupportedResource &resource : diagnostics) {
+      const std::string message = resource.message();
+      if (options.warning_sink) {
+        try {
+          options.warning_sink(message);
+        } catch (...) {
+          RTT::Logger::log().logf(
+              RTT::Logger::Error, "ObjectModel",
+              "OPC UA diagnostic callback threw an exception");
+        }
+        continue;
       }
+      RTT::Logger::log().logf(RTT::Logger::Warning, "ObjectModel", "%s",
+                              message.c_str());
     }
   }
 
-  void retainOwnershipUntilServerStops(const NodeMap &nodes) {
+  bool createCandidate(::opcua::Server &native,
+                       std::uint16_t namespace_index,
+                       const PublishedComponent &candidate,
+                       std::vector<CreatedNode> &ledger,
+                       std::string *error) {
     std::vector<const NodeSpec *> specs;
-    specs.reserve(nodes.size());
-    for (const auto &[path, spec] : nodes) {
+    specs.reserve(candidate.nodes.size());
+    for (const auto &[path, spec] : candidate.nodes) {
       static_cast<void>(path);
       specs.push_back(&spec);
     }
-    retainOwnershipUntilServerStops(specs);
-  }
+    std::sort(specs.begin(), specs.end(),
+              [](const NodeSpec *left, const NodeSpec *right) {
+                const std::size_t left_depth = pathDepth(left->path);
+                const std::size_t right_depth = pathDepth(right->path);
+                return left_depth == right_depth ? left->path < right->path
+                                                 : left_depth < right_depth;
+              });
 
-  void abandonOwnership(::opcua::Server &native,
-                        const std::vector<const NodeSpec *> &specs,
-                        std::string *error) {
-    retainOwnershipUntilServerStops(specs);
-    std::set<const NodeOwnership *> released;
+    const std::string component_root = appendNodeSegment(
+        appendNodeSegment("rtt", "components"),
+        candidate.state->component_name);
+    if (candidate.nodes.size() > ledger.max_size() / 3U) {
+      assignError(error, "OPC UA component snapshot is too large to publish");
+      return false;
+    }
+    ledger.reserve(candidate.nodes.size() * 3U);
     for (const NodeSpec *spec : specs) {
-      if (released.insert(spec->ownership.get()).second) {
-        static_cast<void>(
-            releaseOwnershipMarkers(native, *spec->ownership, error));
+      CreatedNode primary{nodeId(namespace_index, spec->path),
+                          spec->path == component_root ||
+                              spec->kind == NodeKind::method};
+      bool created = false;
+      const bool ready =
+          createNode(native, namespace_index, *spec, &created, error);
+      if (created) {
+        ledger.push_back(std::move(primary));
+      }
+      if (created && spec->kind == NodeKind::method &&
+          !recordMethodArgumentNodes(native, namespace_index, *spec, ledger,
+                                     error)) {
+        return false;
+      }
+      if (!ready) {
+        return false;
+      }
+      if (!created) {
+        assignError(error, "OPC UA node creator did not report ownership for '" +
+                               spec->path + "'");
+        return false;
       }
     }
+    return true;
   }
 
-  void abandonOwnership(::opcua::Server &native, const NodeMap &nodes,
-                        std::string *error) {
-    std::vector<const NodeSpec *> specs;
-    specs.reserve(nodes.size());
-    for (const auto &[path, spec] : nodes) {
-      static_cast<void>(path);
-      specs.push_back(&spec);
-    }
-    abandonOwnership(native, specs, error);
-  }
-
-  void cleanupPublishedComponents(::opcua::Server &native) {
-    const auto namespace_index = server.namespaceIndex();
-    for (auto &[state, nodes] : published) {
-      static_cast<void>(state);
-      std::vector<const NodeSpec *> specs;
-      specs.reserve(nodes.size());
-      for (const auto &[path, spec] : nodes) {
-        static_cast<void>(path);
-        specs.push_back(&spec);
+  static void closeAndRollback(::opcua::Server &native,
+                               const std::shared_ptr<ComponentState> &state,
+                               const std::vector<CreatedNode> &ledger,
+                               bool &rollback_complete,
+                               std::string *error) noexcept {
+    deactivate(state);
+    try {
+      std::string rollback_error;
+      rollback_complete =
+          rollbackCreatedNodes(native, ledger, &rollback_error);
+      if (!rollback_complete) {
+        appendError(error, "rollback failed: " + rollback_error);
       }
-      if (!namespace_index ||
-          !deleteOwnedNodes(native, *namespace_index, specs, nullptr)) {
-        abandonOwnership(native, specs, nullptr);
+    } catch (const std::exception &exception) {
+      rollback_complete = false;
+      try {
+        appendError(error, "rollback threw: " + std::string(exception.what()));
+      } catch (...) {
+      }
+    } catch (...) {
+      rollback_complete = false;
+      try {
+        appendError(error, "rollback threw");
+      } catch (...) {
       }
     }
-    published.clear();
-    unsupported.clear();
-    failed_publications.clear();
   }
 
   bool ensureRoots(::opcua::Server &native, std::uint16_t namespace_index,
@@ -1924,7 +1577,7 @@ private:
     const std::string components_path = appendNodeSegment("rtt", "components");
     const std::string model_path = appendNodeSegment("rtt", "model");
     if (!ensure_object(components_path, "Components",
-                       "Registered RTT components.") ||
+                       "Published RTT components.") ||
         !ensure_object(model_path, "Model", "RTT model metadata.")) {
       return false;
     }
@@ -1953,394 +1606,57 @@ private:
     return true;
   }
 
-  bool reconcileComponent(::opcua::Server &native,
-                          std::uint16_t namespace_index,
-                          const ComponentState *state, const NodeMap &expected,
-                          bool *changed, std::string *error) {
-    const auto current = published.find(state);
-    const NodeMap previous =
-        current == published.end() ? NodeMap{} : current->second;
-    NodeMap committed = expected;
-
-    std::set<std::string> old_remove_set;
-    for (const auto &[path, existing] : previous) {
-      const auto replacement = expected.find(path);
-      if (replacement == expected.end() ||
-          replacement->second.fingerprint != existing.fingerprint) {
-        old_remove_set.insert(path);
+  void advanceRevision(::opcua::Server &native) noexcept {
+    try {
+      const std::uint64_t next = revision.fetch_add(1U) + 1U;
+      const auto namespace_index = server.namespaceIndex();
+      if (!namespace_index) {
+        return;
       }
+      static_cast<void>(::opcua::services::writeValue(
+          native,
+          nodeId(*namespace_index,
+                 appendNodeSegment(appendNodeSegment("rtt", "model"),
+                                   "revision")),
+          ::opcua::Variant(next)));
+    } catch (...) {
+      // The publication is already committed; the local revision remains
+      // authoritative if updating its OPC UA mirror cannot allocate.
     }
-    const std::vector<std::string> direct_remove_paths(old_remove_set.begin(),
-                                                       old_remove_set.end());
-    for (const auto &[path, spec] : previous) {
-      static_cast<void>(spec);
-      if (std::ranges::any_of(direct_remove_paths, [&](const auto &ancestor) {
-            return isDescendantPath(path, ancestor);
-          })) {
-        old_remove_set.insert(path);
-      }
-    }
-    std::vector<std::string> old_remove_paths(old_remove_set.begin(),
-                                              old_remove_set.end());
-    std::sort(old_remove_paths.begin(), old_remove_paths.end(),
-              [](const auto &left, const auto &right) {
-                const std::size_t left_depth = pathDepth(left);
-                const std::size_t right_depth = pathDepth(right);
-                return left_depth == right_depth ? left < right
-                                                 : left_depth > right_depth;
-              });
-
-    for (const auto &[path, existing] : previous) {
-      const auto candidate = committed.find(path);
-      if (!old_remove_set.contains(path) && candidate != committed.end() &&
-          candidate->second.fingerprint == existing.fingerprint) {
-        candidate->second = existing;
-      }
-    }
-
-    std::vector<const NodeSpec *> candidate_specs;
-    for (const auto &[path, spec] : committed) {
-      const auto existing = previous.find(path);
-      if (existing == previous.end() ||
-          existing->second.fingerprint != spec.fingerprint ||
-          old_remove_set.contains(path)) {
-        candidate_specs.push_back(&spec);
-      }
-    }
-    std::sort(candidate_specs.begin(), candidate_specs.end(),
-              [](const NodeSpec *left, const NodeSpec *right) {
-                const std::size_t left_depth = pathDepth(left->path);
-                const std::size_t right_depth = pathDepth(right->path);
-                return left_depth == right_depth ? left->path < right->path
-                                                 : left_depth < right_depth;
-              });
-
-    std::vector<const NodeSpec *> rollback_specs;
-    rollback_specs.reserve(old_remove_paths.size());
-    for (const auto &[path, spec] : previous) {
-      if (old_remove_set.contains(path)) {
-        rollback_specs.push_back(&spec);
-      }
-    }
-    std::sort(rollback_specs.begin(), rollback_specs.end(),
-              [](const NodeSpec *left, const NodeSpec *right) {
-                const std::size_t left_depth = pathDepth(left->path);
-                const std::size_t right_depth = pathDepth(right->path);
-                return left_depth == right_depth ? left->path < right->path
-                                                 : left_depth < right_depth;
-              });
-
-    if (!removalSubtreesAreOwned(native, namespace_index, previous,
-                                 old_remove_paths, error)) {
-      return false;
-    }
-    if (!unchangedCandidateParentsAreOwned(native, previous, old_remove_set,
-                                           candidate_specs, error)) {
-      return false;
-    }
-    for (const NodeSpec *spec : candidate_specs) {
-      if (!previous.contains(spec->path) &&
-          ::opcua::services::readNodeClass(
-              native, nodeId(namespace_index, spec->path))) {
-        assignError(error, "OPC UA candidate node collision at '" +
-                               spec->path + "' before reconciliation");
-        return false;
-      }
-    }
-
-    const auto restore_old = [&](std::string *rollback_error) {
-      std::string cleanup_error;
-      const bool removed = deleteOwnedNodes(native, namespace_index,
-                                            rollback_specs, &cleanup_error);
-      bool restored = removed;
-      std::string creation_error;
-      if (!removed) {
-        assignError(rollback_error, std::move(cleanup_error));
-        return false;
-      }
-      for (const NodeSpec *spec : rollback_specs) {
-        if (!createNode(native, namespace_index, *spec, &creation_error) ||
-            !captureOwnership(native, namespace_index, *spec,
-                              &creation_error)) {
-          restored = false;
-          break;
-        }
-      }
-      if (!cleanup_error.empty() && !creation_error.empty()) {
-        cleanup_error += "; ";
-      }
-      cleanup_error += creation_error;
-      assignError(rollback_error, std::move(cleanup_error));
-      return restored;
-    };
-
-    if (!deleteOwnedNodes(native, namespace_index, rollback_specs, error)) {
-      std::string rollback_error;
-      const bool restored = restore_old(&rollback_error);
-      appendRollbackError(error, rollback_error, restored);
-      return false;
-    }
-
-    std::vector<const NodeSpec *> created_candidate_specs;
-    for (const NodeSpec *spec : candidate_specs) {
-      const bool existed_before = static_cast<bool>(
-          ::opcua::services::readNodeClass(
-              native, nodeId(namespace_index, spec->path)));
-      const bool created = createNode(native, namespace_index, *spec, error);
-      const bool captured =
-          created && captureOwnership(native, namespace_index, *spec, error);
-      if (!created || !captured) {
-        std::vector<const NodeSpec *> cleanup_specs = created_candidate_specs;
-        std::string ownership_error;
-        if (!existed_before &&
-            ::opcua::services::readNodeClass(
-                native, nodeId(namespace_index, spec->path)) &&
-            (!spec->ownership->identities.empty() ||
-             captureOwnership(native, namespace_index, *spec,
-                              &ownership_error))) {
-          cleanup_specs.push_back(spec);
-        }
-        std::string cleanup_error;
-        const bool removed = deleteOwnedNodes(native, namespace_index,
-                                              cleanup_specs, &cleanup_error);
-        if (!removed) {
-          abandonOwnership(native, cleanup_specs, &cleanup_error);
-        }
-        if (!ownership_error.empty()) {
-          if (!cleanup_error.empty()) {
-            cleanup_error += "; ";
-          }
-          cleanup_error += ownership_error;
-        }
-        std::string restore_error;
-        const bool old_restored = restore_old(&restore_error);
-        std::string rollback_error = cleanup_error;
-        if (!restore_error.empty()) {
-          if (!rollback_error.empty()) {
-            rollback_error += "; ";
-          }
-          rollback_error += restore_error;
-        }
-        const bool restored = removed && old_restored;
-        appendRollbackError(error, rollback_error, restored);
-        return false;
-      }
-      created_candidate_specs.push_back(spec);
-    }
-
-    published.insert_or_assign(state, std::move(committed));
-    *changed = !old_remove_paths.empty() || !candidate_specs.empty();
-    return true;
-  }
-
-  bool updateDiagnostics(const std::string &component,
-                         const std::vector<UnsupportedResource> &expected,
-                         std::vector<DiagnosticEvent> &events) {
-    const auto found = unsupported.find(component);
-    const std::vector<UnsupportedResource> empty;
-    const std::vector<UnsupportedResource> &current =
-        found == unsupported.end() ? empty : found->second;
-    std::vector<UnsupportedResource> additions;
-    std::vector<UnsupportedResource> removals;
-    std::set_difference(expected.begin(), expected.end(), current.begin(),
-                        current.end(), std::back_inserter(additions));
-    std::set_difference(current.begin(), current.end(), expected.begin(),
-                        expected.end(), std::back_inserter(removals));
-    for (auto &resource : additions) {
-      events.push_back(DiagnosticEvent{false, std::move(resource)});
-    }
-    for (auto &resource : removals) {
-      events.push_back(DiagnosticEvent{true, std::move(resource)});
-    }
-    if (additions.empty() && removals.empty()) {
-      return false;
-    }
-    if (expected.empty()) {
-      unsupported.erase(component);
-    } else {
-      unsupported.insert_or_assign(component, expected);
-    }
-    return true;
-  }
-
-  void emitDiagnosticEvents(
-      const std::vector<DiagnosticEvent> &events) const noexcept {
-    for (const DiagnosticEvent &event : events) {
-      const UnsupportedResource &resource = event.resource;
-      const std::string message =
-          event.recovered
-              ? "OPC UA: component '" + resource.component +
-                    "' now publishes " + resource.kind + " '" + resource.path +
-                    "' with RTT type '" + resource.type_name + "'."
-              : resource.message();
-      if (options.warning_sink) {
-        try {
-          options.warning_sink(message);
-        } catch (...) {
-          RTT::Logger::log().logf(
-              RTT::Logger::Error, "ObjectModel",
-              "OPC UA diagnostic callback threw an exception");
-        }
-        continue;
-      }
-      RTT::Logger::log().logf(event.recovered ? RTT::Logger::Info
-                                              : RTT::Logger::Warning,
-                              "ObjectModel", "%s", message.c_str());
-    }
-  }
-
-  bool removePublishedComponent(::opcua::Server &native,
-                                const ComponentState *state,
-                                std::string *error) {
-    const bool active_diagnostics_removed =
-        unsupported.erase(state->component_name) != 0U;
-    const bool failed_diagnostics_removed =
-        failed_publications.erase(state->component_name) != 0U;
-    static_cast<void>(active_diagnostics_removed);
-    static_cast<void>(failed_diagnostics_removed);
-    const auto found = published.find(state);
-    if (found == published.end()) {
-      return false;
-    }
-    const auto namespace_index = server.namespaceIndex();
-    if (!namespace_index) {
-      retainOwnershipUntilServerStops(found->second);
-      published.erase(found);
-      return false;
-    }
-    std::vector<std::string> paths;
-    std::vector<const NodeSpec *> specs;
-    paths.reserve(found->second.size());
-    specs.reserve(found->second.size());
-    for (const auto &[path, spec] : found->second) {
-      paths.push_back(path);
-      specs.push_back(&spec);
-    }
-    const bool owned = removalSubtreesAreOwned(
-        native, *namespace_index, found->second, paths, error);
-    const bool deleted =
-        owned && deleteOwnedNodes(native, *namespace_index, std::move(specs),
-                                  error);
-    if (!deleted) {
-      abandonOwnership(native, found->second, error);
-    }
-    published.erase(found);
-    return deleted;
-  }
-
-  void advanceRevision(::opcua::Server &native) {
-    const std::uint64_t next = revision.fetch_add(1U) + 1U;
-    const auto namespace_index = server.namespaceIndex();
-    if (!namespace_index) {
-      return;
-    }
-    ::opcua::services::writeValue(
-        native,
-        nodeId(
-            *namespace_index,
-            appendNodeSegment(appendNodeSegment("rtt", "model"), "revision")),
-        ::opcua::Variant(next));
-  }
-
-  void setLastError(std::string value) {
-    std::lock_guard<std::mutex> lock(error_mutex);
-    last_error = std::move(value);
   }
 
   Server &server;
-  ObjectModelOptions options;
-  std::shared_ptr<const EndpointTypeRegistry> type_registry;
-  std::shared_ptr<OperationDispatcher> dispatcher;
-  mutable std::mutex registry_mutex;
-  std::map<std::string, std::shared_ptr<ComponentState>> components;
-  mutable std::mutex model_mutex;
-  std::map<const ComponentState *, NodeMap> published;
-  std::map<std::string, std::vector<UnsupportedResource>, std::less<>>
-      unsupported;
+  const ObjectModelOptions options;
+  const std::shared_ptr<const EndpointTypeRegistry> type_registry;
+  const std::shared_ptr<OperationDispatcher> dispatcher;
+  mutable std::mutex command_mutex;
+  std::map<std::string, PublishedComponent, std::less<>> components;
+  std::vector<AbandonedResources> abandoned;
   std::map<std::string, std::vector<UnsupportedResource>, std::less<>>
       failed_publications;
   bool roots_ready{false};
   std::atomic<std::uint64_t> revision{0U};
-  mutable std::mutex error_mutex;
   std::string last_error;
   std::atomic_bool shutdown_started{false};
-  std::mutex worker_mutex;
-  std::condition_variable worker_condition;
-  std::jthread worker;
 };
 
 } // namespace detail
 
 std::string UnsupportedResource::message() const {
-  return "OPC UA: component '" + component + "' skipped " + kind + " '" + path +
-         "' because RTT type '" + type_name + "' " + reason + ".";
-}
-
-ComponentRegistration::ComponentRegistration(
-    std::weak_ptr<detail::ObjectModelImpl> model,
-    std::shared_ptr<detail::ComponentState> state)
-    : model_(std::move(model)), state_(std::move(state)) {}
-
-ComponentRegistration::~ComponentRegistration() { reset(); }
-
-ComponentRegistration::ComponentRegistration(
-    ComponentRegistration &&other) noexcept
-    : model_(std::move(other.model_)), state_(std::move(other.state_)) {}
-
-ComponentRegistration &
-ComponentRegistration::operator=(ComponentRegistration &&other) noexcept {
-  if (this != &other) {
-    reset();
-    model_ = std::move(other.model_);
-    state_ = std::move(other.state_);
-  }
-  return *this;
-}
-
-bool ComponentRegistration::active() const noexcept {
-  return detail::isActive(state_);
-}
-
-ComponentRegistration::operator bool() const noexcept { return active(); }
-
-std::string ComponentRegistration::name() const {
-  return state_ ? state_->component_name : std::string{};
-}
-
-void ComponentRegistration::reset() noexcept {
-  if (!state_) {
-    return;
-  }
-  if (const auto model = model_.lock()) {
-    model->unregisterComponent(state_);
-  } else {
-    detail::deactivate(state_);
-  }
-  state_.reset();
-  model_.reset();
+  return "OPC UA: component '" + component + "' rejected " + kind + " '" +
+         path + "' because RTT type '" + type_name + "' " + reason + ".";
 }
 
 ObjectModel::ObjectModel(Server &server, ObjectModelOptions options)
     : impl_(std::make_shared<detail::ObjectModelImpl>(server,
-                                                      std::move(options))) {
-  impl_->startWorker();
-}
+                                                      std::move(options))) {}
 
 ObjectModel::~ObjectModel() { impl_->shutdown(); }
 
-std::optional<ComponentRegistration>
-ObjectModel::registerComponent(RTT::TaskContext &component,
-                               std::string *error,
-                               std::vector<UnsupportedResource> *unsupported) {
-  const auto state = impl_->registerComponent(component, error, unsupported);
-  if (!state) {
-    return std::nullopt;
-  }
-  return ComponentRegistration(impl_, state);
-}
-
-bool ObjectModel::reconcile(std::string *error) {
-  return impl_->reconcile(error);
+bool ObjectModel::publishComponent(
+    RTT::TaskContext &component, std::string *error,
+    std::vector<UnsupportedResource> *unsupported) {
+  return impl_->publishComponent(component, error, unsupported);
 }
 
 std::uint64_t ObjectModel::revision() const noexcept {

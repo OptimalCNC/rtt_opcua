@@ -32,9 +32,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <memory>
-#include <optional>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -91,39 +89,19 @@ bool waitUntil(const std::function<bool()> &predicate,
                          RTT::opcua::makeNodePath(path_segments));
 }
 
-bool hasObjectChild(::opcua::Client &client, const ::opcua::NodeId &parent,
-                    std::string_view browse_name) {
+bool hasHierarchicalChild(::opcua::Client &client,
+                          const ::opcua::NodeId &parent,
+                          const ::opcua::NodeId &child) {
   const ::opcua::BrowseDescription browse(
       parent, ::opcua::BrowseDirection::Forward,
-      ::opcua::ReferenceTypeId::HasComponent, true, ::opcua::NodeClass::Object,
-      ::opcua::BrowseResultMask::All);
+      ::opcua::ReferenceTypeId::HierarchicalReferences, true,
+      ::opcua::NodeClass::Unspecified, ::opcua::BrowseResultMask::All);
   const auto result = ::opcua::services::browseAll(client, browse);
   return result &&
          std::ranges::any_of(result.value(), [&](const auto &reference) {
-           return reference.browseName().name() == browse_name;
+           return reference.nodeId().isLocal() &&
+                  reference.nodeId().nodeId() == child;
          });
-}
-
-std::optional<::opcua::NodeId>
-methodArgumentNode(::opcua::Client &client, const ::opcua::NodeId &method,
-                   std::string_view browse_name) {
-  const ::opcua::BrowseDescription browse(
-      method, ::opcua::BrowseDirection::Forward,
-      ::opcua::ReferenceTypeId::HasProperty, true,
-      ::opcua::NodeClass::Variable, ::opcua::BrowseResultMask::All);
-  const auto result = ::opcua::services::browseAll(client, browse);
-  if (!result) {
-    return std::nullopt;
-  }
-  const auto found = std::ranges::find_if(
-      result.value(), [&](const auto &reference) {
-        return reference.browseName().namespaceIndex() == 0U &&
-               reference.browseName().name() == browse_name &&
-               reference.nodeId().isLocal();
-      });
-  return found == result.value().end()
-             ? std::nullopt
-             : std::optional<::opcua::NodeId>(found->nodeId().nodeId());
 }
 
 struct CanonicalTypesFixture {
@@ -178,33 +156,54 @@ public:
   std::atomic_bool slow_completed{false};
 };
 
-class FixedInt32DataSource final : public ::opcua::DataSourceBase {
-public:
-  explicit FixedInt32DataSource(std::int32_t value) : value_(value) {}
-
-  ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
-                           const ::opcua::NumericRange *range,
-                           ::opcua::DataValue &value, bool) override {
-    if (range != nullptr) {
-      value.setStatus(UA_STATUSCODE_BADINDEXRANGEINVALID);
-      return UA_STATUSCODE_BADINDEXRANGEINVALID;
-    }
-    value.setValue(::opcua::Variant(value_));
-    return UA_STATUSCODE_GOOD;
-  }
-
-  ::opcua::StatusCode write(::opcua::Session &, const ::opcua::NodeId &,
-                            const ::opcua::NumericRange *,
-                            const ::opcua::DataValue &) override {
-    return UA_STATUSCODE_BADNOTWRITABLE;
-  }
-
-private:
-  std::int32_t value_;
-};
-
 struct UnsupportedValue {
   std::int32_t value{0};
+};
+
+constexpr std::string_view kUnsupportedTypeName = "/test/UnsupportedValue";
+constexpr std::string_view kMissingProtocolReason =
+    "has no registered OPC UA protocol";
+
+void registerUnsupportedValueType() {
+  if (RTT::types::Types()->type(std::string(kUnsupportedTypeName)) != nullptr) {
+    return;
+  }
+  BOOST_REQUIRE(RTT::types::Types()->addType(
+      new RTT::types::TemplateTypeInfo<UnsupportedValue, false>(
+          std::string(kUnsupportedTypeName))));
+}
+
+class UnsupportedResourceComponent final : public RTT::TaskContext {
+public:
+  UnsupportedResourceComponent()
+      : RTT::TaskContext("unsupported-component"),
+        unsupported_service(RTT::Service::Create("unsupported")) {
+    unsupported_service
+        ->addOperation("consume", &UnsupportedResourceComponent::consume, this,
+                       RTT::ClientThread)
+        .arg("value", "Unsupported input value.");
+    unsupported_service->addOperation("produce",
+                                      &UnsupportedResourceComponent::produce,
+                                      this, RTT::ClientThread);
+    unsupported_service->addProperty("UnsupportedProperty", property);
+    unsupported_service->addAttribute("UnsupportedAttribute", attribute);
+    unsupported_service->addPort(input);
+    unsupported_service->addPort(output);
+    provides()->addProperty("SupportedProperty", supported_property);
+    BOOST_REQUIRE(provides()->addService(unsupported_service));
+  }
+
+  void removeUnsupportedService() { provides()->removeService("unsupported"); }
+
+  bool consume(UnsupportedValue) const { return true; }
+  UnsupportedValue produce() const { return UnsupportedValue{42}; }
+
+  RTT::Service::shared_ptr unsupported_service;
+  UnsupportedValue property{1};
+  UnsupportedValue attribute{2};
+  std::int32_t supported_property{3};
+  RTT::InputPort<UnsupportedValue> input{"UnsupportedInput"};
+  RTT::OutputPort<UnsupportedValue> output{"UnsupportedOutput"};
 };
 
 class CanonicalArrayComponent final : public RTT::TaskContext {
@@ -226,63 +225,42 @@ public:
   std::vector<std::string> string_attribute{"eleven", "twelve"};
 };
 
-constexpr std::string_view kUnsupportedTypeName = "/test/UnsupportedValue";
-constexpr std::string_view kMissingProtocolReason =
-    "has no registered OPC UA protocol";
-
-void registerUnsupportedValueType() {
-  if (RTT::types::Types()->type(std::string(kUnsupportedTypeName)) != nullptr) {
-    return;
-  }
-  BOOST_REQUIRE(RTT::types::Types()->addType(
-      new RTT::types::TemplateTypeInfo<UnsupportedValue, false>(
-          std::string(kUnsupportedTypeName))));
-}
-
-class UnsupportedResourceComponent final : public RTT::TaskContext {
+class StaticSnapshotComponent final : public RTT::TaskContext {
 public:
-  explicit UnsupportedResourceComponent(bool publish_unsupported = true)
-      : RTT::TaskContext("unsupported-component"),
-        unsupported_service(RTT::Service::Create("unsupported")) {
-    unsupported_service
-        ->addOperation("consume", &UnsupportedResourceComponent::consume, this,
-                       RTT::ClientThread)
-        .arg("value", "Unsupported input value.");
-    unsupported_service->addOperation("produce",
-                                      &UnsupportedResourceComponent::produce,
-                                      this, RTT::ClientThread);
-    unsupported_service->addProperty("UnsupportedProperty", property);
-    unsupported_service->addAttribute("UnsupportedAttribute", attribute);
-    unsupported_service->addPort(input);
-    unsupported_service->addPort(output);
-    provides()->addProperty("SupportedProperty", supported_property);
-    if (publish_unsupported) {
-      addUnsupportedService();
-    }
+  StaticSnapshotComponent()
+      : RTT::TaskContext("arm/left"),
+        motion(RTT::Service::Create("motion/raw", this)) {
+    provides()->doc("Arm controller");
+    addProperty("Gain", gain).doc("Controller gain");
+    addAttribute("Status", status);
+    addConstant("ModelName", model_name);
+    addPort(feedback).doc("Measured feedback");
+    addPort(command).doc("Requested command");
+    motion->addProperty("Scale", scale).doc("Motion scale");
   }
 
-  void addUnsupportedService() {
-    BOOST_REQUIRE(provides()->addService(unsupported_service));
-  }
-
-  void removeUnsupportedService() { provides()->removeService("unsupported"); }
-
-  bool consume(UnsupportedValue) const { return true; }
-  UnsupportedValue produce() const { return UnsupportedValue{42}; }
-
-  RTT::Service::shared_ptr unsupported_service;
-  UnsupportedValue property{1};
-  UnsupportedValue attribute{2};
-  std::int32_t supported_property{3};
-  RTT::InputPort<UnsupportedValue> input{"UnsupportedInput"};
-  RTT::OutputPort<UnsupportedValue> output{"UnsupportedOutput"};
+  std::int32_t gain{7};
+  std::string status{"idle"};
+  std::string model_name{"arm-v1"};
+  RTT::OutputPort<double> feedback{"Feedback"};
+  RTT::InputPort<std::uint16_t> command{"Command"};
+  RTT::Service::shared_ptr motion;
+  std::uint16_t scale{2U};
 };
 
-class FailingInputPort final : public RTT::InputPort<std::int32_t> {
+class CollisionComponent final : public RTT::TaskContext {
 public:
-  using RTT::InputPort<std::int32_t>::InputPort;
+  CollisionComponent() : RTT::TaskContext("collision-component") {
+    addOperation("echo", &CollisionComponent::echo, this, RTT::ClientThread)
+        .arg("value", "Value to echo.");
+    addProperty("Earlier", earlier);
+    addProperty("ZCollision", collision);
+  }
 
-  RTT::base::PortInterface *antiClone() const override { return nullptr; }
+  std::int32_t echo(std::int32_t value) const { return value; }
+
+  std::int32_t earlier{17};
+  std::int32_t collision{42};
 };
 
 class ThrowingInputPort final : public RTT::InputPort<std::int32_t> {
@@ -294,25 +272,14 @@ public:
   }
 };
 
-class RollbackComponent final : public RTT::TaskContext {
+class CallbackFailureComponent final : public RTT::TaskContext {
 public:
-  explicit RollbackComponent(bool publish_failing = true,
-                             std::string name = "rollback-component")
-      : RTT::TaskContext(std::move(name)) {
-    addProperty("OrdinaryProperty", ordinary_property);
-    addPort(stable_output);
-    if (publish_failing) {
-      addFailingPort();
-    }
+  CallbackFailureComponent() : RTT::TaskContext("callback-failure-component") {
+    addProperty("Earlier", earlier);
+    addPort(throwing_input);
   }
 
-  void addFailingPort() { addPort(failing_input); }
-
-  void addThrowingPort() { addPort(throwing_input); }
-
-  std::int32_t ordinary_property{17};
-  RTT::OutputPort<double> stable_output{"StableOutput"};
-  FailingInputPort failing_input{"FailingInput"};
+  std::int32_t earlier{17};
   ThrowingInputPort throwing_input{"ThrowingInput"};
 };
 
@@ -327,10 +294,9 @@ BOOST_FIXTURE_TEST_CASE(canonical_array_value_nodes_publish_and_remain_writable,
   BOOST_REQUIRE_MESSAGE(server.start(&error), error);
   const std::uint16_t namespace_index = *server.namespaceIndex();
 
-  RTT::opcua::ObjectModel model(server);
   CanonicalArrayComponent component;
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
 
   ::opcua::Client client;
   client.connect(server.endpointUrl());
@@ -355,13 +321,227 @@ BOOST_FIXTURE_TEST_CASE(canonical_array_value_nodes_publish_and_remain_writable,
   }));
 
   client.disconnect();
-  registration->reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(publish_component_rejects_invalid_options,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  RTT::TaskContext component("invalid-options-component");
+  {
+    RTT::opcua::ObjectModelOptions options;
+    options.operation_timeout = std::chrono::milliseconds::zero();
+    RTT::opcua::ObjectModel model(server, options);
+    BOOST_TEST(!model.publishComponent(component, &error));
+    BOOST_TEST(error == "object model operation timeout must be positive");
+    BOOST_TEST(model.lastError() == error);
+    BOOST_TEST(model.componentCount() == 0U);
+    BOOST_TEST(model.revision() == 0U);
+  }
+  {
+    RTT::opcua::ObjectModelOptions options;
+    options.port_buffer_size = 0U;
+    RTT::opcua::ObjectModel model(server, options);
+    BOOST_TEST(!model.publishComponent(component, &error));
+    BOOST_TEST(error == "object model port buffer size is out of range");
+    BOOST_TEST(model.lastError() == error);
+    BOOST_TEST(model.componentCount() == 0U);
+    BOOST_TEST(model.revision() == 0U);
+  }
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  StaticSnapshotComponent component;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  BOOST_TEST(model.componentCount() == 1U);
+  BOOST_TEST(model.revision() == 1U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_id =
+      modelNodeId(namespace_index, {"components", "arm/left"});
+  const auto lifecycle_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "lifecycleState"});
+  const auto gain_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "properties", "Gain"});
+  const auto gain_type_id =
+      modelNodeId(namespace_index,
+                  {"components", "arm/left", "properties", "Gain", "rttType"});
+  const auto status_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "attributes", "Status"});
+  const auto model_name_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "attributes", "ModelName"});
+  const auto feedback_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Feedback"});
+  const auto feedback_read_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "ports", "Feedback", "read"});
+  const auto feedback_direction_id =
+      modelNodeId(namespace_index,
+                  {"components", "arm/left", "ports", "Feedback", "direction"});
+  const auto command_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Command"});
+  const auto command_write_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "ports", "Command", "write"});
+  const auto service_property_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "motion/raw", "properties",
+       "Scale"});
+  const auto revision_id = modelNodeId(namespace_index, {"model", "revision"});
+
+  BOOST_TEST(::opcua::services::readBrowseName(client, component_id)
+                 .value()
+                 .name() == "arm/left");
+  BOOST_TEST(::opcua::services::readValue(client, lifecycle_id)
+                 .value()
+                 .to<std::string>() == "PreOperational");
+  BOOST_TEST(::opcua::services::readValue(client, gain_id)
+                 .value()
+                 .to<std::int32_t>() == 7);
+  BOOST_TEST(::opcua::services::readValue(client, gain_type_id)
+                 .value()
+                 .to<std::string>() == "Int32");
+  BOOST_REQUIRE(::opcua::services::writeValue(
+                    client, gain_id, ::opcua::Variant(std::int32_t{11}))
+                    .isGood());
+  BOOST_TEST(component.gain == 11);
+
+  BOOST_REQUIRE(::opcua::services::writeValue(
+                    client, status_id,
+                    ::opcua::Variant(std::string("active")))
+                    .isGood());
+  BOOST_TEST(component.status == "active");
+  BOOST_TEST(::opcua::services::writeValue(
+                 client, status_id, ::opcua::Variant(std::int32_t{42})) ==
+             UA_STATUSCODE_BADTYPEMISMATCH);
+  BOOST_TEST(::opcua::services::readValue(client, model_name_id)
+                 .value()
+                 .to<std::string>() == "arm-v1");
+  BOOST_TEST(::opcua::services::writeValue(
+                 client, model_name_id,
+                 ::opcua::Variant(std::string("unsafe"))) ==
+             UA_STATUSCODE_BADNOTWRITABLE);
+  BOOST_TEST(::opcua::services::readValue(client, feedback_direction_id)
+                 .value()
+                 .to<std::string>() == "output");
+  BOOST_TEST(::opcua::services::readValue(client, service_property_id)
+                 .value()
+                 .to<std::uint16_t>() == 2U);
+
+  BOOST_TEST(component.feedback.write(4.25) == RTT::WriteSuccess);
+  const auto feedback_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(feedback_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(feedback_result.outputArguments().size(), 2U);
+  BOOST_TEST(feedback_result.outputArguments()[0].to<std::string>() ==
+             "NewData");
+  BOOST_TEST(feedback_result.outputArguments()[1].to<double>() == 4.25);
+
+  const std::vector<::opcua::Variant> command_inputs{
+      ::opcua::Variant(std::uint16_t{73})};
+  const auto command_result = ::opcua::services::call(
+      client, command_id, command_write_id, command_inputs);
+  BOOST_REQUIRE(command_result.statusCode().isGood());
+  std::uint16_t commanded_value = 0U;
+  BOOST_REQUIRE(component.command.read(commanded_value) == RTT::NewData);
+  BOOST_TEST(commanded_value == 73U);
+  BOOST_TEST(::opcua::services::readValue(client, revision_id)
+                 .value()
+                 .to<std::uint64_t>() == 1U);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(publish_component_is_idempotent_for_the_same_instance,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  RTT::TaskContext component("idempotent-component");
+  std::int32_t value{7};
+  component.addProperty("Value", value);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  const std::uint64_t first_revision = model.revision();
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+
+  BOOST_TEST(first_revision == 1U);
+  BOOST_TEST(model.revision() == first_revision);
+  BOOST_TEST(model.componentCount() == 1U);
+  BOOST_TEST(error.empty());
+  BOOST_TEST(model.lastError().empty());
+
   server.stop();
 }
 
 BOOST_FIXTURE_TEST_CASE(
-    unsupported_resources_reject_the_complete_initial_component,
+    publish_component_rejects_a_different_instance_with_the_same_name,
     CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::TaskContext first("duplicate-component");
+  RTT::TaskContext second("duplicate-component");
+  std::int32_t first_value{7};
+  std::int32_t second_value{99};
+  first.addProperty("Value", first_value);
+  second.addProperty("Value", second_value);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(first, &error), error);
+  const std::uint64_t first_revision = model.revision();
+
+  BOOST_TEST(!model.publishComponent(second, &error));
+  BOOST_TEST(error.find("different RTT component instance") !=
+             std::string::npos);
+  BOOST_TEST(model.lastError() == error);
+  BOOST_TEST(model.revision() == first_revision);
+  BOOST_TEST(model.componentCount() == 1U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto value_id = modelNodeId(
+      namespace_index,
+      {"components", first.getName(), "properties", "Value"});
+  BOOST_TEST(::opcua::services::readValue(client, value_id)
+                 .value()
+                 .to<std::int32_t>() == first_value);
+
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(first, &error), error);
+  BOOST_TEST(model.revision() == first_revision);
+  BOOST_TEST(model.lastError().empty());
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
+                        CanonicalTypesFixture) {
   registerUnsupportedValueType();
 
   RTT::opcua::ServerOptions server_options;
@@ -372,20 +552,16 @@ BOOST_FIXTURE_TEST_CASE(
   const std::uint16_t namespace_index = *server.namespaceIndex();
 
   std::vector<std::string> messages;
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::milliseconds(20);
-  model_options.warning_sink = [&messages](const std::string &message) {
+  RTT::opcua::ObjectModelOptions options;
+  options.warning_sink = [&messages](const std::string &message) {
     messages.push_back(message);
   };
-  RTT::opcua::ObjectModel model(server, model_options);
-
   UnsupportedResourceComponent component;
-  const std::uint64_t revision_before = model.revision();
+  RTT::opcua::ObjectModel model(server, options);
   std::vector<RTT::opcua::UnsupportedResource> diagnostics;
-  auto registration = model.registerComponent(component, &error, &diagnostics);
-  BOOST_TEST(!registration.has_value());
+  BOOST_TEST(!model.publishComponent(component, &error, &diagnostics));
   BOOST_TEST(model.componentCount() == 0U);
-  BOOST_TEST(model.revision() == revision_before);
+  BOOST_TEST(model.revision() == 0U);
   BOOST_TEST(diagnostics.size() == 6U);
   BOOST_REQUIRE_EQUAL(diagnostics.size(), 6U);
   BOOST_TEST(model.unsupportedResources(component.getName()) == diagnostics,
@@ -393,6 +569,7 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(std::ranges::is_sorted(diagnostics));
   BOOST_TEST(messages.size() == diagnostics.size());
   BOOST_TEST(error.starts_with("strict OPC UA publication rejected component"));
+  BOOST_TEST(model.lastError() == error);
 
   const std::vector<std::pair<std::string, std::string>> expected_resources{
       {"unsupported.UnsupportedAttribute", "attribute"},
@@ -409,6 +586,8 @@ BOOST_FIXTURE_TEST_CASE(
     BOOST_TEST(diagnostic.kind == expected_resources[index].second);
     BOOST_TEST(diagnostic.type_name == kUnsupportedTypeName);
     BOOST_TEST(diagnostic.reason == kMissingProtocolReason);
+    BOOST_TEST(diagnostic.message().find(" rejected ") != std::string::npos);
+    BOOST_TEST(diagnostic.message().find(" skipped ") == std::string::npos);
     BOOST_TEST(messages[index] == diagnostic.message());
   }
 
@@ -423,266 +602,115 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(
       !::opcua::services::readBrowseName(client, supported_property_id));
 
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    failed_initial_publication_rollback_removes_every_component_node,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModel model(server);
-  RollbackComponent component;
-  const std::uint64_t revision_before = model.revision();
-  auto registration = model.registerComponent(component, &error);
-  BOOST_TEST(!registration.has_value());
-  BOOST_TEST(!error.empty());
-  BOOST_TEST(model.componentCount() == 0U);
-  BOOST_TEST(model.revision() == revision_before);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto component_root_id =
-      modelNodeId(namespace_index, {"components", component.getName()});
-  const auto ordinary_property_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "properties", "OrdinaryProperty"});
-  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
-  BOOST_TEST(!::opcua::services::readBrowseName(client, ordinary_property_id));
-
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    exceptional_initial_publication_rollback_removes_every_component_node,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModel model(server);
-  RollbackComponent component(false);
-  component.addThrowingPort();
-  const std::uint64_t revision_before = model.revision();
-  auto registration = model.registerComponent(component, &error);
-  BOOST_TEST(!registration.has_value());
-  BOOST_TEST(!error.empty());
-  BOOST_TEST(model.componentCount() == 0U);
-  BOOST_TEST(model.revision() == revision_before);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto component_root_id =
-      modelNodeId(namespace_index, {"components", component.getName()});
-  const auto ordinary_property_id =
-      modelNodeId(namespace_index, {"components", component.getName(),
-                                    "properties", "OrdinaryProperty"});
-  const auto throwing_port_id =
-      modelNodeId(namespace_index, {"components", component.getName(), "ports",
-                                    "ThrowingInput"});
-  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
-  BOOST_TEST(!::opcua::services::readBrowseName(client, ordinary_property_id));
-  BOOST_TEST(!::opcua::services::readBrowseName(client, throwing_port_id));
-
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    unsupported_runtime_candidate_preserves_the_last_good_revision,
-    CanonicalTypesFixture) {
-  registerUnsupportedValueType();
-
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::milliseconds(20);
-  RTT::opcua::ObjectModel model(server, model_options);
-  UnsupportedResourceComponent component(false);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto known_good_node_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "properties", "SupportedProperty"});
-  const auto unsupported_service_node_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "services", "unsupported"});
-  BOOST_REQUIRE(::opcua::services::readBrowseName(client, known_good_node_id));
-
-  const std::uint64_t last_good_revision = model.revision();
-  component.addUnsupportedService();
-  BOOST_REQUIRE(waitUntil([&] {
-    return !model.unsupportedResources(component.getName()).empty();
-  }));
-  BOOST_TEST(model.revision() == last_good_revision);
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readBrowseName(client, known_good_node_id)));
-  BOOST_TEST(
-      !::opcua::services::readBrowseName(client, unsupported_service_node_id));
-
   component.removeUnsupportedService();
-  BOOST_REQUIRE(waitUntil([&] {
-    return model.unsupportedResources(component.getName()).empty();
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  BOOST_TEST(model.componentCount() == 1U);
+  BOOST_TEST(model.revision() == 1U);
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+  BOOST_TEST(model.lastError().empty());
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(creation_failure_rolls_back_only_candidate_nodes,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  CollisionComponent component;
+  const auto foreign_id = modelNodeId(
+      namespace_index,
+      {"components", component.getName(), "properties", "ZCollision"});
+  bool seeded = false;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(
+        ::opcua::LocalizedText("en-US", "ForeignCollision"));
+    attributes.setValue(::opcua::Variant(std::int32_t{99}));
+    attributes.setDataType(::opcua::DataTypeId::Int32);
+    attributes.setValueRank(::opcua::ValueRank::Scalar);
+    seeded = static_cast<bool>(::opcua::services::addVariable(
+        native, ::opcua::ObjectId::ObjectsFolder, foreign_id,
+        "ForeignCollision", attributes,
+        ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::Organizes));
   }));
-  BOOST_TEST(model.revision() == last_good_revision);
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readBrowseName(client, known_good_node_id)));
+  BOOST_REQUIRE(seeded);
 
-  client.disconnect();
-  registration->reset();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    earlier_component_commit_advances_revision_before_later_rollback,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-
-  RTT::TaskContext successful("a-success");
-  std::int32_t stable_value{11};
-  successful.addProperty("Stable", stable_value);
-  RollbackComponent failing(false, "b-failure");
-  auto successful_registration = model.registerComponent(successful, &error);
-  BOOST_REQUIRE_MESSAGE(successful_registration.has_value(), error);
-  auto failing_registration = model.registerComponent(failing, &error);
-  BOOST_REQUIRE_MESSAGE(failing_registration.has_value(), error);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto successful_dynamic_id = modelNodeId(
-      namespace_index,
-      {"components", successful.getName(), "properties", "Dynamic"});
-  const auto failing_root_id =
-      modelNodeId(namespace_index, {"components", failing.getName()});
-  const auto failing_property_id = modelNodeId(
-      namespace_index,
-      {"components", failing.getName(), "properties", "OrdinaryProperty"});
-  const auto failing_port_id = modelNodeId(
-      namespace_index,
-      {"components", failing.getName(), "ports", "FailingInput"});
-  const auto stable_output_id = modelNodeId(
-      namespace_index,
-      {"components", failing.getName(), "ports", "StableOutput"});
-  const auto stable_output_read_id = modelNodeId(
-      namespace_index,
-      {"components", failing.getName(), "ports", "StableOutput", "read"});
-
-  const std::uint64_t revision_before = model.revision();
-  std::int32_t dynamic_value{23};
-  successful.addProperty("Dynamic", dynamic_value);
-  failing.provides()->doc("replacement candidate");
-  failing.addFailingPort();
-
-  const bool reconciled = model.reconcile(&error);
-  BOOST_TEST_CONTEXT(error) {
-    BOOST_TEST(!reconciled);
-    BOOST_TEST(error.find("rollback succeeded") != std::string::npos);
-  }
-  BOOST_TEST(model.revision() == revision_before + 1U);
-  BOOST_TEST(::opcua::services::readValue(client, successful_dynamic_id)
-                 .value()
-                 .to<std::int32_t>() == dynamic_value);
-  BOOST_TEST(hasObjectChild(client, failing_root_id, "Properties"));
-  BOOST_TEST(::opcua::services::readValue(client, failing_property_id)
-                 .value()
-                 .to<std::int32_t>() == failing.ordinary_property);
-  BOOST_TEST(!::opcua::services::readBrowseName(client, failing_port_id));
-  BOOST_TEST(failing.stable_output.write(9.5) == RTT::WriteSuccess);
-  const auto restored_port_result = ::opcua::services::call(
-      client, stable_output_id, stable_output_read_id, {});
-  BOOST_REQUIRE(restored_port_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(restored_port_result.outputArguments().size(), 2U);
-  BOOST_TEST(restored_port_result.outputArguments()[0].to<std::string>() ==
-             "NewData");
-  BOOST_TEST(restored_port_result.outputArguments()[1].to<double>() == 9.5);
-
-  client.disconnect();
-  failing_registration->reset();
-  successful_registration->reset();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    exceptional_replacement_restores_the_last_good_component,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RollbackComponent component(false);
-  component.provides()->doc("last good component");
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_TEST(!model.publishComponent(component, &error));
+  BOOST_TEST(error.find("BadNodeIdExists") != std::string::npos);
+  BOOST_TEST(model.lastError() == error);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
 
   ::opcua::Client client;
   client.connect(server.endpointUrl());
   const auto component_root_id =
       modelNodeId(namespace_index, {"components", component.getName()});
-  const auto ordinary_property_id =
+  const auto earlier_property_id =
       modelNodeId(namespace_index, {"components", component.getName(),
-                                    "properties", "OrdinaryProperty"});
+                                    "properties", "Earlier"});
+  const auto properties_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "properties"});
+  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_property_id));
+  BOOST_TEST(::opcua::services::readValue(client, foreign_id)
+                 .value()
+                 .to<std::int32_t>() == 99);
+  BOOST_TEST(::opcua::services::readBrowseName(client, foreign_id)
+                 .value()
+                 .name() == "ForeignCollision");
+  BOOST_TEST(hasHierarchicalChild(
+      client, ::opcua::NodeId(::opcua::ObjectId::ObjectsFolder), foreign_id));
+  BOOST_TEST(!hasHierarchicalChild(client, properties_id, foreign_id));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(callback_failure_rolls_back_every_candidate_node,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  CallbackFailureComponent component;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_TEST(!model.publishComponent(component, &error));
+  BOOST_TEST(error.find("intentional antiClone failure") != std::string::npos);
+  BOOST_TEST(model.lastError() == error);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto earlier_property_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "properties", "Earlier"});
   const auto throwing_port_id =
       modelNodeId(namespace_index, {"components", component.getName(), "ports",
                                     "ThrowingInput"});
-
-  const std::uint64_t revision_before = model.revision();
-  component.provides()->doc("replacement candidate");
-  component.addThrowingPort();
-  const bool reconciled = model.reconcile(&error);
-  BOOST_TEST_CONTEXT(error) {
-    BOOST_TEST(!reconciled);
-    BOOST_TEST(error.find("rollback succeeded") != std::string::npos);
-  }
-  BOOST_TEST(model.revision() == revision_before);
-  const auto restored_description =
-      ::opcua::services::readDescription(client, component_root_id);
-  BOOST_REQUIRE(restored_description);
-  BOOST_TEST(restored_description.value().text() == "last good component");
-  BOOST_TEST(::opcua::services::readValue(client, ordinary_property_id)
-                 .value()
-                 .to<std::int32_t>() == component.ordinary_property);
+  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_property_id));
   BOOST_TEST(!::opcua::services::readBrowseName(client, throwing_port_id));
 
   client.disconnect();
-  registration->reset();
   server.stop();
 }
 
 BOOST_FIXTURE_TEST_CASE(
-    method_argument_browse_name_does_not_grant_foreign_node_ownership,
+    resource_changes_after_publication_do_not_change_topology,
     CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
   server_options.port = unusedLoopbackPort();
@@ -691,932 +719,39 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_REQUIRE_MESSAGE(server.start(&error), error);
   const std::uint16_t namespace_index = *server.namespaceIndex();
 
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  OperationComponent component;
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  RTT::TaskContext component("static-topology-component");
+  component.provides()->doc("Original documentation");
+  std::int32_t original_value{7};
+  component.addProperty("Original", original_value);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  const std::uint64_t published_revision = model.revision();
 
-  const auto method_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "operations", "add"});
-  const auto foreign_id =
-      modelNodeId(namespace_index, {"foreign", "method-argument-impostor"});
-  bool seeded = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(
-        ::opcua::LocalizedText("en-US", "InputArguments"));
-    attributes.setValue(::opcua::Variant(std::int32_t{99}));
-    attributes.setDataType(::opcua::DataTypeId::Int32);
-    attributes.setValueRank(::opcua::ValueRank::Scalar);
-    UA_QualifiedName browse_name =
-        UA_QUALIFIEDNAME_ALLOC(0U, "InputArguments");
-    seeded = UA_Server_addVariableNode(
-                 native.handle(), foreign_id, method_id,
-                 UA_NODEID_NUMERIC(0U, UA_NS0ID_HASPROPERTY), browse_name,
-                 UA_NODEID_NUMERIC(0U, UA_NS0ID_BASEDATAVARIABLETYPE),
-                 attributes, nullptr, nullptr) == UA_STATUSCODE_GOOD;
-    UA_QualifiedName_clear(&browse_name);
-  }));
-  BOOST_REQUIRE(seeded);
-
-  component.provides()->doc("replacement candidate");
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("unowned child") != std::string::npos);
+  std::int32_t late_value{23};
+  component.addProperty("Late", late_value);
+  component.provides()->doc("Changed documentation");
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
   ::opcua::Client client;
   client.connect(server.endpointUrl());
-  BOOST_TEST(::opcua::services::readValue(client, foreign_id)
-                 .value()
-                 .to<std::int32_t>() == 99);
-
-  registration->reset();
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    replaced_published_node_id_is_not_adopted_as_component_ownership,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RTT::TaskContext component("replaced-node-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  const auto properties_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "properties"});
-  const auto replaced_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "properties", "Supported"});
-  bool replaced = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    const auto removed =
-        ::opcua::services::deleteNode(native, replaced_id, true);
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Supported"));
-    attributes.setValue(::opcua::Variant(std::int32_t{99}));
-    attributes.setDataType(::opcua::DataTypeId::Int32);
-    attributes.setValueRank(::opcua::ValueRank::Scalar);
-    replaced = removed.isGood() &&
-               static_cast<bool>(::opcua::services::addVariable(
-                   native, properties_id, replaced_id, "Supported", attributes,
-                   ::opcua::VariableTypeId::BaseDataVariableType,
-                   ::opcua::ReferenceTypeId::HasProperty));
-  }));
-  BOOST_REQUIRE(replaced);
-
-  component.provides()->doc("replacement candidate");
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("ownership") != std::string::npos);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  BOOST_TEST(::opcua::services::readValue(client, replaced_id)
-                 .value()
-                 .to<std::int32_t>() == 99);
-
-  registration->reset();
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    recreated_backend_node_id_is_not_adopted_as_component_ownership,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RTT::TaskContext component("recreated-backend-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  const auto properties_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "properties"});
-  const auto replaced_id =
+  const auto component_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto original_id =
       modelNodeId(namespace_index, {"components", component.getName(),
-                                    "properties", "Supported"});
-  bool replaced = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    const auto removed =
-        ::opcua::services::deleteNode(native, replaced_id, true);
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Supported"));
-    attributes.setValue(::opcua::Variant(std::int32_t{99}));
-    attributes.setDataType(::opcua::DataTypeId::Int32);
-    attributes.setValueRank(::opcua::ValueRank::Scalar);
-    const auto added = ::opcua::services::addVariable(
-        native, properties_id, replaced_id, "Supported", attributes,
-        ::opcua::VariableTypeId::BaseDataVariableType,
-        ::opcua::ReferenceTypeId::HasComponent);
-    if (removed.isGood() && added) {
-      ::opcua::setVariableNodeValueBackend(
-          native, replaced_id,
-          std::make_unique<FixedInt32DataSource>(std::int32_t{99}));
-      replaced = true;
-    }
-  }));
-  BOOST_REQUIRE(replaced);
-
-  const std::uint64_t revision_before = model.revision();
-  component.provides()->doc("replacement candidate");
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("ownership") != std::string::npos);
-  BOOST_TEST(model.revision() == revision_before);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  BOOST_TEST(::opcua::services::readValue(client, replaced_id)
+                                    "properties", "Original"});
+  const auto late_id = modelNodeId(namespace_index,
+                                   {"components", component.getName(),
+                                    "properties", "Late"});
+  BOOST_TEST(::opcua::services::readValue(client, original_id)
                  .value()
-                 .to<std::int32_t>() == 99);
-
-  registration->reset();
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    recreated_candidate_parent_blocks_child_creation_before_mutation,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RTT::TaskContext component("recreated-parent-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  const auto component_root_id =
-      modelNodeId(namespace_index, {"components", component.getName()});
-  const auto properties_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "properties"});
-  const auto foreign_id =
-      modelNodeId(namespace_index,
-                  {"components", component.getName(), "properties", "Foreign"});
-  const auto dynamic_id =
-      modelNodeId(namespace_index,
-                  {"components", component.getName(), "properties", "Dynamic"});
-  bool recreated = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    const auto removed =
-        ::opcua::services::deleteNode(native, properties_id, true);
-
-    ::opcua::ObjectAttributes folder_attributes;
-    folder_attributes.setDisplayName(
-        ::opcua::LocalizedText("en-US", "Properties"));
-    folder_attributes.setDescription(
-        ::opcua::LocalizedText("en-US", "foreign properties folder"));
-    const auto folder = ::opcua::services::addObject(
-        native, component_root_id, properties_id, "Properties",
-        folder_attributes, ::opcua::ObjectTypeId::BaseObjectType,
-        ::opcua::ReferenceTypeId::HasComponent);
-
-    ::opcua::VariableAttributes value_attributes;
-    value_attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
-    value_attributes.setValue(::opcua::Variant(std::int32_t{99}));
-    value_attributes.setDataType(::opcua::DataTypeId::Int32);
-    value_attributes.setValueRank(::opcua::ValueRank::Scalar);
-    const auto foreign = ::opcua::services::addVariable(
-        native, properties_id, foreign_id, "Foreign", value_attributes,
-        ::opcua::VariableTypeId::BaseDataVariableType,
-        ::opcua::ReferenceTypeId::HasComponent);
-    recreated = removed.isGood() && static_cast<bool>(folder) &&
-                static_cast<bool>(foreign);
-  }));
-  BOOST_REQUIRE(recreated);
-
-  const std::uint64_t revision_before = model.revision();
-  std::int32_t dynamic_value{23};
-  component.addProperty("Dynamic", dynamic_value);
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("ownership") != std::string::npos);
-  BOOST_TEST(model.revision() == revision_before);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto foreign_description =
-      ::opcua::services::readDescription(client, properties_id);
-  BOOST_REQUIRE(foreign_description);
-  BOOST_TEST(foreign_description.value().text() == "foreign properties folder");
-  BOOST_TEST(::opcua::services::readValue(client, foreign_id)
+                 .to<std::int32_t>() == original_value);
+  BOOST_TEST(!::opcua::services::readNodeClass(client, late_id));
+  BOOST_TEST(::opcua::services::readDescription(client, component_id)
                  .value()
-                 .to<std::int32_t>() == 99);
-  BOOST_TEST(!::opcua::services::readNodeClass(client, dynamic_id));
-
-  client.disconnect();
-  registration->reset();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    detached_method_argument_blocks_reconciliation_before_mutation,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  OperationComponent component;
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto method_id =
-      modelNodeId(namespace_index,
-                  {"components", component.getName(), "operations", "add"});
-  const auto input_arguments =
-      methodArgumentNode(client, method_id, "InputArguments");
-  BOOST_REQUIRE(input_arguments.has_value());
-  const auto lifecycle_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "lifecycleState"});
-
-  bool detached = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    detached = ::opcua::services::deleteReference(
-                   native, method_id, *input_arguments,
-                   ::opcua::ReferenceTypeId::HasProperty, true, true)
-                   .isGood();
-  }));
-  BOOST_REQUIRE(detached);
-
-  const std::uint64_t revision_before = model.revision();
-  component.provides()->doc("replacement candidate");
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("ownership") != std::string::npos);
-  BOOST_TEST(model.revision() == revision_before);
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, *input_arguments)));
-  BOOST_TEST(
-      static_cast<bool>(::opcua::services::readNodeClass(client, method_id)));
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, lifecycle_id)));
-
-  client.disconnect();
-  registration->reset();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    orphaned_method_argument_subtree_blocks_reconciliation_before_mutation,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  OperationComponent component;
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto method_id =
-      modelNodeId(namespace_index,
-                  {"components", component.getName(), "operations", "add"});
-  const auto input_arguments =
-      methodArgumentNode(client, method_id, "InputArguments");
-  BOOST_REQUIRE(input_arguments.has_value());
-  const auto foreign_id =
-      modelNodeId(namespace_index, {"foreign", "argument-descendant"});
-  const auto anchor_id =
-      modelNodeId(namespace_index, {"foreign", "argument-anchor"});
-  const auto lifecycle_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "lifecycleState"});
-
-  bool seeded = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    ::opcua::ObjectAttributes anchor_attributes;
-    anchor_attributes.setDisplayName(
-        ::opcua::LocalizedText("en-US", "ArgumentAnchor"));
-    const auto anchor = ::opcua::services::addObject(
-        native, ::opcua::ObjectId::ObjectsFolder, anchor_id, "ArgumentAnchor",
-        anchor_attributes, ::opcua::ObjectTypeId::BaseObjectType,
-        ::opcua::ReferenceTypeId::Organizes);
-
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(
-        ::opcua::LocalizedText("en-US", "ArgumentDescendant"));
-    attributes.setValue(::opcua::Variant(std::int32_t{99}));
-    attributes.setDataType(::opcua::DataTypeId::Int32);
-    attributes.setValueRank(::opcua::ValueRank::Scalar);
-    const auto added = ::opcua::services::addVariable(
-        native, *input_arguments, foreign_id, "ArgumentDescendant", attributes,
-        ::opcua::VariableTypeId::BaseDataVariableType,
-        ::opcua::ReferenceTypeId::HasComponent);
-    seeded = static_cast<bool>(anchor) && static_cast<bool>(added) &&
-             ::opcua::services::addReference(
-                 native, anchor_id, *input_arguments,
-                 ::opcua::ReferenceTypeId::HasComponent, true)
-                 .isGood() &&
-             ::opcua::services::deleteNode(native, method_id, true).isGood();
-  }));
-  BOOST_REQUIRE(seeded);
-  BOOST_REQUIRE(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, *input_arguments)));
-  BOOST_REQUIRE(
-      static_cast<bool>(::opcua::services::readNodeClass(client, foreign_id)));
-
-  const std::uint64_t revision_before = model.revision();
-  component.provides()->doc("replacement candidate");
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("unowned child") != std::string::npos);
-  BOOST_TEST(model.revision() == revision_before);
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, *input_arguments)));
-  BOOST_TEST(
-      static_cast<bool>(::opcua::services::readNodeClass(client, foreign_id)));
-  BOOST_TEST(static_cast<bool>(
-      ::opcua::services::readNodeClass(client, lifecycle_id)));
-
-  client.disconnect();
-  registration->reset();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    rollback_removes_externally_anchored_old_method_arguments,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RollbackComponent component(false);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto read_method_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "ports", "StableOutput", "read"});
-  const auto old_output_arguments =
-      methodArgumentNode(client, read_method_id, "OutputArguments");
-  BOOST_REQUIRE(old_output_arguments.has_value());
-
-  const auto anchor_id =
-      modelNodeId(namespace_index, {"foreign", "argument-anchor"});
-  bool anchored = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    ::opcua::ObjectAttributes attributes;
-    attributes.setDisplayName(
-        ::opcua::LocalizedText("en-US", "ArgumentAnchor"));
-    const auto added = ::opcua::services::addObject(
-        native, ::opcua::ObjectId::ObjectsFolder, anchor_id, "ArgumentAnchor",
-        attributes, ::opcua::ObjectTypeId::BaseObjectType,
-        ::opcua::ReferenceTypeId::Organizes);
-    anchored = static_cast<bool>(added) &&
-               ::opcua::services::addReference(
-                   native, anchor_id, *old_output_arguments,
-                   ::opcua::ReferenceTypeId::HasComponent, true)
-                   .isGood();
-  }));
-  BOOST_REQUIRE(anchored);
-
-  component.provides()->doc("replacement candidate");
-  component.addFailingPort();
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("rollback succeeded") != std::string::npos);
-  BOOST_TEST(!::opcua::services::readNodeClass(client, *old_output_arguments));
-  BOOST_TEST(
-      methodArgumentNode(client, read_method_id, "OutputArguments").has_value());
-
-  client.disconnect();
-  registration->reset();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    component_collision_rollback_preserves_the_foreign_node,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RTT::TaskContext component("collision-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-  const auto properties_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "properties"});
-  const auto foreign_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "properties", "Foreign"});
-  const auto supported_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "properties", "Supported"});
-  bool seeded = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
-    attributes.setValue(::opcua::Variant(std::int32_t{99}));
-    attributes.setDataType(::opcua::DataTypeId::Int32);
-    attributes.setValueRank(::opcua::ValueRank::Scalar);
-    seeded = static_cast<bool>(::opcua::services::addVariable(
-        native, properties_id, foreign_id, "Foreign", attributes,
-        ::opcua::VariableTypeId::BaseDataVariableType,
-        ::opcua::ReferenceTypeId::HasComponent));
-  }));
-  BOOST_REQUIRE(seeded);
-
-  const std::uint64_t revision_before = model.revision();
-  std::int32_t colliding_value{42};
-  component.provides()->doc("replacement candidate");
-  component.addProperty("Foreign", colliding_value);
-  BOOST_TEST(!model.reconcile(&error));
-  BOOST_TEST(error.find("unowned child") != std::string::npos);
-  BOOST_TEST(model.revision() == revision_before);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto foreign_value = ::opcua::services::readValue(client, foreign_id);
-  BOOST_REQUIRE(foreign_value);
-  BOOST_TEST(foreign_value.value().to<std::int32_t>() == 99);
-  BOOST_TEST(::opcua::services::readValue(client, supported_id)
-                 .value()
-                 .to<std::int32_t>() == supported_value);
-
-  registration->reset();
-  const auto retained_foreign_value =
-      ::opcua::services::readValue(client, foreign_id);
-  BOOST_REQUIRE(retained_foreign_value);
-  BOOST_TEST(retained_foreign_value.value().to<std::int32_t>() == 99);
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    refused_unregister_does_not_advance_revision_for_empty_diagnostics,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RTT::TaskContext component("refused-unregister-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  BOOST_REQUIRE_MESSAGE(model.reconcile(&error), error);
-
-  const auto properties_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "properties"});
-  const auto foreign_id =
-      modelNodeId(namespace_index,
-                  {"components", component.getName(), "properties", "Foreign"});
-  bool seeded = false;
-  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
-    attributes.setValue(::opcua::Variant(std::int32_t{99}));
-    attributes.setDataType(::opcua::DataTypeId::Int32);
-    attributes.setValueRank(::opcua::ValueRank::Scalar);
-    seeded = static_cast<bool>(::opcua::services::addVariable(
-        native, properties_id, foreign_id, "Foreign", attributes,
-        ::opcua::VariableTypeId::BaseDataVariableType,
-        ::opcua::ReferenceTypeId::HasComponent));
-  }));
-  BOOST_REQUIRE(seeded);
-
-  const std::uint64_t revision_before = model.revision();
-  registration->reset();
-  BOOST_TEST(model.revision() == revision_before);
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  BOOST_TEST(::opcua::services::readValue(client, foreign_id)
-                 .value()
-                 .to<std::int32_t>() == 99);
-
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    cancelled_unregister_retries_cleanup_before_releasing_ownership,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-  RTT::TaskContext component("cancelled-unregister-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  const auto component_id =
-      modelNodeId(namespace_index, {"components", component.getName()});
-
-  std::promise<void> blocker_started;
-  std::future<void> blocker_started_future = blocker_started.get_future();
-  std::promise<void> release_blocker;
-  std::shared_future<void> release_blocker_future =
-      release_blocker.get_future().share();
-  BOOST_REQUIRE(server.post(
-      [&blocker_started, release_blocker_future](::opcua::Server &) mutable {
-        blocker_started.set_value();
-        release_blocker_future.wait();
-      }));
-  BOOST_REQUIRE(blocker_started_future.wait_for(std::chrono::seconds(1)) ==
-                std::future_status::ready);
-
-  std::future<void> unregister =
-      std::async(std::launch::async, [&] { registration->reset(); });
-  BOOST_REQUIRE(unregister.wait_for(std::chrono::seconds(6)) ==
-                std::future_status::ready);
-  release_blocker.set_value();
-  unregister.get();
-  BOOST_REQUIRE(
-      server.invoke([](::opcua::Server &) {}, std::chrono::seconds(2), &error));
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  BOOST_TEST(!::opcua::services::readNodeClass(client, component_id));
-
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    cancelled_shutdown_retries_cleanup_before_releasing_ownership,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::seconds(30);
-  auto model = std::make_unique<RTT::opcua::ObjectModel>(server, model_options);
-  RTT::TaskContext component("cancelled-shutdown-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  auto registration = model->registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  const auto component_id =
-      modelNodeId(namespace_index, {"components", component.getName()});
-
-  std::promise<void> blocker_started;
-  std::future<void> blocker_started_future = blocker_started.get_future();
-  std::promise<void> release_blocker;
-  std::shared_future<void> release_blocker_future =
-      release_blocker.get_future().share();
-  BOOST_REQUIRE(server.post(
-      [&blocker_started, release_blocker_future](::opcua::Server &) mutable {
-        blocker_started.set_value();
-        release_blocker_future.wait();
-      }));
-  BOOST_REQUIRE(blocker_started_future.wait_for(std::chrono::seconds(1)) ==
-                std::future_status::ready);
-
-  std::future<void> shutdown = std::async(
-      std::launch::async,
-      [owned_model = std::move(model)]() mutable { owned_model.reset(); });
-  BOOST_REQUIRE(shutdown.wait_for(std::chrono::seconds(6)) ==
-                std::future_status::ready);
-  release_blocker.set_value();
-  shutdown.get();
-  BOOST_REQUIRE(
-      server.invoke([](::opcua::Server &) {}, std::chrono::seconds(2), &error));
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  BOOST_TEST(!::opcua::services::readNodeClass(client, component_id));
-
-  client.disconnect();
-  registration->reset();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    model_shutdown_preserves_unowned_component_descendants,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::TaskContext component("shutdown-collision-component");
-  std::int32_t supported_value{7};
-  component.addProperty("Supported", supported_value);
-  std::optional<RTT::opcua::ComponentRegistration> registration;
-  const auto properties_id = modelNodeId(
-      namespace_index, {"components", component.getName(), "properties"});
-  const auto foreign_id = modelNodeId(
-      namespace_index,
-      {"components", component.getName(), "properties", "Foreign"});
-
-  {
-    RTT::opcua::ObjectModelOptions model_options;
-    model_options.reconcile_interval = std::chrono::seconds(30);
-    auto model =
-        std::make_unique<RTT::opcua::ObjectModel>(server, model_options);
-    registration = model->registerComponent(component, &error);
-    BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-
-    bool seeded = false;
-    BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
-      ::opcua::VariableAttributes attributes;
-      attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
-      attributes.setValue(::opcua::Variant(std::int32_t{99}));
-      attributes.setDataType(::opcua::DataTypeId::Int32);
-      attributes.setValueRank(::opcua::ValueRank::Scalar);
-      seeded = static_cast<bool>(::opcua::services::addVariable(
-          native, properties_id, foreign_id, "Foreign", attributes,
-          ::opcua::VariableTypeId::BaseDataVariableType,
-          ::opcua::ReferenceTypeId::HasComponent));
-    }));
-    BOOST_REQUIRE(seeded);
-    model.reset();
-  }
-
-  ::opcua::Client client;
-  client.connect(server.endpointUrl());
-  const auto foreign_value = ::opcua::services::readValue(client, foreign_id);
-  BOOST_REQUIRE(foreign_value);
-  BOOST_TEST(foreign_value.value().to<std::int32_t>() == 99);
-
-  registration.reset();
-  client.disconnect();
-  server.stop();
-}
-
-BOOST_FIXTURE_TEST_CASE(
-    component_metadata_reconciles_and_registration_guards_lifetime,
-    CanonicalTypesFixture) {
-  RTT::opcua::ServerOptions server_options;
-  server_options.port = unusedLoopbackPort();
-  RTT::opcua::Server server(server_options);
-  std::string error;
-  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
-  const std::uint16_t namespace_index = *server.namespaceIndex();
-
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::milliseconds(20);
-  RTT::opcua::ObjectModel model(server, model_options);
-
-  RTT::TaskContext component("arm/left");
-  std::int32_t gain = 7;
-  std::string status = "idle";
-  std::string model_name = "arm-v1";
-  component.addProperty("Gain", gain).doc("Controller gain");
-  component.addAttribute("Status", status);
-  component.addConstant("ModelName", model_name);
-
-  RTT::OutputPort<double> feedback("Feedback");
-  RTT::InputPort<std::uint16_t> command("Command");
-  component.addPort(feedback).doc("Measured feedback");
-  component.addPort(command).doc("Requested command");
-
-  RTT::Service::shared_ptr motion =
-      RTT::Service::Create("motion/raw", &component);
-  std::uint16_t scale = 2U;
-  motion->addProperty("Scale", scale).doc("Motion scale");
-
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
-  BOOST_TEST(registration->name() == "arm/left");
+                 .text() == "Original documentation");
+  BOOST_TEST(model.revision() == published_revision);
   BOOST_TEST(model.componentCount() == 1U);
-
-  ::opcua::ClientConfig client_config;
-  client_config.setTimeout(2000U);
-  ::opcua::Client client(std::move(client_config));
-  client.connect(server.endpointUrl());
-
-  const auto component_id =
-      modelNodeId(namespace_index, {"components", "arm/left"});
-  const auto gain_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "properties", "Gain"});
-  const auto gain_type_id =
-      modelNodeId(namespace_index,
-                  {"components", "arm/left", "properties", "Gain", "rttType"});
-  const auto status_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "attributes", "Status"});
-  const auto model_name_id = modelNodeId(
-      namespace_index,
-      {"components", "arm/left", "attributes", "ModelName"});
-  const auto feedback_type_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "ports", "Feedback", "type"});
-  const auto feedback_direction_id =
-      modelNodeId(namespace_index,
-                  {"components", "arm/left", "ports", "Feedback", "direction"});
-  const auto command_direction_id =
-      modelNodeId(namespace_index,
-                  {"components", "arm/left", "ports", "Command", "direction"});
-  const auto feedback_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "ports", "Feedback"});
-  const auto feedback_read_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "ports", "Feedback", "read"});
-  const auto command_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "ports", "Command"});
-  const auto command_write_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "ports", "Command", "write"});
-  const auto service_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "services", "motion/raw"});
-  const auto revision_id = modelNodeId(namespace_index, {"model", "revision"});
-
-  const auto component_name =
-      ::opcua::services::readBrowseName(client, component_id);
-  BOOST_REQUIRE(component_name);
-  BOOST_TEST(component_name.value().name() == "arm/left");
-
-  const auto gain_value = ::opcua::services::readValue(client, gain_id);
-  BOOST_REQUIRE(gain_value);
-  BOOST_TEST(gain_value.value().to<std::int32_t>() == 7);
-  const auto gain_type = ::opcua::services::readValue(client, gain_type_id);
-  BOOST_REQUIRE(gain_type);
-  BOOST_TEST(gain_type.value().to<std::string>() == "Int32");
-  BOOST_CHECK(::opcua::services::writeValue(client, gain_id,
-                                            ::opcua::Variant(std::int32_t{11}))
-                  .isGood());
-  BOOST_TEST(gain == 11);
-
-  const auto status_value = ::opcua::services::readValue(client, status_id);
-  BOOST_REQUIRE(status_value);
-  BOOST_TEST(status_value.value().to<std::string>() == "idle");
-  BOOST_CHECK(::opcua::services::writeValue(
-                  client, status_id, ::opcua::Variant(std::string("active")))
-                  .isGood());
-  BOOST_TEST(status == "active");
-
-  const auto wrong_status_write = ::opcua::services::writeValue(
-      client, status_id, ::opcua::Variant(std::int32_t{42}));
-  BOOST_TEST(wrong_status_write.get() == UA_STATUSCODE_BADTYPEMISMATCH);
-  BOOST_TEST(status == "active");
-
-  const auto model_name_value =
-      ::opcua::services::readValue(client, model_name_id);
-  BOOST_REQUIRE(model_name_value);
-  BOOST_TEST(model_name_value.value().to<std::string>() == "arm-v1");
-  const auto model_name_write = ::opcua::services::writeValue(
-      client, model_name_id, ::opcua::Variant(std::string("unsafe")));
-  BOOST_TEST(model_name_write.get() == UA_STATUSCODE_BADNOTWRITABLE);
-  BOOST_TEST(model_name == "arm-v1");
-
-  BOOST_TEST(::opcua::services::readValue(client, feedback_type_id)
-                 .value()
-                 .to<std::string>() == "Float64");
-  BOOST_TEST(::opcua::services::readValue(client, feedback_direction_id)
-                 .value()
-                 .to<std::string>() == "output");
-  BOOST_TEST(::opcua::services::readValue(client, command_direction_id)
-                 .value()
-                 .to<std::string>() == "input");
-  BOOST_REQUIRE(::opcua::services::readBrowseName(client, service_id));
-
-  const auto empty_feedback_result =
-      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
-  BOOST_REQUIRE(empty_feedback_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(empty_feedback_result.outputArguments().size(), 2U);
-  BOOST_TEST(empty_feedback_result.outputArguments()[0].to<std::string>() ==
-             "NoData");
-
-  BOOST_TEST(feedback.write(4.25) == RTT::WriteSuccess);
-  const auto feedback_result =
-      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
-  BOOST_REQUIRE(feedback_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(feedback_result.outputArguments().size(), 2U);
-  BOOST_TEST(feedback_result.outputArguments()[0].to<std::string>() ==
-             "NewData");
-  BOOST_TEST(feedback_result.outputArguments()[1].to<double>() == 4.25);
-
-  const auto feedback_old_result =
-      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
-  BOOST_REQUIRE(feedback_old_result.statusCode().isGood());
-  BOOST_TEST(feedback_old_result.outputArguments()[0].to<std::string>() ==
-             "OldData");
-  BOOST_TEST(feedback_old_result.outputArguments()[1].to<double>() == 4.25);
-
-  const std::vector<::opcua::Variant> wrong_command_inputs{
-      ::opcua::Variant(std::string("not-an-integer"))};
-  const auto wrong_command_result = ::opcua::services::call(
-      client, command_id, command_write_id, wrong_command_inputs);
-  BOOST_TEST(wrong_command_result.statusCode().isBad());
-  std::uint16_t commanded_value = 0U;
-  BOOST_TEST(command.read(commanded_value) == RTT::NoData);
-
-  const std::vector<::opcua::Variant> command_inputs{
-      ::opcua::Variant(std::uint16_t{73})};
-  const auto command_result = ::opcua::services::call(
-      client, command_id, command_write_id, command_inputs);
-  BOOST_REQUIRE(command_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(command_result.outputArguments().size(), 1U);
-  BOOST_TEST(command_result.outputArguments()[0].to<std::string>() ==
-             "WriteSuccess");
-  BOOST_TEST(command.read(commanded_value) == RTT::NewData);
-  BOOST_TEST(commanded_value == 73U);
-
-  const std::uint64_t first_revision =
-      ::opcua::services::readValue(client, revision_id)
-          .value()
-          .to<std::uint64_t>();
-  BOOST_TEST(first_revision > 0U);
-
-  component.provides()->doc("Updated component documentation");
-  BOOST_REQUIRE_MESSAGE(model.reconcile(&error), error);
-  BOOST_TEST(model.revision() > first_revision);
-  BOOST_TEST(feedback.write(8.25) == RTT::WriteSuccess);
-  const auto reconciled_feedback_result =
-      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
-  BOOST_REQUIRE(reconciled_feedback_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(reconciled_feedback_result.outputArguments().size(), 2U);
-  BOOST_TEST(
-      reconciled_feedback_result.outputArguments()[0].to<std::string>() ==
-      "NewData");
-  BOOST_TEST(reconciled_feedback_result.outputArguments()[1].to<double>() ==
-             8.25);
-
-  std::int32_t dynamic_value = 23;
-  RTT::Property<std::int32_t> &dynamic =
-      component.addProperty("Dynamic", dynamic_value);
-  const auto dynamic_id = modelNodeId(
-      namespace_index, {"components", "arm/left", "properties", "Dynamic"});
-  BOOST_REQUIRE(waitUntil([&] {
-    const auto value = ::opcua::services::readValue(client, dynamic_id);
-    return static_cast<bool>(value) && value.value().to<std::int32_t>() == 23;
-  }));
-  BOOST_TEST(::opcua::services::readValue(client, revision_id)
-                 .value()
-                 .to<std::uint64_t>() > first_revision);
-
-  BOOST_REQUIRE(component.provides()->removeProperty(dynamic));
-  BOOST_REQUIRE(waitUntil(
-      [&] { return !::opcua::services::readValue(client, dynamic_id); }));
-
-  registration->reset();
-  BOOST_TEST(!registration->active());
-  BOOST_TEST(model.componentCount() == 0U);
-  BOOST_TEST(!::opcua::services::readBrowseName(client, component_id));
-  BOOST_TEST(!feedback.connected());
-  BOOST_TEST(!command.connected());
 
   client.disconnect();
   server.stop();
@@ -1632,14 +767,11 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_REQUIRE_MESSAGE(server.start(&error), error);
   const std::uint16_t namespace_index = *server.namespaceIndex();
 
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::milliseconds(10);
-  model_options.operation_timeout = std::chrono::milliseconds(30);
-  RTT::opcua::ObjectModel model(server, model_options);
-
+  RTT::opcua::ObjectModelOptions options;
+  options.operation_timeout = std::chrono::milliseconds(30);
   OperationComponent component;
-  auto registration = model.registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  RTT::opcua::ObjectModel model(server, options);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
 
   ::opcua::ClientConfig client_config;
   client_config.setTimeout(2000U);
@@ -1650,39 +782,31 @@ BOOST_FIXTURE_TEST_CASE(
       modelNodeId(namespace_index, {"components", "calculator", "operations"});
   const auto add_id = modelNodeId(
       namespace_index, {"components", "calculator", "operations", "add"});
-  const auto increment_id = modelNodeId(
-      namespace_index, {"components", "calculator", "operations", "increment"});
+  const auto increment_id =
+      modelNodeId(namespace_index,
+                  {"components", "calculator", "operations", "increment"});
   const auto add_input_types_id =
       modelNodeId(namespace_index, {"components", "calculator", "operations",
                                     "add", "rttInputTypes"});
-  const auto add_output_types_id =
-      modelNodeId(namespace_index, {"components", "calculator", "operations",
-                                    "add", "rttOutputTypes"});
   const auto add_output_sources_id =
       modelNodeId(namespace_index, {"components", "calculator", "operations",
                                     "add", "rttOutputSources"});
-  const auto increment_output_sources_id =
-      modelNodeId(namespace_index, {"components", "calculator", "operations",
-                                    "increment", "rttOutputSources"});
-  const auto owner_thread_id =
-      modelNodeId(namespace_index,
-                  {"components", "calculator", "operations", "onOwnerThread"});
-  const auto global_engine_id =
-      modelNodeId(namespace_index,
-                  {"components", "calculator", "operations", "onGlobalEngine"});
+  const auto increment_output_sources_id = modelNodeId(
+      namespace_index, {"components", "calculator", "operations", "increment",
+                        "rttOutputSources"});
+  const auto owner_thread_id = modelNodeId(
+      namespace_index,
+      {"components", "calculator", "operations", "onOwnerThread"});
+  const auto global_engine_id = modelNodeId(
+      namespace_index,
+      {"components", "calculator", "operations", "onGlobalEngine"});
   const auto slow_id = modelNodeId(
       namespace_index, {"components", "calculator", "operations", "slow"});
 
-  const std::vector<::opcua::Variant> add_inputs{
-      ::opcua::Variant(std::int32_t{20}), ::opcua::Variant(std::int32_t{22})};
   BOOST_TEST(::opcua::services::readValue(client, add_input_types_id)
                  .value()
                  .to<std::vector<std::string>>() ==
              std::vector<std::string>({"Int32", "Int32"}));
-  BOOST_TEST(::opcua::services::readValue(client, add_output_types_id)
-                 .value()
-                 .to<std::vector<std::string>>() ==
-             std::vector<std::string>({"Int32"}));
   BOOST_TEST(::opcua::services::readValue(client, add_output_sources_id)
                  .value()
                  .to<std::vector<std::int32_t>>() ==
@@ -1691,10 +815,12 @@ BOOST_FIXTURE_TEST_CASE(
                  .value()
                  .to<std::vector<std::int32_t>>() ==
              std::vector<std::int32_t>({0}));
+
+  const std::vector<::opcua::Variant> add_inputs{
+      ::opcua::Variant(std::int32_t{20}), ::opcua::Variant(std::int32_t{22})};
   const auto add_result =
       ::opcua::services::call(client, operations_id, add_id, add_inputs);
   BOOST_REQUIRE(add_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(add_result.outputArguments().size(), 1U);
   BOOST_TEST(add_result.outputArguments()[0].to<std::int32_t>() == 42);
 
   const std::vector<::opcua::Variant> increment_inputs{
@@ -1702,43 +828,32 @@ BOOST_FIXTURE_TEST_CASE(
   const auto increment_result = ::opcua::services::call(
       client, operations_id, increment_id, increment_inputs);
   BOOST_REQUIRE(increment_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(increment_result.outputArguments().size(), 1U);
   BOOST_TEST(increment_result.outputArguments()[0].to<std::int32_t>() == 5);
 
   const auto owner_thread_result =
       ::opcua::services::call(client, operations_id, owner_thread_id, {});
   BOOST_REQUIRE(owner_thread_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(owner_thread_result.outputArguments().size(), 1U);
   BOOST_TEST(owner_thread_result.outputArguments()[0].to<bool>());
-
   const auto global_engine_result =
       ::opcua::services::call(client, operations_id, global_engine_id, {});
   BOOST_REQUIRE(global_engine_result.statusCode().isGood());
-  BOOST_REQUIRE_EQUAL(global_engine_result.outputArguments().size(), 1U);
   BOOST_TEST(global_engine_result.outputArguments()[0].to<bool>());
 
   const std::vector<::opcua::Variant> wrong_inputs{
       ::opcua::Variant(std::string("not-an-integer")),
       ::opcua::Variant(std::int32_t{2})};
-  const auto wrong_result =
-      ::opcua::services::call(client, operations_id, add_id, wrong_inputs);
-  BOOST_TEST(wrong_result.statusCode() == UA_STATUSCODE_BADINVALIDARGUMENT);
+  BOOST_TEST(::opcua::services::call(client, operations_id, add_id, wrong_inputs)
+                 .statusCode() == UA_STATUSCODE_BADINVALIDARGUMENT);
 
   const std::vector<::opcua::Variant> slow_inputs{
       ::opcua::Variant(std::uint32_t{120})};
-  const auto started_at = std::chrono::steady_clock::now();
   const auto slow_result =
       ::opcua::services::call(client, operations_id, slow_id, slow_inputs);
-  const auto elapsed = std::chrono::steady_clock::now() - started_at;
   BOOST_TEST(slow_result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
-  BOOST_TEST(elapsed < std::chrono::milliseconds(100));
   BOOST_TEST(model.pendingOperationCount() == 1U);
-  BOOST_REQUIRE(waitUntil([&] {
-    return component.slow_completed.load() &&
-           model.pendingOperationCount() == 0U;
-  }));
+  BOOST_REQUIRE(waitUntil([&] { return component.slow_completed.load(); }));
+  BOOST_TEST(model.pendingOperationCount() == 1U);
 
-  registration->reset();
   client.disconnect();
   server.stop();
 }
@@ -1753,20 +868,16 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_REQUIRE_MESSAGE(server.start(&error), error);
   const std::uint16_t namespace_index = *server.namespaceIndex();
 
-  RTT::opcua::ObjectModelOptions model_options;
-  model_options.reconcile_interval = std::chrono::milliseconds(10);
-  model_options.operation_timeout = std::chrono::milliseconds(30);
-  auto model = std::make_unique<RTT::opcua::ObjectModel>(server, model_options);
-
+  RTT::opcua::ObjectModelOptions options;
+  options.operation_timeout = std::chrono::milliseconds(30);
   OperationComponent component;
-  auto registration = model->registerComponent(component, &error);
-  BOOST_REQUIRE_MESSAGE(registration.has_value(), error);
+  auto model = std::make_unique<RTT::opcua::ObjectModel>(server, options);
+  BOOST_REQUIRE_MESSAGE(model->publishComponent(component, &error), error);
 
   ::opcua::ClientConfig client_config;
   client_config.setTimeout(2000U);
   ::opcua::Client client(std::move(client_config));
   client.connect(server.endpointUrl());
-
   const auto operations_id =
       modelNodeId(namespace_index, {"components", "calculator", "operations"});
   const auto slow_id = modelNodeId(
@@ -1781,9 +892,6 @@ BOOST_FIXTURE_TEST_CASE(
 
   client.disconnect();
   model.reset();
-
   BOOST_TEST(component.slow_completed.load());
-  BOOST_TEST(!registration->active());
-  registration->reset();
   server.stop();
 }

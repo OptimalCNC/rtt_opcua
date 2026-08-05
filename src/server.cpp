@@ -261,23 +261,7 @@ public:
   std::mutex tasks_mutex;
   std::deque<std::shared_ptr<QueuedTask>> tasks;
 
-  std::mutex retained_owners_mutex;
-  std::vector<std::shared_ptr<void>> retained_owners;
-
-  void retainUntilStopped(std::shared_ptr<void> owner) {
-    if (!owner) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(retained_owners_mutex);
-    retained_owners.push_back(std::move(owner));
-  }
-
 private:
-  void releaseRetainedOwners() {
-    std::lock_guard<std::mutex> lock(retained_owners_mutex);
-    retained_owners.clear();
-  }
-
   void run() noexcept {
     {
       std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -356,7 +340,6 @@ private:
       drainTasks();
       native_server->stop();
       native_server.reset();
-      releaseRetainedOwners();
       {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         type_registry.reset();
@@ -366,7 +349,6 @@ private:
       current_state.store(ServerState::stopped);
     } catch (...) {
       native_server.reset();
-      releaseRetainedOwners();
       {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         type_registry.reset();
@@ -509,10 +491,6 @@ bool Server::post(Task task) {
 bool Server::invoke(Task task, std::chrono::milliseconds timeout,
                     std::string *error) {
   return impl_->invoke(std::move(task), timeout, error);
-}
-
-void Server::retainUntilStopped(std::shared_ptr<void> owner) {
-  impl_->retainUntilStopped(std::move(owner));
 }
 
 } // namespace RTT::opcua
