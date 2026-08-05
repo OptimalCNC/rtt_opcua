@@ -1159,6 +1159,10 @@ bool rollbackCreatedNodes(::opcua::Server &native,
                           const std::vector<CreatedNode> &ledger,
                           std::string *error) {
   bool complete = true;
+  std::set<::opcua::NodeId> created_ids;
+  for (const CreatedNode &created : ledger) {
+    created_ids.insert(created.id);
+  }
   std::set<::opcua::NodeId> recursively_removed;
   for (auto created = ledger.rbegin(); created != ledger.rend(); ++created) {
     std::set<::opcua::NodeId> descendants;
@@ -1168,6 +1172,9 @@ bool rollbackCreatedNodes(::opcua::Server &native,
     }
 
     for (const auto &descendant : descendants) {
+      if (!created_ids.contains(descendant)) {
+        continue;
+      }
       const ::opcua::StatusCode descendant_result =
           ::opcua::services::deleteNode(native, descendant, true);
       if (descendant_result.isBad() &&
@@ -1197,7 +1204,6 @@ bool rollbackCreatedNodes(::opcua::Server &native,
       complete = false;
       continue;
     }
-    recursively_removed.insert(descendants.begin(), descendants.end());
   }
   return complete;
 }
@@ -1212,7 +1218,7 @@ struct PublishedComponent {
         nodes(std::move(snapshot_nodes)),
         snapshot_fingerprint(std::move(fingerprint)) {}
 
-  PublishedComponent(PublishedComponent &&) noexcept = default;
+  PublishedComponent(PublishedComponent &&) = default;
   PublishedComponent &operator=(PublishedComponent &&) = delete;
   PublishedComponent(const PublishedComponent &) = delete;
   PublishedComponent &operator=(const PublishedComponent &) = delete;

@@ -36,6 +36,7 @@
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -89,19 +90,34 @@ bool waitUntil(const std::function<bool()> &predicate,
                          RTT::opcua::makeNodePath(path_segments));
 }
 
-bool hasHierarchicalChild(::opcua::Client &client,
-                          const ::opcua::NodeId &parent,
-                          const ::opcua::NodeId &child) {
+bool hasHierarchicalReference(::opcua::Client &client,
+                              const ::opcua::NodeId &source,
+                              const ::opcua::NodeId &target,
+                              ::opcua::BrowseDirection direction) {
   const ::opcua::BrowseDescription browse(
-      parent, ::opcua::BrowseDirection::Forward,
-      ::opcua::ReferenceTypeId::HierarchicalReferences, true,
+      source, direction, ::opcua::ReferenceTypeId::HierarchicalReferences, true,
       ::opcua::NodeClass::Unspecified, ::opcua::BrowseResultMask::All);
   const auto result = ::opcua::services::browseAll(client, browse);
   return result &&
          std::ranges::any_of(result.value(), [&](const auto &reference) {
            return reference.nodeId().isLocal() &&
-                  reference.nodeId().nodeId() == child;
+                  reference.nodeId().nodeId() == target;
          });
+}
+
+std::size_t generatedMethodArgumentCount(::opcua::Server &server) {
+  std::size_t count = 0U;
+  const auto visitor = [](void *context, const UA_Node *node) {
+    const std::string_view name(
+        reinterpret_cast<const char *>(node->head.browseName.name.data),
+        node->head.browseName.name.length);
+    if (name == "InputArguments" || name == "OutputArguments") {
+      ++*static_cast<std::size_t *>(context);
+    }
+  };
+  UA_ServerConfig *config = UA_Server_getConfig(server.handle());
+  config->nodestore.iterate(config->nodestore.context, visitor, &count);
+  return count;
 }
 
 struct CanonicalTypesFixture {
@@ -283,6 +299,59 @@ public:
   ThrowingInputPort throwing_input{"ThrowingInput"};
 };
 
+class ReentrantForeignReferencePort final
+    : public RTT::InputPort<std::int32_t> {
+public:
+  ReentrantForeignReferencePort(RTT::opcua::Server &server,
+                                ::opcua::NodeId candidate_parent,
+                                ::opcua::NodeId foreign_id)
+      : RTT::InputPort<std::int32_t>("ReentrantInput"), server_(server),
+        candidate_parent_(std::move(candidate_parent)),
+        foreign_id_(std::move(foreign_id)) {}
+
+  RTT::base::PortInterface *antiClone() const override {
+    std::string error;
+    bool linked = false;
+    const bool invoked = server_.invoke(
+        [&](::opcua::Server &native) {
+          linked = ::opcua::services::addReference(
+                       native, candidate_parent_, foreign_id_,
+                       ::opcua::ReferenceTypeId::HasComponent, true)
+                       .isGood();
+        },
+        std::chrono::seconds(5), &error);
+    if (!invoked || !linked) {
+      throw std::runtime_error("failed to add reentrant foreign reference: " +
+                               error);
+    }
+    throw std::runtime_error("intentional reentrant antiClone failure");
+  }
+
+private:
+  RTT::opcua::Server &server_;
+  ::opcua::NodeId candidate_parent_;
+  ::opcua::NodeId foreign_id_;
+};
+
+class ReentrantRollbackComponent final : public RTT::TaskContext {
+public:
+  ReentrantRollbackComponent(RTT::opcua::Server &server,
+                             std::uint16_t namespace_index,
+                             ::opcua::NodeId foreign_id)
+      : RTT::TaskContext("reentrant-rollback-component"),
+        input(server,
+              modelNodeId(
+                  namespace_index,
+                  {"components", "reentrant-rollback-component", "ports"}),
+              std::move(foreign_id)) {
+    addProperty("Earlier", earlier);
+    addPort(input);
+  }
+
+  std::int32_t earlier{17};
+  ReentrantForeignReferencePort input;
+};
+
 } // namespace
 
 BOOST_FIXTURE_TEST_CASE(canonical_array_value_nodes_publish_and_remain_writable,
@@ -388,6 +457,8 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   const auto model_name_id = modelNodeId(
       namespace_index,
       {"components", "arm/left", "attributes", "ModelName"});
+  const auto feedback_type_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Feedback", "type"});
   const auto feedback_id = modelNodeId(
       namespace_index, {"components", "arm/left", "ports", "Feedback"});
   const auto feedback_read_id = modelNodeId(
@@ -396,6 +467,9 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   const auto feedback_direction_id =
       modelNodeId(namespace_index,
                   {"components", "arm/left", "ports", "Feedback", "direction"});
+  const auto command_direction_id =
+      modelNodeId(namespace_index,
+                  {"components", "arm/left", "ports", "Command", "direction"});
   const auto command_id = modelNodeId(
       namespace_index, {"components", "arm/left", "ports", "Command"});
   const auto command_write_id = modelNodeId(
@@ -439,12 +513,25 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                  client, model_name_id,
                  ::opcua::Variant(std::string("unsafe"))) ==
              UA_STATUSCODE_BADNOTWRITABLE);
+  BOOST_TEST(::opcua::services::readValue(client, feedback_type_id)
+                 .value()
+                 .to<std::string>() == "Float64");
   BOOST_TEST(::opcua::services::readValue(client, feedback_direction_id)
                  .value()
                  .to<std::string>() == "output");
+  BOOST_TEST(::opcua::services::readValue(client, command_direction_id)
+                 .value()
+                 .to<std::string>() == "input");
   BOOST_TEST(::opcua::services::readValue(client, service_property_id)
                  .value()
                  .to<std::uint16_t>() == 2U);
+
+  const auto empty_feedback_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(empty_feedback_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(empty_feedback_result.outputArguments().size(), 2U);
+  BOOST_TEST(empty_feedback_result.outputArguments()[0].to<std::string>() ==
+             "NoData");
 
   BOOST_TEST(component.feedback.write(4.25) == RTT::WriteSuccess);
   const auto feedback_result =
@@ -455,12 +542,30 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
              "NewData");
   BOOST_TEST(feedback_result.outputArguments()[1].to<double>() == 4.25);
 
+  const auto feedback_old_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(feedback_old_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(feedback_old_result.outputArguments().size(), 2U);
+  BOOST_TEST(feedback_old_result.outputArguments()[0].to<std::string>() ==
+             "OldData");
+  BOOST_TEST(feedback_old_result.outputArguments()[1].to<double>() == 4.25);
+
+  const std::vector<::opcua::Variant> wrong_command_inputs{
+      ::opcua::Variant(std::string("not-an-integer"))};
+  const auto wrong_command_result = ::opcua::services::call(
+      client, command_id, command_write_id, wrong_command_inputs);
+  BOOST_TEST(wrong_command_result.statusCode().isBad());
+  std::uint16_t commanded_value = 0U;
+  BOOST_TEST(component.command.read(commanded_value) == RTT::NoData);
+
   const std::vector<::opcua::Variant> command_inputs{
       ::opcua::Variant(std::uint16_t{73})};
   const auto command_result = ::opcua::services::call(
       client, command_id, command_write_id, command_inputs);
   BOOST_REQUIRE(command_result.statusCode().isGood());
-  std::uint16_t commanded_value = 0U;
+  BOOST_REQUIRE_EQUAL(command_result.outputArguments().size(), 1U);
+  BOOST_TEST(command_result.outputArguments()[0].to<std::string>() ==
+             "WriteSuccess");
   BOOST_REQUIRE(component.command.read(commanded_value) == RTT::NewData);
   BOOST_TEST(commanded_value == 73U);
   BOOST_TEST(::opcua::services::readValue(client, revision_id)
@@ -642,6 +747,11 @@ BOOST_FIXTURE_TEST_CASE(creation_failure_rolls_back_only_candidate_nodes,
   }));
   BOOST_REQUIRE(seeded);
 
+  std::size_t argument_nodes_before = 0U;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    argument_nodes_before = generatedMethodArgumentCount(native);
+  }));
+
   RTT::opcua::ObjectModel model(server);
   BOOST_TEST(!model.publishComponent(component, &error));
   BOOST_TEST(error.find("BadNodeIdExists") != std::string::npos);
@@ -656,16 +766,82 @@ BOOST_FIXTURE_TEST_CASE(creation_failure_rolls_back_only_candidate_nodes,
   const auto earlier_property_id =
       modelNodeId(namespace_index, {"components", component.getName(),
                                     "properties", "Earlier"});
+  const auto echo_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "operations", "echo"});
   BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
   BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_property_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, echo_id));
   BOOST_TEST(::opcua::services::readValue(client, foreign_id)
                  .value()
                  .to<std::int32_t>() == 99);
   BOOST_TEST(::opcua::services::readBrowseName(client, foreign_id)
                  .value()
                  .name() == "ForeignCollision");
-  BOOST_TEST(hasHierarchicalChild(
-      client, ::opcua::NodeId(::opcua::ObjectId::ObjectsFolder), foreign_id));
+  BOOST_TEST(hasHierarchicalReference(
+      client, ::opcua::NodeId(::opcua::ObjectId::ObjectsFolder), foreign_id,
+      ::opcua::BrowseDirection::Forward));
+  std::size_t argument_nodes_after = 0U;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    argument_nodes_after = generatedMethodArgumentCount(native);
+  }));
+  BOOST_TEST(argument_nodes_after == argument_nodes_before);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(rollback_never_deletes_a_reentrant_foreign_descendant,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+  const ::opcua::NodeId foreign_id(namespace_index, "foreign-reentrant-node");
+  bool seeded = false;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
+    attributes.setValue(::opcua::Variant(std::int32_t{99}));
+    attributes.setDataType(::opcua::DataTypeId::Int32);
+    attributes.setValueRank(::opcua::ValueRank::Scalar);
+    seeded = static_cast<bool>(::opcua::services::addVariable(
+        native, ::opcua::ObjectId::ObjectsFolder, foreign_id, "Foreign",
+        attributes, ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::Organizes));
+  }));
+  BOOST_REQUIRE(seeded);
+
+  ReentrantRollbackComponent component(server, namespace_index, foreign_id);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_TEST(!model.publishComponent(component, &error));
+  BOOST_TEST(error.find("intentional reentrant antiClone failure") !=
+             std::string::npos);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto earlier_property_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "properties", "Earlier"});
+  const auto ports_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "ports"});
+  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_property_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, ports_id));
+  BOOST_TEST(::opcua::services::readValue(client, foreign_id)
+                 .value()
+                 .to<std::int32_t>() == 99);
+  BOOST_TEST(hasHierarchicalReference(
+      client, ::opcua::NodeId(::opcua::ObjectId::ObjectsFolder), foreign_id,
+      ::opcua::BrowseDirection::Forward));
+  BOOST_TEST(!hasHierarchicalReference(client, foreign_id, ports_id,
+                                       ::opcua::BrowseDirection::Inverse));
 
   client.disconnect();
   server.stop();
@@ -785,6 +961,9 @@ BOOST_FIXTURE_TEST_CASE(
   const auto add_input_types_id =
       modelNodeId(namespace_index, {"components", "calculator", "operations",
                                     "add", "rttInputTypes"});
+  const auto add_output_types_id =
+      modelNodeId(namespace_index, {"components", "calculator", "operations",
+                                    "add", "rttOutputTypes"});
   const auto add_output_sources_id =
       modelNodeId(namespace_index, {"components", "calculator", "operations",
                                     "add", "rttOutputSources"});
@@ -804,6 +983,10 @@ BOOST_FIXTURE_TEST_CASE(
                  .value()
                  .to<std::vector<std::string>>() ==
              std::vector<std::string>({"Int32", "Int32"}));
+  BOOST_TEST(::opcua::services::readValue(client, add_output_types_id)
+                 .value()
+                 .to<std::vector<std::string>>() ==
+             std::vector<std::string>({"Int32"}));
   BOOST_TEST(::opcua::services::readValue(client, add_output_sources_id)
                  .value()
                  .to<std::vector<std::int32_t>>() ==
@@ -844,9 +1027,12 @@ BOOST_FIXTURE_TEST_CASE(
 
   const std::vector<::opcua::Variant> slow_inputs{
       ::opcua::Variant(std::uint32_t{120})};
+  const auto started_at = std::chrono::steady_clock::now();
   const auto slow_result =
       ::opcua::services::call(client, operations_id, slow_id, slow_inputs);
+  const auto elapsed = std::chrono::steady_clock::now() - started_at;
   BOOST_TEST(slow_result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
+  BOOST_TEST(elapsed < std::chrono::milliseconds(100));
   BOOST_TEST(model.pendingOperationCount() == 1U);
   BOOST_REQUIRE(waitUntil([&] { return component.slow_completed.load(); }));
   BOOST_TEST(model.pendingOperationCount() == 1U);
