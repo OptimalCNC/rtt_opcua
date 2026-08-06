@@ -22,9 +22,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -39,6 +41,52 @@ struct ServerFixtureValue {
   std::int32_t value;
 };
 
+class StartupGate final {
+public:
+  void arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+    entered_ = false;
+    released_ = false;
+  }
+
+  void waitIfArmed() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!armed_) {
+      return;
+    }
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [this] { return released_; });
+    armed_ = false;
+  }
+
+  bool waitUntilEntered(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, timeout, [this] { return entered_; });
+  }
+
+  void release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    condition_.notify_all();
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool armed_{false};
+  bool entered_{false};
+  bool released_{false};
+};
+
+StartupGate &startupGate() {
+  static StartupGate gate;
+  return gate;
+}
+
 struct ServerDatatypeFixture {
   ServerDatatypeFixture() {
     const RTT::opcua::LogicalDataTypeId id{
@@ -50,6 +98,7 @@ struct ServerDatatypeFixture {
     definition.schema_fingerprint = "server-fixture-value-v1";
     definition.materialize =
         [id](const RTT::opcua::DataTypeFactoryContext &context) {
+          startupGate().waitIfArmed();
           return ::opcua::DataTypeBuilder<ServerFixtureValue>::createStructure(
                      "ServerFixtureValue", context.nodeId(id),
                      {context.namespaceIndex(id.namespace_uri),
@@ -125,6 +174,40 @@ BOOST_AUTO_TEST_CASE(invalid_server_options_fail_without_starting_a_thread) {
   BOOST_TEST(!server.isRunning());
   server.stop();
   BOOST_CHECK(server.state() == RTT::opcua::ServerState::stopped);
+}
+
+BOOST_AUTO_TEST_CASE(concurrent_start_calls_share_one_startup) {
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+
+  StartupGate &gate = startupGate();
+  gate.arm();
+  std::string first_error;
+  std::future<bool> first = std::async(
+      std::launch::async, [&] { return server.start(&first_error); });
+  const bool first_entered = gate.waitUntilEntered(std::chrono::seconds(1));
+
+  std::string second_error;
+  std::future<bool> second = std::async(
+      std::launch::async, [&] { return server.start(&second_error); });
+  gate.release();
+
+  const bool second_completed_without_stop =
+      second.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+  if (!second_completed_without_stop) {
+    server.stop();
+  }
+  const bool first_result = first.get();
+  const bool second_result = second.get();
+  const bool running_after_both_calls = server.isRunning();
+  server.stop();
+
+  BOOST_REQUIRE(first_entered);
+  BOOST_TEST(second_completed_without_stop);
+  BOOST_TEST(first_result, first_error);
+  BOOST_TEST(second_result, second_error);
+  BOOST_TEST(running_after_both_calls);
 }
 
 BOOST_AUTO_TEST_CASE(loopback_server_exposes_namespace_and_serialized_tasks) {

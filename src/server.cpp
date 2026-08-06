@@ -100,6 +100,7 @@ public:
   ~Impl() { stop(); }
 
   bool start(std::string *output_error) {
+    std::lock_guard<std::mutex> transition_lock(transition_mutex);
     if (const auto validation_error = validateServerOptions(options)) {
       setFailure(*validation_error);
       copyError(output_error);
@@ -108,6 +109,7 @@ public:
 
     std::unique_lock<std::mutex> lock(lifecycle_mutex);
     if (current_state.load() == ServerState::running) {
+      assignError(output_error, {});
       return true;
     }
     if (server_thread.joinable()) {
@@ -147,6 +149,7 @@ public:
   }
 
   void stop() noexcept {
+    std::lock_guard<std::mutex> transition_lock(transition_mutex);
     std::thread thread_to_join;
     {
       std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -249,6 +252,7 @@ public:
   std::atomic<ServerState> current_state{ServerState::stopped};
   std::atomic<std::uint16_t> namespace_index{0U};
 
+  std::mutex transition_mutex;
   mutable std::mutex lifecycle_mutex;
   std::condition_variable lifecycle_condition;
   std::string current_error;
