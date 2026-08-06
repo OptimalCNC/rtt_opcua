@@ -847,6 +847,67 @@ BOOST_FIXTURE_TEST_CASE(rollback_never_deletes_a_reentrant_foreign_descendant,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(rollback_never_deletes_a_reentrant_foreign_sole_child,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+  const ::opcua::NodeId foreign_id(namespace_index,
+                                   "foreign-reentrant-sole-child");
+  bool seeded_and_orphaned = false;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
+    attributes.setValue(::opcua::Variant(std::int32_t{99}));
+    attributes.setDataType(::opcua::DataTypeId::Int32);
+    attributes.setValueRank(::opcua::ValueRank::Scalar);
+    const auto added = ::opcua::services::addVariable(
+        native, ::opcua::ObjectId::ObjectsFolder, foreign_id, "Foreign",
+        attributes, ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::Organizes);
+    if (!added) {
+      return;
+    }
+    seeded_and_orphaned =
+        ::opcua::services::deleteReference(
+            native, ::opcua::NodeId(::opcua::ObjectId::ObjectsFolder),
+            foreign_id, ::opcua::NodeId(::opcua::ReferenceTypeId::Organizes),
+            true, true)
+            .isGood();
+  }));
+  BOOST_REQUIRE(seeded_and_orphaned);
+
+  ReentrantRollbackComponent component(server, namespace_index, foreign_id);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_TEST(!model.publishComponent(component, &error));
+  BOOST_TEST(error.find("intentional reentrant antiClone failure") !=
+             std::string::npos);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_root_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto earlier_property_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "properties", "Earlier"});
+  const auto ports_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "ports"});
+  BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_property_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, ports_id));
+  const auto foreign_value = ::opcua::services::readValue(client, foreign_id);
+  BOOST_REQUIRE(static_cast<bool>(foreign_value));
+  BOOST_TEST(foreign_value.value().to<std::int32_t>() == 99);
+
+  client.disconnect();
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(callback_failure_rolls_back_every_candidate_node,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;

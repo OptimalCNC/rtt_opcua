@@ -37,6 +37,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -1155,6 +1156,53 @@ bool collectDescendantNodeIds(::opcua::Server &native,
   return true;
 }
 
+struct ForeignHierarchicalReference {
+  ::opcua::NodeId source;
+  ::opcua::NodeId target;
+  ::opcua::NodeId type;
+};
+
+bool detachForeignHierarchicalReferences(
+    ::opcua::Server &native, const std::set<::opcua::NodeId> &created_ids,
+    std::string *error) {
+  std::vector<ForeignHierarchicalReference> foreign_references;
+  for (const ::opcua::NodeId &source : created_ids) {
+    const ::opcua::BrowseDescription browse(
+        source, ::opcua::BrowseDirection::Forward,
+        ::opcua::ReferenceTypeId::HierarchicalReferences, true,
+        ::opcua::NodeClass::Unspecified, ::opcua::BrowseResultMask::All);
+    const auto references = ::opcua::services::browseAll(native, browse);
+    if (!references) {
+      appendError(error, "failed to inspect OPC UA rollback references: " +
+                             statusName(references.code()));
+      return false;
+    }
+    for (const auto &reference : references.value()) {
+      if (!reference.nodeId().isLocal()) {
+        continue;
+      }
+      const ::opcua::NodeId target = reference.nodeId().nodeId();
+      if (created_ids.contains(target)) {
+        continue;
+      }
+      foreign_references.push_back(ForeignHierarchicalReference{
+          source, target, reference.referenceTypeId()});
+    }
+  }
+
+  for (const ForeignHierarchicalReference &reference : foreign_references) {
+    const ::opcua::StatusCode result = ::opcua::services::deleteReference(
+        native, reference.source, reference.target, reference.type, true, true);
+    if (result.isBad()) {
+      appendError(error,
+                  "failed to detach a foreign OPC UA rollback reference: " +
+                      statusName(result));
+      return false;
+    }
+  }
+  return true;
+}
+
 bool rollbackCreatedNodes(::opcua::Server &native,
                           const std::vector<CreatedNode> &ledger,
                           std::string *error) {
@@ -1162,6 +1210,9 @@ bool rollbackCreatedNodes(::opcua::Server &native,
   std::set<::opcua::NodeId> created_ids;
   for (const CreatedNode &created : ledger) {
     created_ids.insert(created.id);
+  }
+  if (!detachForeignHierarchicalReferences(native, created_ids, error)) {
+    return false;
   }
   std::set<::opcua::NodeId> recursively_removed;
   for (auto created = ledger.rbegin(); created != ledger.rend(); ++created) {
@@ -1218,7 +1269,7 @@ struct PublishedComponent {
         nodes(std::move(snapshot_nodes)),
         snapshot_fingerprint(std::move(fingerprint)) {}
 
-  PublishedComponent(PublishedComponent &&) = default;
+  PublishedComponent(PublishedComponent &&) noexcept = default;
   PublishedComponent &operator=(PublishedComponent &&) = delete;
   PublishedComponent(const PublishedComponent &) = delete;
   PublishedComponent &operator=(const PublishedComponent &) = delete;
@@ -1226,14 +1277,18 @@ struct PublishedComponent {
   RTT::TaskContext *const component;
   std::shared_ptr<ComponentState> state;
   NodeMap nodes;
-  const std::string snapshot_fingerprint;
+  std::string snapshot_fingerprint;
 };
+
+static_assert(std::is_nothrow_move_constructible_v<PublishedComponent>);
 
 struct AbandonedResources {
   std::shared_ptr<ComponentState> closed_state;
   NodeMap nodes;
-  const std::string snapshot_fingerprint;
+  std::string snapshot_fingerprint;
 };
+
+static_assert(std::is_nothrow_move_constructible_v<AbandonedResources>);
 
 class ObjectModelImpl final {
 public:
@@ -1371,8 +1426,9 @@ public:
     if (!invoked || !committed) {
       deactivate(state);
       if (!rollback_complete) {
-        abandoned.push_back(AbandonedResources{
-            state, std::move(candidate.nodes), candidate.snapshot_fingerprint});
+        abandoned.push_back(
+            AbandonedResources{state, std::move(candidate.nodes),
+                               std::move(candidate.snapshot_fingerprint)});
       }
       std::string failure =
           server_error.empty() ? std::move(transaction_error)
