@@ -48,7 +48,6 @@ public:
                              ::opcua::Span<const ::opcua::Variant> inputs,
                              ::opcua::Span<::opcua::Variant> outputs) noexcept;
 
-  void reapPending() noexcept;
   void drainPending() noexcept;
   std::size_t pendingCount() const noexcept;
 

@@ -173,6 +173,7 @@ if(BUILD_TESTING)
     endif()
   endif()
   add_test(NAME rtt_opcua_object_model_test COMMAND rtt_opcua_object_model_test)
+  set_tests_properties(rtt_opcua_object_model_test PROPERTIES TIMEOUT 30)
 
   add_executable(rtt_opcua_task_context_proxy_test tests/task_context_proxy_test.cpp)
   target_link_libraries(

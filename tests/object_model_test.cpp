@@ -28,11 +28,12 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -146,9 +147,6 @@ public:
     addOperation("onGlobalEngine", &OperationComponent::onGlobalEngine, this,
                  RTT::ClientThread)
         .doc("Report whether RTT dispatched to the global engine.");
-    addOperation("slow", &OperationComponent::slow, this, RTT::OwnThread)
-        .doc("Sleep for the requested duration.")
-        .arg("milliseconds", "Sleep duration in milliseconds.");
   }
 
   std::int32_t add(std::int32_t left, std::int32_t right) {
@@ -162,14 +160,73 @@ public:
   bool onGlobalEngine() const {
     return RTT::internal::GlobalEngine::Instance()->isSelf();
   }
+};
 
-  bool slow(std::uint32_t milliseconds) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
-    slow_completed.store(true);
+class GatedOperationComponent final : public RTT::TaskContext {
+public:
+  GatedOperationComponent() : RTT::TaskContext("gated-operation") {
+    addOperation("waitForRelease", &GatedOperationComponent::waitForRelease,
+                 this, RTT::OwnThread)
+        .doc("Wait until the test releases the operation gate.");
+  }
+
+  ~GatedOperationComponent() override { release(); }
+
+  bool waitForRelease() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ++invocation_count_;
+    condition_.notify_all();
+    condition_.wait(lock, [this] { return released_; });
+    ++completion_count_;
+    condition_.notify_all();
     return true;
   }
 
-  std::atomic_bool slow_completed{false};
+  bool waitUntilEntered(
+      std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return condition_.wait_for(lock, timeout,
+                               [this] { return invocation_count_ > 0U; });
+  }
+
+  void release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    condition_.notify_all();
+  }
+
+  std::size_t invocationCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return invocation_count_;
+  }
+
+  std::size_t completionCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return completion_count_;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  bool released_{false};
+  std::size_t invocation_count_{0U};
+  std::size_t completion_count_{0U};
+};
+
+class GatedOperationRelease final {
+public:
+  explicit GatedOperationRelease(GatedOperationComponent &component)
+      : component_(component) {}
+
+  ~GatedOperationRelease() { component_.release(); }
+
+  GatedOperationRelease(const GatedOperationRelease &) = delete;
+  GatedOperationRelease &operator=(const GatedOperationRelease &) = delete;
+
+private:
+  GatedOperationComponent &component_;
 };
 
 struct UnsupportedValue {
@@ -1083,9 +1140,8 @@ BOOST_FIXTURE_TEST_CASE(
   server.stop();
 }
 
-BOOST_FIXTURE_TEST_CASE(
-    operations_dispatch_on_rtt_engines_and_retain_timed_out_calls,
-    CanonicalTypesFixture) {
+BOOST_FIXTURE_TEST_CASE(operations_dispatch_on_rtt_engines,
+                        CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
   server_options.port = unusedLoopbackPort();
   RTT::opcua::Server server(server_options);
@@ -1126,11 +1182,9 @@ BOOST_FIXTURE_TEST_CASE(
   const auto owner_thread_id = modelNodeId(
       namespace_index,
       {"components", "calculator", "operations", "onOwnerThread"});
-  const auto global_engine_id = modelNodeId(
-      namespace_index,
-      {"components", "calculator", "operations", "onGlobalEngine"});
-  const auto slow_id = modelNodeId(
-      namespace_index, {"components", "calculator", "operations", "slow"});
+  const auto global_engine_id =
+      modelNodeId(namespace_index,
+                  {"components", "calculator", "operations", "onGlobalEngine"});
 
   BOOST_TEST(::opcua::services::readValue(client, add_input_types_id)
                  .value()
@@ -1178,25 +1232,12 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(::opcua::services::call(client, operations_id, add_id, wrong_inputs)
                  .statusCode() == UA_STATUSCODE_BADINVALIDARGUMENT);
 
-  const std::vector<::opcua::Variant> slow_inputs{
-      ::opcua::Variant(std::uint32_t{120})};
-  const auto started_at = std::chrono::steady_clock::now();
-  const auto slow_result =
-      ::opcua::services::call(client, operations_id, slow_id, slow_inputs);
-  const auto elapsed = std::chrono::steady_clock::now() - started_at;
-  BOOST_TEST(slow_result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
-  BOOST_TEST(elapsed < std::chrono::milliseconds(100));
-  BOOST_TEST(model.pendingOperationCount() == 1U);
-  BOOST_REQUIRE(waitUntil([&] { return component.slow_completed.load(); }));
-  BOOST_TEST(model.pendingOperationCount() == 1U);
-
   client.disconnect();
   server.stop();
 }
 
-BOOST_FIXTURE_TEST_CASE(
-    object_model_shutdown_waits_for_timed_out_own_thread_operations,
-    CanonicalTypesFixture) {
+BOOST_FIXTURE_TEST_CASE(timed_out_operation_is_reaped_without_graph_activity,
+                        CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
   server_options.port = unusedLoopbackPort();
   RTT::opcua::Server server(server_options);
@@ -1206,28 +1247,90 @@ BOOST_FIXTURE_TEST_CASE(
 
   RTT::opcua::ObjectModelOptions options;
   options.operation_timeout = std::chrono::milliseconds(30);
-  OperationComponent component;
-  auto model = std::make_unique<RTT::opcua::ObjectModel>(server, options);
-  BOOST_REQUIRE_MESSAGE(model->publishComponent(component, &error), error);
+  GatedOperationComponent component;
+  RTT::opcua::ObjectModel model(server, options);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  GatedOperationRelease release_on_exit(component);
 
   ::opcua::ClientConfig client_config;
   client_config.setTimeout(2000U);
   ::opcua::Client client(std::move(client_config));
   client.connect(server.endpointUrl());
-  const auto operations_id =
-      modelNodeId(namespace_index, {"components", "calculator", "operations"});
-  const auto slow_id = modelNodeId(
-      namespace_index, {"components", "calculator", "operations", "slow"});
-  const std::vector<::opcua::Variant> inputs{
-      ::opcua::Variant(std::uint32_t{200})};
+  const auto operations_id = modelNodeId(
+      namespace_index, {"components", "gated-operation", "operations"});
+  const auto operation_id =
+      modelNodeId(namespace_index, {"components", "gated-operation",
+                                    "operations", "waitForRelease"});
 
+  const auto call_started = std::chrono::steady_clock::now();
   const auto result =
-      ::opcua::services::call(client, operations_id, slow_id, inputs);
+      ::opcua::services::call(client, operations_id, operation_id, {});
+  const auto call_elapsed = std::chrono::steady_clock::now() - call_started;
   BOOST_TEST(result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
+  BOOST_TEST(call_elapsed < std::chrono::seconds(1));
+  BOOST_REQUIRE(component.waitUntilEntered());
+  BOOST_TEST(component.invocationCount() == 1U);
+  BOOST_TEST(model.pendingOperationCount() == 1U);
+
+  component.release();
+  BOOST_REQUIRE(waitUntil([&] { return model.pendingOperationCount() == 0U; }));
+  BOOST_TEST(component.completionCount() == 1U);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(shutdown_after_timeout_waits_for_operation_completion,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions options;
+  options.operation_timeout = std::chrono::milliseconds(30);
+  GatedOperationComponent component;
+  auto model = std::make_unique<RTT::opcua::ObjectModel>(server, options);
+  BOOST_REQUIRE_MESSAGE(model->publishComponent(component, &error), error);
+  GatedOperationRelease release_on_exit(component);
+
+  ::opcua::ClientConfig client_config;
+  client_config.setTimeout(2000U);
+  ::opcua::Client client(std::move(client_config));
+  client.connect(server.endpointUrl());
+  const auto operations_id = modelNodeId(
+      namespace_index, {"components", "gated-operation", "operations"});
+  const auto operation_id =
+      modelNodeId(namespace_index, {"components", "gated-operation",
+                                    "operations", "waitForRelease"});
+
+  const auto call_started = std::chrono::steady_clock::now();
+  const auto result =
+      ::opcua::services::call(client, operations_id, operation_id, {});
+  const auto call_elapsed = std::chrono::steady_clock::now() - call_started;
+  BOOST_TEST(result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
+  BOOST_TEST(call_elapsed < std::chrono::seconds(1));
+  BOOST_REQUIRE(component.waitUntilEntered());
+  BOOST_TEST(component.invocationCount() == 1U);
   BOOST_TEST(model->pendingOperationCount() == 1U);
 
   client.disconnect();
-  model.reset();
-  BOOST_TEST(component.slow_completed.load());
   server.stop();
+
+  std::jthread release_thread([&component] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    component.release();
+  });
+  const auto destruction_started = std::chrono::steady_clock::now();
+  model.reset();
+  const auto destruction_elapsed =
+      std::chrono::steady_clock::now() - destruction_started;
+  release_thread.join();
+
+  BOOST_TEST(destruction_elapsed >= std::chrono::milliseconds(75));
+  BOOST_TEST(destruction_elapsed < std::chrono::seconds(2));
+  BOOST_TEST(component.invocationCount() == 1U);
+  BOOST_TEST(component.completionCount() == 1U);
 }

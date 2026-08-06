@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <exception>
 #include <mutex>
 #include <sstream>
@@ -83,23 +84,43 @@ OperationSchema unsupportedValueSchema(const RTT::types::TypeInfo *type,
 struct PendingInvocation {
   PendingInvocation(
       ComponentLease &&component_lease,
-      const RTT::internal::SendHandleC &operation_handle,
-      std::vector<RTT::base::DataSourceBase::shared_ptr> collected_values)
-      : lease(std::move(component_lease)), handle(operation_handle),
+      std::unique_ptr<RTT::internal::SendHandleC> operation_handle,
+      std::vector<RTT::base::DataSourceBase::shared_ptr>
+          collected_values) noexcept
+      : lease(std::move(component_lease)), handle(std::move(operation_handle)),
         values(std::move(collected_values)) {}
 
-  bool finished() noexcept {
+  bool collectIfDone() noexcept {
     try {
-      return handle.collectIfDone() != RTT::SendNotReady;
+      return handle->collectIfDone() != RTT::SendNotReady;
     } catch (...) {
       return true;
     }
   }
 
+  void wait() noexcept {
+    while (!collectIfDone()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
   ComponentLease lease;
-  RTT::internal::SendHandleC handle;
+  std::unique_ptr<RTT::internal::SendHandleC> handle;
   std::vector<RTT::base::DataSourceBase::shared_ptr> values;
 };
+
+void waitForCompletion(RTT::internal::SendHandleC &handle) noexcept {
+  while (true) {
+    try {
+      if (handle.collectIfDone() != RTT::SendNotReady) {
+        return;
+      }
+    } catch (...) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
 
 } // namespace
 
@@ -108,46 +129,38 @@ public:
   Impl(std::shared_ptr<const EndpointTypeRegistry> endpoint_type_registry,
        std::chrono::milliseconds operation_timeout)
       : type_registry(std::move(endpoint_type_registry)),
-        timeout(operation_timeout) {}
+        timeout(operation_timeout),
+        reaper([this](std::stop_token stop) noexcept { runReaper(stop); }) {}
 
-  void retain(ComponentLease &&lease, const RTT::internal::SendHandleC &handle,
-              std::vector<RTT::base::DataSourceBase::shared_ptr> values) {
-    auto pending = std::make_shared<PendingInvocation>(std::move(lease), handle,
-                                                       std::move(values));
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      if (!draining) {
-        invocations.push_back(std::move(pending));
+  void
+  retain(ComponentLease &&lease, RTT::internal::SendHandleC &handle,
+         std::vector<RTT::base::DataSourceBase::shared_ptr> values) noexcept {
+    try {
+      auto retained_handle =
+          std::make_unique<RTT::internal::SendHandleC>(handle);
+      auto pending = std::make_shared<PendingInvocation>(
+          std::move(lease), std::move(retained_handle), std::move(values));
+      bool retained = false;
+      try {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          if (!draining) {
+            invocations.push_back(pending);
+            retained = true;
+          }
+        }
+      } catch (...) {
+        pending->wait();
         return;
       }
-    }
-    while (!pending->finished()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-
-  void reap() noexcept {
-    std::vector<std::shared_ptr<PendingInvocation>> current;
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      current = invocations;
-    }
-
-    std::vector<const PendingInvocation *> finished;
-    for (const auto &invocation : current) {
-      if (invocation->finished()) {
-        finished.push_back(invocation.get());
+      if (retained) {
+        wake.notify_one();
+        return;
       }
+      pending->wait();
+    } catch (...) {
+      waitForCompletion(handle);
     }
-    if (finished.empty()) {
-      return;
-    }
-
-    std::lock_guard<std::mutex> lock(mutex);
-    std::erase_if(invocations, [&finished](const auto &invocation) {
-      return std::find(finished.begin(), finished.end(), invocation.get()) !=
-             finished.end();
-    });
   }
 
   void drain() noexcept {
@@ -155,10 +168,15 @@ public:
       std::lock_guard<std::mutex> lock(mutex);
       draining = true;
     }
+    reaper.request_stop();
+    wake.notify_all();
+    if (reaper.joinable()) {
+      reaper.join();
+    }
     while (true) {
-      reap();
       {
         std::lock_guard<std::mutex> lock(mutex);
+        reapOnce();
         if (invocations.empty()) {
           return;
         }
@@ -175,8 +193,37 @@ public:
   const std::shared_ptr<const EndpointTypeRegistry> type_registry;
   const std::chrono::milliseconds timeout;
   mutable std::mutex mutex;
+  std::condition_variable wake;
   std::vector<std::shared_ptr<PendingInvocation>> invocations;
   bool draining{false};
+  std::jthread reaper;
+
+private:
+  void reapOnce() noexcept {
+    std::erase_if(invocations, [](const auto &invocation) {
+      return invocation->collectIfDone();
+    });
+  }
+
+  void runReaper(std::stop_token stop) noexcept {
+    try {
+      std::unique_lock<std::mutex> lock(mutex);
+      while (!stop.stop_requested()) {
+        wake.wait(lock, [&] {
+          return stop.stop_requested() || !invocations.empty();
+        });
+        if (stop.stop_requested()) {
+          return;
+        }
+        reapOnce();
+        if (!invocations.empty()) {
+          wake.wait_for(lock, std::chrono::milliseconds(1),
+                        [&] { return stop.stop_requested(); });
+        }
+      }
+    } catch (...) {
+    }
+  }
 };
 
 OperationDispatcher::OperationDispatcher(
@@ -369,8 +416,6 @@ OperationDispatcher::invoke(const std::shared_ptr<ComponentState> &state,
     return UA_STATUSCODE_BADUNEXPECTEDERROR;
   }
 }
-
-void OperationDispatcher::reapPending() noexcept { impl_->reap(); }
 
 void OperationDispatcher::drainPending() noexcept { impl_->drain(); }
 
