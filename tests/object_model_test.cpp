@@ -352,6 +352,50 @@ public:
   ReentrantForeignReferencePort input;
 };
 
+class ReentrantRollbackInspectionPort final
+    : public RTT::InputPort<std::int32_t> {
+public:
+  ReentrantRollbackInspectionPort(RTT::opcua::Server &server,
+                                  ::opcua::NodeId properties_id)
+      : RTT::InputPort<std::int32_t>("ReentrantInspectionInput"),
+        server_(server), properties_id_(std::move(properties_id)) {}
+
+  RTT::base::PortInterface *antiClone() const override {
+    std::string error;
+    bool removed = false;
+    const bool invoked = server_.invoke(
+        [&](::opcua::Server &native) {
+          removed = ::opcua::services::deleteNode(native, properties_id_, true)
+                        .isGood();
+        },
+        std::chrono::seconds(5), &error);
+    if (!invoked || !removed) {
+      throw std::runtime_error(
+          "failed to remove the reentrant properties folder: " + error);
+    }
+    throw std::runtime_error("intentional rollback inspection failure");
+  }
+
+private:
+  RTT::opcua::Server &server_;
+  ::opcua::NodeId properties_id_;
+};
+
+class RollbackInspectionFailureComponent final : public RTT::TaskContext {
+public:
+  RollbackInspectionFailureComponent(RTT::opcua::Server &server,
+                                     std::uint16_t namespace_index)
+      : RTT::TaskContext("rollback-inspection-failure-component"),
+        input(server, modelNodeId(namespace_index,
+                                  {"components", getName(), "properties"})) {
+    addProperty("Earlier", earlier);
+    addPort(input);
+  }
+
+  std::int32_t earlier{17};
+  ReentrantRollbackInspectionPort input;
+};
+
 } // namespace
 
 BOOST_FIXTURE_TEST_CASE(canonical_array_value_nodes_publish_and_remain_writable,
@@ -903,6 +947,54 @@ BOOST_FIXTURE_TEST_CASE(rollback_never_deletes_a_reentrant_foreign_sole_child,
   const auto foreign_value = ::opcua::services::readValue(client, foreign_id);
   BOOST_REQUIRE(static_cast<bool>(foreign_value));
   BOOST_TEST(foreign_value.value().to<std::int32_t>() == 99);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(rollback_inspection_failure_is_fail_closed,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RollbackInspectionFailureComponent component(server, namespace_index);
+  RTT::opcua::ObjectModel model(server);
+  BOOST_TEST(!model.publishComponent(component, &error));
+  BOOST_TEST(error.find("intentional rollback inspection failure") !=
+             std::string::npos);
+  BOOST_TEST_CONTEXT("publication error: " << error) {
+    BOOST_TEST(error.find("rollback threw: BadNodeIdUnknown") !=
+               std::string::npos);
+  }
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto properties_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "properties"});
+  const auto earlier_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "properties", "Earlier"});
+  const auto ports_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "ports"});
+  const auto input_id =
+      modelNodeId(namespace_index, {"components", component.getName(), "ports",
+                                    "ReentrantInspectionInput"});
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readBrowseName(client, component_id)));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, properties_id));
+  BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_id));
+  BOOST_TEST(
+      static_cast<bool>(::opcua::services::readBrowseName(client, ports_id)));
+  BOOST_TEST(
+      static_cast<bool>(::opcua::services::readBrowseName(client, input_id)));
 
   client.disconnect();
   server.stop();
