@@ -19,6 +19,59 @@ provided by OCL.
 Non-loopback binding and PKI are intentionally deferred until their security
 contract is designed and tested.
 
+## Static Publication API
+
+Application typekits and their OPC UA transport plugins must register every
+required datatype provider and codec before the endpoint starts. The generic
+server flow is:
+
+```cpp
+std::string error;
+if (!RTT::opcua::registerCanonicalTypeProtocols(&error) ||
+    !RTT::opcua::freezeDataTypeRegistry(&error)) {
+    throw std::runtime_error(error);
+}
+
+RTT::opcua::Server server(options);
+if (!server.start(&error)) {
+    throw std::runtime_error(error);
+}
+
+{
+    RTT::opcua::ObjectModel model(server);
+    std::vector<RTT::opcua::UnsupportedResource> unsupported;
+    if (!model.publishComponent(component, &error, &unsupported)) {
+        throw std::runtime_error(error); // Nothing was partially published.
+    }
+
+    server.stop();
+} // Destroy the ObjectModel before releasing published components.
+```
+
+`publishComponent` validates the complete component interface before commit.
+It is strict, static, and idempotent for the same component instance. An
+unsupported operation, property, attribute, constant, or port rejects the
+whole component and leaves diagnostics available through
+`unsupportedResources`.
+
+Resources added to an RTT component after publication are not added to the
+address space. This version has no public unpublish or component-replacement
+API. Destroying `ObjectModel` is endpoint teardown; it drains retained timed-out
+operation calls before its published RTT components may be destroyed.
+
+OCL owns the operator-facing lifecycle. A typical deployment script is:
+
+```text
+import("sample_typekit")
+loadComponent("sample", "SampleComponent")
+opcua.start()
+opcua.publishComponent("sample")
+```
+
+The first `opcua.start()` freezes the registry and publishes the complete
+Deployer interface. Other local components require an explicit
+`publishComponent` call; `Server=true` is not an OPC UA publication rule.
+
 ## Information Model
 
 The namespace URI is `urn:orocos:rtt`. Namespace indexes are resolved at
