@@ -1,6 +1,9 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_server
 #include <boost/test/included/unit_test.hpp>
 
+#include <rtt/os/main.h>
+#include <rtt/os/Semaphore.hpp>
 #include <rtt/opcua/datatype_registry.hpp>
 #include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/node_id.hpp>
@@ -326,6 +329,29 @@ BOOST_AUTO_TEST_CASE(
   server.stop();
 }
 
+BOOST_AUTO_TEST_CASE(server_tasks_can_use_rtt_synchronization_primitives) {
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  bool semaphore_usable = false;
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&semaphore_usable](::opcua::Server &) {
+            RTT::os::Semaphore semaphore(0);
+            semaphore.signal();
+            semaphore_usable = semaphore.trywait();
+          },
+          std::chrono::seconds(1), &error),
+      error);
+  BOOST_TEST(semaphore_usable);
+
+  server.stop();
+}
+
 BOOST_AUTO_TEST_CASE(custom_datatype_binding_follows_endpoint_namespace_order) {
   RTT::opcua::ServerOptions first_options;
   first_options.port = unusedLoopbackPort();
@@ -433,4 +459,8 @@ BOOST_AUTO_TEST_CASE(custom_datatype_binding_follows_endpoint_namespace_order) {
   client.disconnect();
   second.stop();
   BOOST_TEST(second.typeRegistry() == nullptr);
+}
+
+int ORO_main(int argc, char **argv) {
+  return boost::unit_test::unit_test_main(&init_unit_test_suite, argc, argv);
 }

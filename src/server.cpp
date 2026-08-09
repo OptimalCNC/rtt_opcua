@@ -1,6 +1,11 @@
 #include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/server.hpp>
+#include <rtt/rtt-config.h>
+
+#ifdef OROPKG_OS_XENOMAI
+#include <alchemy/task.h>
+#endif
 
 #include "datatype_registry_internal.hpp"
 
@@ -8,12 +13,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <deque>
 #include <exception>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -35,6 +42,19 @@ std::string exceptionMessage(std::exception_ptr exception) {
   } catch (...) {
     return "unknown server task exception";
   }
+}
+
+void initializeRttThreadContext() {
+#ifdef OROPKG_OS_XENOMAI
+  if (rt_task_self() != nullptr) {
+    return;
+  }
+  const int result = rt_task_shadow(nullptr, nullptr, 0, 0);
+  if (result != 0 && result != -EBUSY) {
+    throw std::system_error(-result, std::generic_category(),
+                            "failed to shadow the OPC UA server thread");
+  }
+#endif
 }
 
 void setServerUrl(::opcua::ServerConfig &config, const std::string &url) {
@@ -272,6 +292,9 @@ private:
       server_thread_id = std::this_thread::get_id();
     }
     try {
+      // RTT synchronization primitives require an Alchemy context on Xenomai.
+      initializeRttThreadContext();
+
       ::opcua::ServerConfig config(options.port);
       config.setLogger(
           [](::opcua::LogLevel, ::opcua::LogCategory, std::string_view) {});
