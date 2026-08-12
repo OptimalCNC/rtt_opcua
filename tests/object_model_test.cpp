@@ -321,6 +321,16 @@ public:
   std::uint16_t scale{2U};
 };
 
+class NonRetainingOutputComponent final : public RTT::TaskContext {
+public:
+  NonRetainingOutputComponent()
+      : RTT::TaskContext("non-retaining-output"), output("Ephemeral", false) {
+    addPort(output);
+  }
+
+  RTT::OutputPort<std::int32_t> output;
+};
+
 class CollisionComponent final : public RTT::TaskContext {
 public:
   CollisionComponent() : RTT::TaskContext("collision-component") {
@@ -527,6 +537,36 @@ BOOST_FIXTURE_TEST_CASE(publish_component_rejects_invalid_options,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(non_retaining_output_omits_current_value_node,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  NonRetainingOutputComponent component;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto read_id =
+      modelNodeId(namespace_index, {"components", component.getName(), "ports",
+                                    "Ephemeral", "read"});
+  const auto value_id =
+      modelNodeId(namespace_index, {"components", component.getName(), "ports",
+                                    "Ephemeral", "value"});
+  BOOST_TEST(
+      static_cast<bool>(::opcua::services::readNodeClass(client, read_id)));
+  BOOST_TEST(
+      !static_cast<bool>(::opcua::services::readNodeClass(client, value_id)));
+
+  client.disconnect();
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -565,6 +605,9 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   const auto feedback_read_id = modelNodeId(
       namespace_index,
       {"components", "arm/left", "ports", "Feedback", "read"});
+  const auto feedback_value_id =
+      modelNodeId(namespace_index,
+                  {"components", "arm/left", "ports", "Feedback", "value"});
   const auto feedback_direction_id =
       modelNodeId(namespace_index,
                   {"components", "arm/left", "ports", "Feedback", "direction"});
@@ -627,6 +670,13 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                  .value()
                  .to<std::uint16_t>() == 2U);
 
+  const auto unwritten_feedback = ::opcua::services::readAttribute(
+      client, feedback_value_id, ::opcua::AttributeId::Value,
+      ::opcua::TimestampsToReturn::Neither);
+  BOOST_REQUIRE(unwritten_feedback);
+  BOOST_TEST(unwritten_feedback->status() ==
+             UA_STATUSCODE_BADWAITINGFORINITIALDATA);
+
   const auto empty_feedback_result =
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(empty_feedback_result.statusCode().isGood());
@@ -635,6 +685,14 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
              "NoData");
 
   BOOST_TEST(component.feedback.write(4.25) == RTT::WriteSuccess);
+  BOOST_TEST(component.feedback.write(5.25) == RTT::WriteSuccess);
+  BOOST_TEST(component.feedback.write(6.25) == RTT::WriteSuccess);
+  BOOST_TEST(::opcua::services::readValue(client, feedback_value_id)
+                 .value()
+                 .to<double>() == 6.25);
+  BOOST_TEST(::opcua::services::writeValue(client, feedback_value_id,
+                                           ::opcua::Variant(7.25)) ==
+             UA_STATUSCODE_BADNOTWRITABLE);
   const auto feedback_result =
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(feedback_result.statusCode().isGood());
@@ -643,13 +701,29 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
              "NewData");
   BOOST_TEST(feedback_result.outputArguments()[1].to<double>() == 4.25);
 
+  const auto second_feedback_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(second_feedback_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(second_feedback_result.outputArguments().size(), 2U);
+  BOOST_TEST(second_feedback_result.outputArguments()[0].to<std::string>() ==
+             "NewData");
+  BOOST_TEST(second_feedback_result.outputArguments()[1].to<double>() == 5.25);
+
+  const auto third_feedback_result =
+      ::opcua::services::call(client, feedback_id, feedback_read_id, {});
+  BOOST_REQUIRE(third_feedback_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(third_feedback_result.outputArguments().size(), 2U);
+  BOOST_TEST(third_feedback_result.outputArguments()[0].to<std::string>() ==
+             "NewData");
+  BOOST_TEST(third_feedback_result.outputArguments()[1].to<double>() == 6.25);
+
   const auto feedback_old_result =
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(feedback_old_result.statusCode().isGood());
   BOOST_REQUIRE_EQUAL(feedback_old_result.outputArguments().size(), 2U);
   BOOST_TEST(feedback_old_result.outputArguments()[0].to<std::string>() ==
              "OldData");
-  BOOST_TEST(feedback_old_result.outputArguments()[1].to<double>() == 4.25);
+  BOOST_TEST(feedback_old_result.outputArguments()[1].to<double>() == 6.25);
 
   const std::vector<::opcua::Variant> wrong_command_inputs{
       ::opcua::Variant(std::string("not-an-integer"))};

@@ -201,6 +201,58 @@ private:
   bool writable_;
 };
 
+class PortValueDataSource final : public ::opcua::DataSourceBase {
+public:
+  PortValueDataSource(std::weak_ptr<ComponentState> state,
+                      RTT::base::OutputPortInterface *port,
+                      std::shared_ptr<const EndpointTypeRegistry> type_registry,
+                      const TypeCodec *codec)
+      : state_(std::move(state)), port_(port),
+        type_registry_(std::move(type_registry)), codec_(codec) {}
+
+  ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
+                           const ::opcua::NumericRange *range,
+                           ::opcua::DataValue &value, bool) override {
+    if (range != nullptr) {
+      value.setStatus(UA_STATUSCODE_BADINDEXRANGEINVALID);
+      return UA_STATUSCODE_BADINDEXRANGEINVALID;
+    }
+    ComponentLease lease(state_.lock());
+    if (!lease || port_ == nullptr) {
+      value.setStatus(UA_STATUSCODE_BADNOTCONNECTED);
+      return UA_STATUSCODE_BADNOTCONNECTED;
+    }
+
+    ::opcua::Variant encoded;
+    switch (codec_ == nullptr ? PortValueStatus::error
+                              : codec_->portValue(port_, &encoded)) {
+    case PortValueStatus::value:
+      value.setValue(std::move(encoded));
+      return UA_STATUSCODE_GOOD;
+    case PortValueStatus::waiting_for_initial_data:
+      value.setStatus(UA_STATUSCODE_BADWAITINGFORINITIALDATA);
+      return UA_STATUSCODE_BADWAITINGFORINITIALDATA;
+    case PortValueStatus::error:
+      value.setStatus(UA_STATUSCODE_BADTYPEMISMATCH);
+      return UA_STATUSCODE_BADTYPEMISMATCH;
+    }
+    value.setStatus(UA_STATUSCODE_BADUNEXPECTEDERROR);
+    return UA_STATUSCODE_BADUNEXPECTEDERROR;
+  }
+
+  ::opcua::StatusCode write(::opcua::Session &, const ::opcua::NodeId &,
+                            const ::opcua::NumericRange *,
+                            const ::opcua::DataValue &) override {
+    return UA_STATUSCODE_BADNOTWRITABLE;
+  }
+
+private:
+  std::weak_ptr<ComponentState> state_;
+  RTT::base::OutputPortInterface *port_;
+  std::shared_ptr<const EndpointTypeRegistry> type_registry_;
+  const TypeCodec *codec_;
+};
+
 class LifecycleDataSource final : public ::opcua::DataSourceBase {
 public:
   explicit LifecycleDataSource(std::weak_ptr<ComponentState> state)
@@ -672,6 +724,64 @@ dataSourceSpec(const std::string &parent_path, const std::string &name,
   return spec;
 }
 
+NodeSpec
+portValueSpec(const std::string &port_path,
+              RTT::base::OutputPortInterface &port,
+              const std::shared_ptr<ComponentState> &state,
+              std::shared_ptr<const EndpointTypeRegistry> type_registry) {
+  NodeSpec spec;
+  spec.kind = NodeKind::variable;
+  spec.parent_path = port_path;
+  spec.path = appendNodeSegment(port_path, "value");
+  spec.browse_name = "value";
+  spec.fingerprint = "port-value|" + pointerFingerprint(&port);
+  spec.create = [path = spec.path, parent = spec.parent_path, port = &port,
+                 weak_state = std::weak_ptr<ComponentState>(state),
+                 type_registry = std::move(type_registry)](
+                    ::opcua::Server &server, std::uint16_t namespace_index,
+                    bool *created, std::string *error) {
+    ComponentLease lease(weak_state.lock());
+    if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
+      assignError(
+          error,
+          "RTT output port became unavailable while creating OPC UA value");
+      return false;
+    }
+    const TypeCodec *codec =
+        type_registry ? type_registry->codecForTypeInfo(port->getTypeInfo())
+                      : nullptr;
+    if (codec == nullptr || !codec->hasValue()) {
+      assignError(error, "RTT output port type has no OPC UA protocol");
+      return false;
+    }
+
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", "value"));
+    attributes.setDescription(
+        ::opcua::LocalizedText("en-US", "Current RTT output-port value."));
+    attributes.setDataType(codec->dataTypeNodeId());
+    attributes.setValueRank(codec->valueRank());
+    if (codec->valueRank() == ::opcua::ValueRank::OneDimension) {
+      attributes.setArrayDimensions({0U});
+    }
+    attributes.setAccessLevel(readOnlyAccess());
+    attributes.setUserAccessLevel(readOnlyAccess());
+    const auto result = ::opcua::services::addVariable(
+        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
+        "value", attributes, ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::HasComponent);
+    if (!componentNodeCreated(result, path, created, error)) {
+      return false;
+    }
+    ::opcua::setVariableNodeValueBackend(
+        server, nodeId(namespace_index, path),
+        std::make_unique<PortValueDataSource>(weak_state, port, type_registry,
+                                              codec));
+    return true;
+  };
+  return spec;
+}
+
 NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
                        const std::string &description,
                        const RTT::Service::shared_ptr &service,
@@ -1042,6 +1152,11 @@ void appendPortNodes(
       insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
                                        buffer_size, PortMethodKind::write));
     } else if (is_output) {
+      auto *output = dynamic_cast<RTT::base::OutputPortInterface *>(port);
+      if (output != nullptr && output->keepsLastWrittenValue()) {
+        insertNode(nodes,
+                   portValueSpec(port_path, *output, state, type_registry));
+      }
       insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
                                        buffer_size, PortMethodKind::read));
     }
