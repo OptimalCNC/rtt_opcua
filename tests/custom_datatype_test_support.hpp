@@ -215,15 +215,19 @@ public:
     return new FixtureProxyDataSource(std::move(reader), dataTypeNodeId());
   }
 
-  bool portValue(const RTT::base::OutputPortInterface *port,
-                 ::opcua::Variant *value) const override {
+  PortValueStatus portValue(const RTT::base::OutputPortInterface *port,
+                            ::opcua::Variant *value) const override {
     const auto *typed =
         dynamic_cast<const RTT::OutputPort<FixtureValue> *>(port);
     if (typed == nullptr || value == nullptr || native_type_ == nullptr) {
-      return false;
+      return PortValueStatus::error;
     }
-    *value = ::opcua::Variant(typed->getLastWrittenValue(), *native_type_);
-    return true;
+    FixtureValue sample;
+    if (!typed->getLastWrittenValue(sample)) {
+      return PortValueStatus::waiting_for_initial_data;
+    }
+    *value = ::opcua::Variant(sample, *native_type_);
+    return PortValueStatus::value;
   }
 
 private:

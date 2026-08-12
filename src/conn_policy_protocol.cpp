@@ -272,19 +272,22 @@ public:
     return new ConnPolicyProxyDataSource(std::move(reader), dataTypeNodeId());
   }
 
-  bool portValue(const RTT::base::OutputPortInterface *port,
-                 ::opcua::Variant *value) const override {
+  PortValueStatus portValue(const RTT::base::OutputPortInterface *port,
+                            ::opcua::Variant *value) const override {
     const auto *typed =
         dynamic_cast<const RTT::OutputPort<RTT::ConnPolicy> *>(port);
     if (typed == nullptr || value == nullptr || native_type_ == nullptr) {
-      return false;
+      return PortValueStatus::error;
+    }
+    RTT::ConnPolicy sample;
+    if (!typed->getLastWrittenValue(sample)) {
+      return PortValueStatus::waiting_for_initial_data;
     }
     try {
-      *value =
-          ::opcua::Variant(toWire(typed->getLastWrittenValue()), *native_type_);
-      return true;
+      *value = ::opcua::Variant(toWire(sample), *native_type_);
+      return PortValueStatus::value;
     } catch (const std::exception &) {
-      return false;
+      return PortValueStatus::error;
     }
   }
 

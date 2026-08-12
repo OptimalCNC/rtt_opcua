@@ -398,15 +398,18 @@ public:
                                               dataTypeNodeId());
   }
 
-  bool portValue(const RTT::base::OutputPortInterface *port,
-                 ::opcua::Variant *value) const override {
+  PortValueStatus portValue(const RTT::base::OutputPortInterface *port,
+                            ::opcua::Variant *value) const override {
     const auto *typed = dynamic_cast<const RTT::OutputPort<T> *>(port);
     if (typed == nullptr || value == nullptr) {
-      return false;
+      return PortValueStatus::error;
     }
-    *value =
-        ::opcua::Variant(encodeScalar<T, Wire>(typed->getLastWrittenValue()));
-    return true;
+    T sample{};
+    if (!typed->getLastWrittenValue(sample)) {
+      return PortValueStatus::waiting_for_initial_data;
+    }
+    *value = ::opcua::Variant(encodeScalar<T, Wire>(sample));
+    return PortValueStatus::value;
   }
 
 private:
@@ -477,14 +480,18 @@ public:
     return new ArrayProxyDataSource<T>(std::move(reader), dataTypeNodeId());
   }
 
-  bool portValue(const RTT::base::OutputPortInterface *port,
-                 ::opcua::Variant *value) const override {
+  PortValueStatus portValue(const RTT::base::OutputPortInterface *port,
+                            ::opcua::Variant *value) const override {
     const auto *typed = dynamic_cast<const RTT::OutputPort<Value> *>(port);
     if (typed == nullptr || value == nullptr) {
-      return false;
+      return PortValueStatus::error;
     }
-    *value = ::opcua::Variant(typed->getLastWrittenValue());
-    return true;
+    Value sample;
+    if (!typed->getLastWrittenValue(sample)) {
+      return PortValueStatus::waiting_for_initial_data;
+    }
+    *value = ::opcua::Variant(std::move(sample));
+    return PortValueStatus::value;
   }
 };
 
@@ -514,9 +521,9 @@ public:
     return {};
   }
 
-  bool portValue(const RTT::base::OutputPortInterface *,
-                 ::opcua::Variant *) const override {
-    return false;
+  PortValueStatus portValue(const RTT::base::OutputPortInterface *,
+                            ::opcua::Variant *) const override {
+    return PortValueStatus::error;
   }
 };
 

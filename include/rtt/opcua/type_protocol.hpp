@@ -30,6 +30,8 @@ using DataTypeReference = std::variant<::opcua::NodeId, LogicalDataTypeId>;
 using VariantReader = std::function<bool(::opcua::Variant *)>;
 using VariantWriter = std::function<bool(const ::opcua::Variant &)>;
 
+enum class PortValueStatus { value, waiting_for_initial_data, error };
+
 class TypeCodec {
 public:
   virtual ~TypeCodec() = default;
@@ -44,8 +46,9 @@ public:
   virtual RTT::base::DataSourceBase::shared_ptr
   makeProxyDataSource(VariantReader reader,
                       VariantWriter writer = {}) const = 0;
-  virtual bool portValue(const RTT::base::OutputPortInterface *port,
-                         ::opcua::Variant *value) const = 0;
+  virtual PortValueStatus
+  portValue(const RTT::base::OutputPortInterface *port,
+            ::opcua::Variant *value) const = 0;
 
   const ::opcua::NodeId &dataTypeNodeId() const noexcept;
   ::opcua::ValueRank valueRank() const noexcept;
