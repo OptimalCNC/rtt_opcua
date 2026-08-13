@@ -25,6 +25,7 @@
 #include <rtt/types/TypeInfo.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -46,6 +47,15 @@ namespace detail {
 namespace {
 
 constexpr std::size_t kMaximumServiceDepth = 32U;
+
+constexpr std::array<std::pair<std::string_view, std::string_view>, 5U>
+    kResourceCategories{{
+        {"operations", "Operations"},
+        {"properties", "Properties"},
+        {"attributes", "Attributes"},
+        {"ports", "Ports"},
+        {"services", "Services"},
+    }};
 
 std::string appendNodeSegment(std::string path, std::string_view segment) {
   path += '/';
@@ -1034,16 +1044,26 @@ void appendOperationNodes(
 
 void appendResourceFolders(NodeMap &nodes, const std::string &owner_path,
                            const std::string &description) {
-  for (const auto &[segment, browse_name] :
-       std::initializer_list<std::pair<std::string_view, std::string_view>>{
-           {"operations", "Operations"},
-           {"properties", "Properties"},
-           {"attributes", "Attributes"},
-           {"ports", "Ports"},
-           {"services", "Services"}}) {
+  for (const auto &category : kResourceCategories) {
     insertNode(nodes,
-               objectSpec(appendNodeSegment(owner_path, segment), owner_path,
-                          std::string(browse_name), description));
+               objectSpec(appendNodeSegment(owner_path, category.first),
+                          owner_path, std::string(category.second),
+                          description));
+  }
+}
+
+void pruneEmptyResourceFolders(NodeMap &nodes,
+                               const std::string &owner_path) {
+  for (const auto &category : kResourceCategories) {
+    const std::string category_path =
+        appendNodeSegment(owner_path, category.first);
+    const bool has_direct_child = std::ranges::any_of(
+        nodes, [&category_path](const auto &entry) {
+          return entry.second.parent_path == category_path;
+        });
+    if (!has_direct_child) {
+      nodes.erase(category_path);
+    }
   }
 }
 
@@ -1231,6 +1251,7 @@ void appendServiceContents(
                           type_registry, port_buffer_size, ancestry, depth + 1U);
   }
 
+  pruneEmptyResourceFolders(nodes, service_path);
   ancestry.erase(service.get());
 }
 

@@ -91,6 +91,12 @@ bool waitUntil(const std::function<bool()> &predicate,
                          RTT::opcua::makeNodePath(path_segments));
 }
 
+void requireMissingNode(::opcua::Client &client, const ::opcua::NodeId &id) {
+  const auto result = ::opcua::services::readNodeClass(client, id);
+  BOOST_REQUIRE(!result);
+  BOOST_TEST(result.code() == UA_STATUSCODE_BADNODEIDUNKNOWN);
+}
+
 bool hasHierarchicalReference(::opcua::Client &client,
                               const ::opcua::NodeId &source,
                               const ::opcua::NodeId &target,
@@ -308,7 +314,8 @@ public:
   StaticSnapshotComponent()
       : RTT::TaskContext("arm/left"),
         motion(RTT::Service::Create("motion/raw", this)),
-        limits(RTT::Service::Create("limits")) {
+        limits(RTT::Service::Create("limits")),
+        empty(RTT::Service::Create("empty")) {
     provides()->doc("Arm controller");
     addProperty("Gain", gain).doc("Controller gain");
     addAttribute("Status", status);
@@ -326,6 +333,8 @@ public:
     motion->addPort(motion_command).doc("Nested command");
     limits->addProperty("Maximum", maximum).doc("Maximum command");
     BOOST_REQUIRE(motion->addService(limits));
+    empty->doc("Intentionally empty service");
+    BOOST_REQUIRE(provides()->addService(empty));
   }
 
   std::int32_t offset(std::int32_t value) const { return value + scale; }
@@ -339,6 +348,7 @@ public:
   RTT::InputPort<std::int32_t> trigger{"Trigger"};
   RTT::Service::shared_ptr motion;
   RTT::Service::shared_ptr limits;
+  RTT::Service::shared_ptr empty;
   std::uint16_t scale{2U};
   std::string motion_mode{"automatic"};
   std::string motion_units{"counts"};
@@ -626,6 +636,43 @@ BOOST_FIXTURE_TEST_CASE(non_retaining_output_omits_current_value_node,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(publish_component_omits_empty_root_categories,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  OperationComponent component;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index, {"components", "calculator"}))));
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index,
+                          {"components", "calculator", "operations"}))));
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index,
+                          {"components", "calculator", "attributes"}))));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "calculator", "properties"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "calculator", "ports"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "calculator", "services"}));
+
+  client.disconnect();
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -734,6 +781,8 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   const auto deep_service_property_id = modelNodeId(
       namespace_index, {"components", "arm/left", "services", "motion/raw",
                         "services", "limits", "properties", "Maximum"});
+  const auto empty_service_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "empty"});
   const auto revision_id = modelNodeId(namespace_index, {"model", "revision"});
 
   BOOST_TEST(::opcua::services::readBrowseName(client, component_id)
@@ -807,6 +856,102 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   BOOST_TEST(::opcua::services::readValue(client, deep_service_property_id)
                  .value()
                  .to<std::int32_t>() == 100);
+  BOOST_REQUIRE(::opcua::services::readDescription(client, empty_service_id));
+  BOOST_TEST(::opcua::services::readDescription(client, empty_service_id)
+                 ->text() == "Intentionally empty service");
+
+  requireMissingNode(client, modelNodeId(
+                                 namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Command", "properties"}));
+  requireMissingNode(client, modelNodeId(
+                                 namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Command", "attributes"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Command", "ports"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Command", "services"}));
+  requireMissingNode(client, modelNodeId(
+                                 namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Feedback", "properties"}));
+  requireMissingNode(client, modelNodeId(
+                                 namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Feedback", "attributes"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Feedback", "ports"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "Feedback", "services"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "MotionFeedback",
+                                  "properties"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "MotionFeedback",
+                                  "attributes"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "MotionFeedback",
+                                  "ports"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "MotionFeedback",
+                                  "services"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "limits",
+                                  "operations"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "limits",
+                                  "attributes"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "limits",
+                                  "ports"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "motion/raw", "services", "limits",
+                                  "services"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "empty", "operations"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "empty", "properties"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "empty", "attributes"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "empty", "ports"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", "arm/left", "services",
+                                  "empty", "services"}));
 
   const auto offset_result = ::opcua::services::call(
       client, motion_operations_id, motion_offset_id,
