@@ -7,6 +7,7 @@
 #include <open62541pp/datatype.hpp>
 #include <open62541pp/ua/nodeids.hpp>
 
+#include <rtt/FlowStatus.hpp>
 #include <rtt/OutputPort.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
@@ -688,6 +689,16 @@ makeCanonicalProtocol(std::string_view type_name) {
   }
   if (type_name == "RtString") {
     return std::make_unique<ScalarTypeProtocol<RTT::rt_string, std::string>>(
+        descriptor->data_type, fingerprint);
+  }
+  if (type_name == "FlowStatus") {
+    return std::make_unique<
+        ScalarTypeProtocol<RTT::FlowStatus, std::int32_t>>(
+        descriptor->data_type, fingerprint);
+  }
+  if (type_name == "WriteStatus") {
+    return std::make_unique<
+        ScalarTypeProtocol<RTT::WriteStatus, std::int32_t>>(
         descriptor->data_type, fingerprint);
   }
   if (type_name == "Void") {

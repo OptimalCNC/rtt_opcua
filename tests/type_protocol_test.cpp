@@ -9,6 +9,7 @@
 #include <open62541pp/ua/nodeids.hpp>
 
 #include <rtt/ConnPolicy.hpp>
+#include <rtt/FlowStatus.hpp>
 #include <rtt/OutputPort.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
@@ -16,6 +17,7 @@
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/Types.hpp>
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -190,6 +192,65 @@ BOOST_AUTO_TEST_CASE(scalar_protocol_round_trips_data_sources) {
 
   BOOST_TEST(
       !codec->assignVariant(::opcua::Variant(std::string("wrong")), value));
+}
+
+BOOST_AUTO_TEST_CASE(status_protocols_use_documented_int32_codes) {
+  const auto registry = makeRegistry();
+  const RTT::opcua::TypeCodec *flow =
+      registry->codecForTypeName("FlowStatus");
+  const RTT::opcua::TypeCodec *write =
+      registry->codecForTypeName("WriteStatus");
+  BOOST_REQUIRE(flow != nullptr);
+  BOOST_REQUIRE(write != nullptr);
+  BOOST_CHECK(flow->dataTypeNodeId() ==
+              ::opcua::NodeId(::opcua::DataTypeId::Int32));
+  BOOST_CHECK(write->dataTypeNodeId() ==
+              ::opcua::NodeId(::opcua::DataTypeId::Int32));
+
+  const std::array<std::pair<RTT::FlowStatus, std::int32_t>, 3> flow_values{{
+      {RTT::NoData, 0},
+      {RTT::OldData, 1},
+      {RTT::NewData, 2},
+  }};
+  for (const auto &[status, code] : flow_values) {
+    RTT::internal::ValueDataSource<RTT::FlowStatus>::shared_ptr source =
+        new RTT::internal::ValueDataSource<RTT::FlowStatus>(status);
+    ::opcua::Variant encoded;
+    BOOST_REQUIRE(flow->toVariant(source, &encoded));
+    BOOST_TEST(encoded.to<std::int32_t>() == code);
+
+    const auto decoded =
+        flow->makeDataSource(::opcua::Variant(std::int32_t{code}));
+    const auto typed = boost::dynamic_pointer_cast<
+        RTT::internal::DataSource<RTT::FlowStatus>>(decoded);
+    BOOST_REQUIRE(typed);
+    BOOST_TEST(typed->get() == status);
+  }
+
+  const std::array<std::pair<RTT::WriteStatus, std::int32_t>, 3> write_values{{
+      {RTT::WriteSuccess, 0},
+      {RTT::WriteFailure, 1},
+      {RTT::NotConnected, 2},
+  }};
+  for (const auto &[status, code] : write_values) {
+    RTT::internal::ValueDataSource<RTT::WriteStatus>::shared_ptr source =
+        new RTT::internal::ValueDataSource<RTT::WriteStatus>(status);
+    ::opcua::Variant encoded;
+    BOOST_REQUIRE(write->toVariant(source, &encoded));
+    BOOST_TEST(encoded.to<std::int32_t>() == code);
+
+    const auto decoded =
+        write->makeDataSource(::opcua::Variant(std::int32_t{code}));
+    const auto typed = boost::dynamic_pointer_cast<
+        RTT::internal::DataSource<RTT::WriteStatus>>(decoded);
+    BOOST_REQUIRE(typed);
+    BOOST_TEST(typed->get() == status);
+  }
+
+  BOOST_TEST(!flow->makeDataSource(
+      ::opcua::Variant(std::string("NewData"))));
+  BOOST_TEST(!write->makeDataSource(
+      ::opcua::Variant(std::string("WriteSuccess"))));
 }
 
 BOOST_AUTO_TEST_CASE(output_port_value_distinguishes_unwritten_from_current) {
