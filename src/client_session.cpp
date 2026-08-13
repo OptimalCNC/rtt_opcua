@@ -3,6 +3,7 @@
 #include <rtt/opcua/node_id.hpp>
 
 #include <open62541pp/client.hpp>
+#include <open62541pp/exception.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
 #include <open62541pp/services/method.hpp>
 #include <open62541pp/services/view.hpp>
@@ -52,6 +53,10 @@ bool invalidatesInterface(::opcua::StatusCode status) noexcept {
          code == UA_STATUSCODE_BADTIMEOUT ||
          code == UA_STATUSCODE_BADTYPEMISMATCH ||
          code == UA_STATUSCODE_BADINVALIDARGUMENT;
+}
+
+bool isMissingCategory(::opcua::StatusCode status) noexcept {
+  return status.get() == UA_STATUSCODE_BADNODEIDUNKNOWN;
 }
 
 std::string modelPath(std::string_view component,
@@ -398,16 +403,31 @@ ClientSession::discoverOperations(const std::string &component_name,
         operations_id, ::opcua::BrowseDirection::Forward,
         ::opcua::ReferenceTypeId::HasComponent, false,
         ::opcua::NodeClass::Method, ::opcua::BrowseResultMask::All);
-    const auto browse_result = ::opcua::services::browseAll(*client_, browse);
-    if (!browse_result) {
-      last_error_ = statusMessage("failed to discover remote RTT operations",
-                                  browse_result.code());
-      assignError(error, last_error_);
-      return operations;
+    std::vector<::opcua::ReferenceDescription> references;
+    try {
+      const auto browse_result = ::opcua::services::browseAll(*client_, browse);
+      if (!browse_result) {
+        if (isMissingCategory(browse_result.code())) {
+          last_error_.clear();
+          assignError(error, "");
+          return operations;
+        }
+        last_error_ = statusMessage("failed to discover remote RTT operations",
+                                    browse_result.code());
+        assignError(error, last_error_);
+        return operations;
+      }
+      references = browse_result.value();
+    } catch (const ::opcua::BadStatus &exception) {
+      if (isMissingCategory(::opcua::StatusCode(exception.code()))) {
+        last_error_.clear();
+        assignError(error, "");
+        return operations;
+      }
+      throw;
     }
 
-    for (const ::opcua::ReferenceDescription &reference :
-         browse_result.value()) {
+    for (const ::opcua::ReferenceDescription &reference : references) {
       if (!reference.nodeId().isLocal()) {
         continue;
       }
@@ -536,17 +556,32 @@ std::vector<RemoteValueDescription> ClientSession::discoverValues(
         folder_id, ::opcua::BrowseDirection::Forward,
         ::opcua::ReferenceTypeId::HasComponent, false,
         ::opcua::NodeClass::Variable, ::opcua::BrowseResultMask::All);
-    const auto browse_result = ::opcua::services::browseAll(*client_, browse);
-    if (!browse_result) {
-      last_error_ = statusMessage("failed to discover remote RTT " +
-                                      std::string(category_name),
-                                  browse_result.code());
-      assignError(error, last_error_);
-      return values;
+    std::vector<::opcua::ReferenceDescription> references;
+    try {
+      const auto browse_result = ::opcua::services::browseAll(*client_, browse);
+      if (!browse_result) {
+        if (isMissingCategory(browse_result.code())) {
+          last_error_.clear();
+          assignError(error, "");
+          return values;
+        }
+        last_error_ = statusMessage("failed to discover remote RTT " +
+                                        std::string(category_name),
+                                    browse_result.code());
+        assignError(error, last_error_);
+        return values;
+      }
+      references = browse_result.value();
+    } catch (const ::opcua::BadStatus &exception) {
+      if (isMissingCategory(::opcua::StatusCode(exception.code()))) {
+        last_error_.clear();
+        assignError(error, "");
+        return values;
+      }
+      throw;
     }
 
-    for (const ::opcua::ReferenceDescription &reference :
-         browse_result.value()) {
+    for (const ::opcua::ReferenceDescription &reference : references) {
       if (!reference.nodeId().isLocal()) {
         continue;
       }
@@ -745,16 +780,31 @@ ClientSession::discoverServices(const std::string &component_name,
         folder_id, ::opcua::BrowseDirection::Forward,
         ::opcua::ReferenceTypeId::HasComponent, false,
         ::opcua::NodeClass::Object, ::opcua::BrowseResultMask::All);
-    const auto browse_result = ::opcua::services::browseAll(*client_, browse);
-    if (!browse_result) {
-      last_error_ = statusMessage("failed to discover remote RTT services",
-                                  browse_result.code());
-      assignError(error, last_error_);
-      return services;
+    std::vector<::opcua::ReferenceDescription> references;
+    try {
+      const auto browse_result = ::opcua::services::browseAll(*client_, browse);
+      if (!browse_result) {
+        if (isMissingCategory(browse_result.code())) {
+          last_error_.clear();
+          assignError(error, "");
+          return services;
+        }
+        last_error_ = statusMessage("failed to discover remote RTT services",
+                                    browse_result.code());
+        assignError(error, last_error_);
+        return services;
+      }
+      references = browse_result.value();
+    } catch (const ::opcua::BadStatus &exception) {
+      if (isMissingCategory(::opcua::StatusCode(exception.code()))) {
+        last_error_.clear();
+        assignError(error, "");
+        return services;
+      }
+      throw;
     }
 
-    for (const ::opcua::ReferenceDescription &reference :
-         browse_result.value()) {
+    for (const ::opcua::ReferenceDescription &reference : references) {
       if (!reference.nodeId().isLocal()) {
         continue;
       }
@@ -827,16 +877,31 @@ ClientSession::discoverPorts(const std::string &component_name,
         folder_id, ::opcua::BrowseDirection::Forward,
         ::opcua::ReferenceTypeId::HasComponent, false,
         ::opcua::NodeClass::Object, ::opcua::BrowseResultMask::All);
-    const auto browse_result = ::opcua::services::browseAll(*client_, browse);
-    if (!browse_result) {
-      last_error_ = statusMessage("failed to discover remote RTT ports",
-                                  browse_result.code());
-      assignError(error, last_error_);
-      return ports;
+    std::vector<::opcua::ReferenceDescription> references;
+    try {
+      const auto browse_result = ::opcua::services::browseAll(*client_, browse);
+      if (!browse_result) {
+        if (isMissingCategory(browse_result.code())) {
+          last_error_.clear();
+          assignError(error, "");
+          return ports;
+        }
+        last_error_ = statusMessage("failed to discover remote RTT ports",
+                                    browse_result.code());
+        assignError(error, last_error_);
+        return ports;
+      }
+      references = browse_result.value();
+    } catch (const ::opcua::BadStatus &exception) {
+      if (isMissingCategory(::opcua::StatusCode(exception.code()))) {
+        last_error_.clear();
+        assignError(error, "");
+        return ports;
+      }
+      throw;
     }
 
-    for (const ::opcua::ReferenceDescription &reference :
-         browse_result.value()) {
+    for (const ::opcua::ReferenceDescription &reference : references) {
       if (!reference.nodeId().isLocal()) {
         continue;
       }

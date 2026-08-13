@@ -25,6 +25,8 @@
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/Types.hpp>
 
+#include <open62541pp/exception.hpp>
+#include <open62541pp/services/attribute_highlevel.hpp>
 #include <open62541pp/services/nodemanagement.hpp>
 
 #include <arpa/inet.h>
@@ -37,9 +39,12 @@
 #include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -71,6 +76,76 @@ std::uint16_t unusedLoopbackPort() {
   const std::uint16_t port = ntohs(address.sin_port);
   ::close(socket_fd);
   return port;
+}
+
+::opcua::NodeId modelNodeId(std::uint16_t namespace_index,
+                            std::initializer_list<std::string_view> segments) {
+  const std::vector<std::string_view> path_segments(segments);
+  return ::opcua::NodeId(namespace_index,
+                         RTT::opcua::makeNodePath(path_segments));
+}
+
+::opcua::NodeId modelNodeId(std::uint16_t namespace_index,
+                            const std::vector<std::string_view> &segments) {
+  return ::opcua::NodeId(namespace_index, RTT::opcua::makeNodePath(segments));
+}
+
+void removeNodeIfPresent(::opcua::Server &server, const ::opcua::NodeId &id) {
+  const ::opcua::StatusCode status =
+      ::opcua::services::deleteNode(server, id, true);
+  if (!status.isGood() && status.get() != UA_STATUSCODE_BADNODEIDUNKNOWN) {
+    throw ::opcua::BadStatus(status);
+  }
+}
+
+void ensureEmptyCategory(::opcua::Server &server, const ::opcua::NodeId &parent,
+                         const ::opcua::NodeId &id,
+                         std::string_view browse_name) {
+  const auto existing = ::opcua::services::readNodeClass(server, id);
+  if (existing) {
+    return;
+  }
+  if (existing.code().get() != UA_STATUSCODE_BADNODEIDUNKNOWN) {
+    throw ::opcua::BadStatus(existing.code());
+  }
+  ::opcua::ObjectAttributes attributes;
+  attributes.setDisplayName(::opcua::LocalizedText("en-US", browse_name));
+  const auto added =
+      ::opcua::services::addObject(server, parent, id, browse_name, attributes,
+                                   ::opcua::ObjectTypeId::BaseObjectType,
+                                   ::opcua::ReferenceTypeId::HasComponent);
+  if (!added) {
+    throw ::opcua::BadStatus(added.code());
+  }
+}
+
+void removeCategories(::opcua::Server &server, std::uint16_t namespace_index,
+                      const std::vector<std::string_view> &base,
+                      std::initializer_list<std::string_view> categories) {
+  for (const std::string_view category : categories) {
+    auto path = base;
+    path.push_back(category);
+    removeNodeIfPresent(server, modelNodeId(namespace_index, path));
+  }
+}
+
+void ensureDenseCategories(::opcua::Server &server,
+                           std::uint16_t namespace_index,
+                           const std::vector<std::string_view> &base) {
+  const auto parent = modelNodeId(namespace_index, base);
+  for (const auto &[segment, browse_name] :
+       std::array<std::pair<std::string_view, std::string_view>, 5U>{{
+           {"operations", "Operations"},
+           {"properties", "Properties"},
+           {"attributes", "Attributes"},
+           {"ports", "Ports"},
+           {"services", "Services"},
+       }}) {
+    auto path = base;
+    path.push_back(segment);
+    ensureEmptyCategory(server, parent, modelNodeId(namespace_index, path),
+                        browse_name);
+  }
 }
 
 struct CanonicalTypesFixture {
@@ -147,6 +222,15 @@ public:
         .arg("value", "Value to negate.");
     BOOST_REQUIRE(math->addService(advanced));
     BOOST_REQUIRE(provides()->addService(math));
+
+    RTT::Service::shared_ptr sparse_empty =
+        RTT::Service::Create("sparse_empty");
+    sparse_empty->doc("Intentionally sparse empty service.");
+    BOOST_REQUIRE(provides()->addService(sparse_empty));
+
+    RTT::Service::shared_ptr dense_empty = RTT::Service::Create("dense_empty");
+    dense_empty->doc("Legacy dense empty service.");
+    BOOST_REQUIRE(provides()->addService(dense_empty));
   }
 
   ~ProxyTarget() override {
@@ -206,6 +290,13 @@ public:
   FixtureValue observed{4, 2.5};
   RTT::OutputPort<FixtureValue> feedback{"Feedback"};
   RTT::InputPort<FixtureValue> command{"Command"};
+};
+
+class SparseRootTarget final : public RTT::TaskContext {
+public:
+  SparseRootTarget()
+      : RTT::TaskContext("remote/sparse-root",
+                         RTT::TaskContext::PreOperational) {}
 };
 
 } // namespace
@@ -741,6 +832,181 @@ BOOST_FIXTURE_TEST_CASE(proxy_creation_rejects_a_missing_component,
       server.endpointUrl(), "missing/component", proxy_options, &error);
   BOOST_TEST(proxy == nullptr);
   BOOST_TEST(!error.empty());
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    proxy_treats_missing_category_objects_as_empty_collections,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+  const std::string component_name = target.getName();
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&](::opcua::Server &native) {
+            removeCategories(
+                native, namespace_index,
+                {"components", component_name, "services", "Command"},
+                {"properties", "attributes", "ports", "services"});
+            removeCategories(native, namespace_index,
+                             {"components", component_name, "services", "math",
+                              "services", "advanced"},
+                             {"properties", "attributes", "ports", "services"});
+            removeCategories(
+                native, namespace_index,
+                {"components", component_name, "services", "sparse_empty"},
+                {"operations", "properties", "attributes", "ports",
+                 "services"});
+            ensureDenseCategories(
+                native, namespace_index,
+                {"components", component_name, "services", "dense_empty"});
+          },
+          std::chrono::seconds(1), &error),
+      error);
+
+  RTT::opcua::TaskContextProxyOptions proxy_options;
+  proxy_options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), proxy_options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  BOOST_REQUIRE(proxy->provides()->getService("Command"));
+  BOOST_REQUIRE(proxy->provides()->getService("Command")->getOperation("read"));
+  BOOST_REQUIRE(proxy->provides()->getService("sparse_empty"));
+  BOOST_TEST(proxy->provides()->getService("sparse_empty")->doc() ==
+             "Intentionally sparse empty service.");
+  BOOST_TEST(proxy->provides()
+                 ->getService("sparse_empty")
+                 ->getOperationNames()
+                 .empty());
+  BOOST_TEST(proxy->provides()
+                 ->getService("sparse_empty")
+                 ->properties()
+                 ->getPropertyNames()
+                 .empty());
+  BOOST_TEST(proxy->provides()
+                 ->getService("sparse_empty")
+                 ->getAttributeNames()
+                 .empty());
+  BOOST_TEST(
+      proxy->provides()->getService("sparse_empty")->getPortNames().empty());
+  BOOST_TEST(proxy->provides()
+                 ->getService("sparse_empty")
+                 ->getProviderNames()
+                 .empty());
+  BOOST_REQUIRE(proxy->provides()->getService("dense_empty"));
+  BOOST_TEST(proxy->provides()->getService("dense_empty")->doc() ==
+             "Legacy dense empty service.");
+  BOOST_TEST(proxy->provides()
+                 ->getService("dense_empty")
+                 ->getOperationNames()
+                 .empty());
+  BOOST_TEST(proxy->provides()
+                 ->getService("dense_empty")
+                 ->properties()
+                 ->getPropertyNames()
+                 .empty());
+  BOOST_TEST(proxy->provides()
+                 ->getService("dense_empty")
+                 ->getAttributeNames()
+                 .empty());
+  BOOST_TEST(
+      proxy->provides()->getService("dense_empty")->getPortNames().empty());
+  BOOST_TEST(
+      proxy->provides()->getService("dense_empty")->getProviderNames().empty());
+  BOOST_REQUIRE(proxy->provides()
+                    ->getService("math")
+                    ->getService("advanced")
+                    ->getOperation("negate"));
+
+  proxy.reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_reconstructs_a_sparse_component_root,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SparseRootTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+  const std::string component_name = target.getName();
+  BOOST_REQUIRE_MESSAGE(server.invoke(
+                            [&](::opcua::Server &native) {
+                              removeCategories(
+                                  native, namespace_index,
+                                  {"components", component_name},
+                                  {"properties", "ports", "services"});
+                            },
+                            std::chrono::seconds(1), &error),
+                        error);
+
+  RTT::opcua::TaskContextProxyOptions proxy_options;
+  proxy_options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), proxy_options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  BOOST_TEST(proxy->getName() == target.getName());
+  BOOST_TEST(proxy->provides()->properties()->getPropertyNames().empty());
+  BOOST_TEST(proxy->ports()->getPortNames().empty());
+  BOOST_TEST(proxy->provides()->getProviderNames().empty());
+
+  proxy.reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    proxy_rejects_missing_metadata_inside_a_present_category,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+  const auto type_id =
+      modelNodeId(namespace_index, {"components", target.getName(), "ports",
+                                    "Feedback", "type"});
+  BOOST_REQUIRE_MESSAGE(server.invoke(
+                            [&](::opcua::Server &native) {
+                              const ::opcua::StatusCode status =
+                                  ::opcua::services::deleteNode(native, type_id,
+                                                                true);
+                              if (!status.isGood()) {
+                                throw ::opcua::BadStatus(status);
+                              }
+                            },
+                            std::chrono::seconds(1), &error),
+                        error);
+
+  RTT::opcua::TaskContextProxyOptions proxy_options;
+  proxy_options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), proxy_options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("failed to read RTT port type metadata") !=
+             std::string::npos);
+  BOOST_TEST(error.find("BadNodeIdUnknown") != std::string::npos);
 
   server.stop();
 }
