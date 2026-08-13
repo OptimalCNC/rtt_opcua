@@ -846,15 +846,16 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
 enum class PortMethodKind { read, write };
 
 std::pair<std::vector<::opcua::Argument>, std::vector<::opcua::Argument>>
-portMethodArguments(const TypeCodec &codec, bool reads) {
+portMethodArguments(const TypeCodec &sample_codec,
+                    const TypeCodec &status_codec, bool reads) {
   std::vector<::opcua::Argument> inputs;
   std::vector<::opcua::Argument> outputs;
   const ::opcua::Argument status_argument(
       "status", ::opcua::LocalizedText("en-US", "RTT port flow status."),
-      ::opcua::DataTypeId::String, ::opcua::ValueRank::Scalar);
+      status_codec.dataTypeNodeId(), status_codec.valueRank());
   const ::opcua::Argument value_argument(
       "value", ::opcua::LocalizedText("en-US", "RTT port sample."),
-      codec.dataTypeNodeId(), codec.valueRank());
+      sample_codec.dataTypeNodeId(), sample_codec.valueRank());
   if (reads) {
     outputs.push_back(status_argument);
     outputs.push_back(value_argument);
@@ -885,8 +886,14 @@ portMethodSpec(const std::string &port_path, RTT::base::PortInterface &port,
       type_registry && port.getTypeInfo()
           ? type_registry->codecForTypeInfo(port.getTypeInfo())
           : nullptr;
-  if (expected_codec != nullptr) {
-    auto [inputs, outputs] = portMethodArguments(*expected_codec, reads);
+  const TypeCodec *expected_status_codec =
+      type_registry
+          ? type_registry->codecForTypeName(reads ? "FlowStatus"
+                                                  : "WriteStatus")
+          : nullptr;
+  if (expected_codec != nullptr && expected_status_codec != nullptr) {
+    auto [inputs, outputs] =
+        portMethodArguments(*expected_codec, *expected_status_codec, reads);
     spec.expected_input_arguments = std::move(inputs);
     spec.expected_output_arguments = std::move(outputs);
   }
@@ -909,7 +916,13 @@ portMethodSpec(const std::string &port_path, RTT::base::PortInterface &port,
     const TypeCodec *codec =
         type_registry ? type_registry->codecForTypeInfo(port->getTypeInfo())
                       : nullptr;
-    if (codec == nullptr || !codec->hasValue()) {
+    const TypeCodec *status_codec =
+        type_registry
+            ? type_registry->codecForTypeName(reads ? "FlowStatus"
+                                                    : "WriteStatus")
+            : nullptr;
+    if (codec == nullptr || !codec->hasValue() || status_codec == nullptr ||
+        !status_codec->hasValue()) {
       assignError(error, "RTT port type has no OPC UA protocol");
       return false;
     }

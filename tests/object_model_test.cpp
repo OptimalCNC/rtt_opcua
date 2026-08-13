@@ -316,7 +316,8 @@ public:
   std::string status{"idle"};
   std::string model_name{"arm-v1"};
   RTT::OutputPort<double> feedback{"Feedback"};
-  RTT::InputPort<std::uint16_t> command{"Command"};
+  RTT::InputPort<std::uint16_t> command{
+      "Command", RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)};
   RTT::Service::shared_ptr motion;
   std::uint16_t scale{2U};
 };
@@ -681,8 +682,8 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(empty_feedback_result.statusCode().isGood());
   BOOST_REQUIRE_EQUAL(empty_feedback_result.outputArguments().size(), 2U);
-  BOOST_TEST(empty_feedback_result.outputArguments()[0].to<std::string>() ==
-             "NoData");
+  BOOST_TEST(empty_feedback_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::NoData));
 
   BOOST_TEST(component.feedback.write(4.25) == RTT::WriteSuccess);
   BOOST_TEST(component.feedback.write(5.25) == RTT::WriteSuccess);
@@ -697,32 +698,32 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(feedback_result.statusCode().isGood());
   BOOST_REQUIRE_EQUAL(feedback_result.outputArguments().size(), 2U);
-  BOOST_TEST(feedback_result.outputArguments()[0].to<std::string>() ==
-             "NewData");
+  BOOST_TEST(feedback_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::NewData));
   BOOST_TEST(feedback_result.outputArguments()[1].to<double>() == 4.25);
 
   const auto second_feedback_result =
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(second_feedback_result.statusCode().isGood());
   BOOST_REQUIRE_EQUAL(second_feedback_result.outputArguments().size(), 2U);
-  BOOST_TEST(second_feedback_result.outputArguments()[0].to<std::string>() ==
-             "NewData");
+  BOOST_TEST(second_feedback_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::NewData));
   BOOST_TEST(second_feedback_result.outputArguments()[1].to<double>() == 5.25);
 
   const auto third_feedback_result =
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(third_feedback_result.statusCode().isGood());
   BOOST_REQUIRE_EQUAL(third_feedback_result.outputArguments().size(), 2U);
-  BOOST_TEST(third_feedback_result.outputArguments()[0].to<std::string>() ==
-             "NewData");
+  BOOST_TEST(third_feedback_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::NewData));
   BOOST_TEST(third_feedback_result.outputArguments()[1].to<double>() == 6.25);
 
   const auto feedback_old_result =
       ::opcua::services::call(client, feedback_id, feedback_read_id, {});
   BOOST_REQUIRE(feedback_old_result.statusCode().isGood());
   BOOST_REQUIRE_EQUAL(feedback_old_result.outputArguments().size(), 2U);
-  BOOST_TEST(feedback_old_result.outputArguments()[0].to<std::string>() ==
-             "OldData");
+  BOOST_TEST(feedback_old_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::OldData));
   BOOST_TEST(feedback_old_result.outputArguments()[1].to<double>() == 6.25);
 
   const std::vector<::opcua::Variant> wrong_command_inputs{
@@ -739,10 +740,21 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       client, command_id, command_write_id, command_inputs);
   BOOST_REQUIRE(command_result.statusCode().isGood());
   BOOST_REQUIRE_EQUAL(command_result.outputArguments().size(), 1U);
-  BOOST_TEST(command_result.outputArguments()[0].to<std::string>() ==
-             "WriteSuccess");
+  BOOST_TEST(command_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::WriteSuccess));
+
+  const std::vector<::opcua::Variant> replacement_command_inputs{
+      ::opcua::Variant(std::uint16_t{74})};
+  const auto replacement_command_result = ::opcua::services::call(
+      client, command_id, command_write_id, replacement_command_inputs);
+  BOOST_REQUIRE(replacement_command_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(replacement_command_result.outputArguments().size(), 1U);
+  BOOST_TEST(
+      replacement_command_result.outputArguments()[0].to<std::int32_t>() ==
+      static_cast<std::int32_t>(RTT::WriteSuccess));
+
   BOOST_REQUIRE(component.command.read(commanded_value) == RTT::NewData);
-  BOOST_TEST(commanded_value == 73U);
+  BOOST_TEST(commanded_value == 74U);
   BOOST_TEST(::opcua::services::readValue(client, revision_id)
                  .value()
                  .to<std::uint64_t>() == 1U);

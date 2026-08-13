@@ -4,6 +4,7 @@
 #include <rtt/base/InputPortInterface.hpp>
 #include <rtt/base/OutputPortInterface.hpp>
 #include <rtt/base/PortInterface.hpp>
+#include <rtt/internal/DataSource.hpp>
 #include <rtt/types/TypeInfo.hpp>
 #include <rtt/types/Types.hpp>
 
@@ -20,6 +21,44 @@ void assignError(std::string *output, std::string value) {
   }
 }
 
+bool decodeFlowStatus(const TypeCodec &codec, const ::opcua::Variant &value,
+                      RTT::FlowStatus *status) {
+  const auto source = codec.makeDataSource(value);
+  const auto typed = boost::dynamic_pointer_cast<
+      RTT::internal::DataSource<RTT::FlowStatus>>(source);
+  if (!typed || status == nullptr) {
+    return false;
+  }
+  *status = typed->get();
+  return *status == RTT::NoData || *status == RTT::OldData ||
+         *status == RTT::NewData;
+}
+
+bool decodeWriteStatus(const TypeCodec &codec, const ::opcua::Variant &value,
+                       RTT::WriteStatus *status) {
+  const auto source = codec.makeDataSource(value);
+  const auto typed = boost::dynamic_pointer_cast<
+      RTT::internal::DataSource<RTT::WriteStatus>>(source);
+  if (!typed || status == nullptr) {
+    return false;
+  }
+  *status = typed->get();
+  return *status == RTT::WriteSuccess || *status == RTT::WriteFailure ||
+         *status == RTT::NotConnected;
+}
+
+std::string_view writeStatusName(RTT::WriteStatus status) {
+  switch (status) {
+  case RTT::WriteSuccess:
+    return "WriteSuccess";
+  case RTT::WriteFailure:
+    return "WriteFailure";
+  case RTT::NotConnected:
+    return "NotConnected";
+  }
+  return "invalid WriteStatus";
+}
+
 } // namespace
 
 std::shared_ptr<RemotePortAdapter>
@@ -31,8 +70,16 @@ RemotePortAdapter::create(std::shared_ptr<ClientSession> session,
   const auto type_registry = session ? session->typeRegistry() : nullptr;
   const TypeCodec *codec =
       type_registry ? type_registry->codecForTypeInfo(type_info) : nullptr;
+  const TypeCodec *status_codec =
+      type_registry
+          ? type_registry->codecForTypeName(
+                description.direction == RemotePortDirection::input
+                    ? "WriteStatus"
+                    : "FlowStatus")
+          : nullptr;
   if (!session || type_info == nullptr || codec == nullptr ||
-      !codec->hasValue()) {
+      !codec->hasValue() || status_codec == nullptr ||
+      !status_codec->hasValue()) {
     assignError(error, "remote port '" + description.name +
                            "' uses unsupported RTT type '" +
                            description.type_name + "'");
@@ -54,17 +101,19 @@ RemotePortAdapter::create(std::shared_ptr<ClientSession> session,
   assignError(error, {});
   return std::shared_ptr<RemotePortAdapter>(
       new RemotePortAdapter(std::move(session), std::move(description),
-                            type_registry, type_info, codec, std::move(port)));
+                            type_registry, type_info, codec, status_codec,
+                            std::move(port)));
 }
 
 RemotePortAdapter::RemotePortAdapter(
     std::shared_ptr<ClientSession> session, RemotePortDescription description,
     std::shared_ptr<const EndpointTypeRegistry> type_registry,
     const RTT::types::TypeInfo *type_info, const TypeCodec *codec,
+    const TypeCodec *status_codec,
     std::unique_ptr<RTT::base::PortInterface> port)
     : session_(std::move(session)), description_(std::move(description)),
       type_registry_(std::move(type_registry)), type_info_(type_info),
-      codec_(codec), port_(std::move(port)) {}
+      codec_(codec), status_codec_(status_codec), port_(std::move(port)) {}
 
 RemotePortAdapter::~RemotePortAdapter() noexcept {
   if (!port_) {
@@ -185,16 +234,18 @@ void RemotePortAdapter::pumpInput() {
              "' returned an invalid response");
     return;
   }
-  const std::string status = result.outputs.front().to<std::string>();
-  if (status == "WriteSuccess") {
+  RTT::WriteStatus status{};
+  if (!decodeWriteStatus(*status_codec_, result.outputs.front(), &status)) {
+    setError("remote input port '" + description_.name +
+             "' returned an invalid WriteStatus");
+    return;
+  }
+  if (status == RTT::WriteSuccess) {
     pending_input_.reset();
     clearError();
-  } else if (status == "WriteFailure" || status == "NotConnected") {
-    setError("remote input port '" + description_.name + "' returned " +
-             status);
   } else {
-    setError("remote input port '" + description_.name +
-             "' returned invalid status '" + status + "'");
+    setError("remote input port '" + description_.name + "' returned " +
+             std::string(writeStatusName(status)));
   }
 }
 
@@ -231,8 +282,14 @@ void RemotePortAdapter::pumpOutput() {
              "' returned an invalid response");
     return;
   }
-  const std::string status = result.outputs[0].to<std::string>();
-  if (status == "NewData" || (status == "OldData" && first_connected_poll)) {
+  RTT::FlowStatus status{};
+  if (!decodeFlowStatus(*status_codec_, result.outputs[0], &status)) {
+    setError("remote output port '" + description_.name +
+             "' returned an invalid FlowStatus");
+    return;
+  }
+  if (status == RTT::NewData ||
+      (status == RTT::OldData && first_connected_poll)) {
     pending_output_ = codec_->makeDataSource(result.outputs[1]);
     if (!pending_output_) {
       setError("failed to decode sample from remote output port '" +
@@ -248,10 +305,6 @@ void RemotePortAdapter::pumpOutput() {
       return;
     }
     pending_output_.reset();
-  } else if (status != "OldData" && status != "NoData") {
-    setError("remote output port '" + description_.name +
-             "' returned invalid status '" + status + "'");
-    return;
   }
   output_was_connected_ = true;
   clearError();

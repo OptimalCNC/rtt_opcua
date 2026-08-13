@@ -46,6 +46,7 @@ private:
                     std::shared_ptr<const EndpointTypeRegistry> type_registry,
                     const RTT::types::TypeInfo *type_info,
                     const TypeCodec *codec,
+                    const TypeCodec *status_codec,
                     std::unique_ptr<RTT::base::PortInterface> port);
 
   void pumpInput();
@@ -59,6 +60,7 @@ private:
   std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   const RTT::types::TypeInfo *type_info_;
   const TypeCodec *codec_;
+  const TypeCodec *status_codec_;
   std::unique_ptr<RTT::base::PortInterface> port_;
   RTT::base::DataSourceBase::shared_ptr pending_input_source_;
   std::optional<::opcua::Variant> pending_input_;

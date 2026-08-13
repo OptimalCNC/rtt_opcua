@@ -773,10 +773,19 @@ BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_incompatible_port_method_signature,
                    const ::opcua::NodeId &) {
                   return ::opcua::StatusCode(UA_STATUSCODE_GOOD);
                 });
+        const std::vector<::opcua::Argument> outputs{
+            ::opcua::Argument(
+                "status",
+                ::opcua::LocalizedText("en-US", "Legacy string status."),
+                ::opcua::DataTypeId::String, ::opcua::ValueRank::Scalar),
+            ::opcua::Argument(
+                "value", ::opcua::LocalizedText("en-US", "Port sample."),
+                ::opcua::DataTypeId::Int32, ::opcua::ValueRank::Scalar),
+        };
         replaced =
             ::opcua::services::addMethod(
-                native, port_id, method_id, "read", std::move(callback), {}, {},
-                attributes, ::opcua::ReferenceTypeId::HasComponent)
+                native, port_id, method_id, "read", std::move(callback), {},
+                outputs, attributes, ::opcua::ReferenceTypeId::HasComponent)
                 .hasValue();
       },
       std::chrono::seconds(1), &error));

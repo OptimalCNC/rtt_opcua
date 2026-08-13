@@ -213,7 +213,11 @@ bool validatePortMethod(::opcua::Client &client,
                         const EndpointTypeRegistry &type_registry,
                         const RemotePortDescription &port, std::string *error) {
   const TypeCodec *codec = type_registry.codecForTypeName(port.type_name);
-  if (codec == nullptr || !codec->hasValue()) {
+  const TypeCodec *status_codec = type_registry.codecForTypeName(
+      port.direction == RemotePortDirection::input ? "WriteStatus"
+                                                   : "FlowStatus");
+  if (codec == nullptr || !codec->hasValue() || status_codec == nullptr ||
+      !status_codec->hasValue()) {
     assignError(error, "remote port '" + port.name +
                            "' uses unsupported RTT type '" + port.type_name +
                            "'");
@@ -240,10 +244,10 @@ bool validatePortMethod(::opcua::Client &client,
   if (!readMethodArguments(client, port.method_id, &inputs, &outputs, error)) {
     return false;
   }
-  const ::opcua::NodeId status_type(::opcua::DataTypeId::String);
   const bool status_output =
       !outputs.empty() &&
-      argumentMatches(outputs.front(), status_type, ::opcua::ValueRank::Scalar);
+      argumentMatches(outputs.front(), status_codec->dataTypeNodeId(),
+                      status_codec->valueRank());
   const bool valid =
       port.direction == RemotePortDirection::input
           ? inputs.size() == 1U && outputs.size() == 1U && status_output &&
