@@ -1185,8 +1185,7 @@ void appendServiceContents(
     const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
     std::size_t port_buffer_size, std::set<const RTT::Service *> &ancestry,
     std::size_t depth) {
-  if (!service || depth > kMaximumServiceDepth ||
-      ancestry.contains(service.get())) {
+  if (!service) {
     return;
   }
   ancestry.insert(service.get());
@@ -1201,20 +1200,35 @@ void appendServiceContents(
 
   const std::string services_path = appendNodeSegment(service_path, "services");
   for (const std::string &name : service->getProviderNames()) {
-    if (name == "this" || service->getPort(name) != nullptr) {
+    if (name == "this") {
       continue;
     }
     RTT::Service::shared_ptr child = service->getService(name);
     if (!child) {
       continue;
     }
+    const std::string child_diagnostic_path =
+        appendDiagnosticSegment(diagnostic_path, name);
+    if (ancestry.contains(child.get())) {
+      appendUnsupported(unsupported, state->component_name,
+                        child_diagnostic_path, "service", "RTT::Service",
+                        "forms a cycle in the RTT service graph");
+      continue;
+    }
+    if (depth >= kMaximumServiceDepth) {
+      appendUnsupported(
+          unsupported, state->component_name, child_diagnostic_path, "service",
+          "RTT::Service",
+          "exceeds the maximum supported service depth of " +
+              std::to_string(kMaximumServiceDepth));
+      continue;
+    }
     const std::string child_path = appendNodeSegment(services_path, name);
     insertNode(nodes,
                objectSpec(child_path, services_path, name, child->doc()));
     appendServiceContents(nodes, unsupported, child, child_path,
-                          appendDiagnosticSegment(diagnostic_path, name), state,
-                          dispatcher, type_registry, port_buffer_size, ancestry,
-                          depth + 1U);
+                          child_diagnostic_path, state, dispatcher,
+                          type_registry, port_buffer_size, ancestry, depth + 1U);
   }
 
   ancestry.erase(service.get());

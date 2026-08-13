@@ -168,6 +168,11 @@ public:
     addOperation("waitForRelease", &GatedOperationComponent::waitForRelease,
                  this, RTT::OwnThread)
         .doc("Wait until the test releases the operation gate.");
+    provides()
+        ->addSynchronousOperation("waitSynchronouslyForRelease",
+                                  &GatedOperationComponent::waitForRelease,
+                                  this)
+        .doc("Wait synchronously until the test releases the operation gate.");
   }
 
   ~GatedOperationComponent() override { release(); }
@@ -302,15 +307,28 @@ class StaticSnapshotComponent final : public RTT::TaskContext {
 public:
   StaticSnapshotComponent()
       : RTT::TaskContext("arm/left"),
-        motion(RTT::Service::Create("motion/raw", this)) {
+        motion(RTT::Service::Create("motion/raw", this)),
+        limits(RTT::Service::Create("limits")) {
     provides()->doc("Arm controller");
     addProperty("Gain", gain).doc("Controller gain");
     addAttribute("Status", status);
     addConstant("ModelName", model_name);
     addPort(feedback).doc("Measured feedback");
     addPort(command).doc("Requested command");
+    addEventPort(trigger).doc("External trigger");
     motion->addProperty("Scale", scale).doc("Motion scale");
+    motion->addAttribute("Mode", motion_mode);
+    motion->addConstant("Units", motion_units);
+    motion->addOperation("offset", &StaticSnapshotComponent::offset, this,
+                         RTT::ClientThread)
+        .arg("value", "Value to offset.");
+    motion->addPort(motion_feedback).doc("Nested feedback");
+    motion->addPort(motion_command).doc("Nested command");
+    limits->addProperty("Maximum", maximum).doc("Maximum command");
+    BOOST_REQUIRE(motion->addService(limits));
   }
+
+  std::int32_t offset(std::int32_t value) const { return value + scale; }
 
   std::int32_t gain{7};
   std::string status{"idle"};
@@ -318,8 +336,48 @@ public:
   RTT::OutputPort<double> feedback{"Feedback"};
   RTT::InputPort<std::uint16_t> command{
       "Command", RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)};
+  RTT::InputPort<std::int32_t> trigger{"Trigger"};
   RTT::Service::shared_ptr motion;
+  RTT::Service::shared_ptr limits;
   std::uint16_t scale{2U};
+  std::string motion_mode{"automatic"};
+  std::string motion_units{"counts"};
+  RTT::OutputPort<std::int32_t> motion_feedback{"MotionFeedback"};
+  RTT::InputPort<std::int32_t> motion_command{"MotionCommand"};
+  std::int32_t maximum{100};
+};
+
+class CyclicServiceComponent final : public RTT::TaskContext {
+public:
+  CyclicServiceComponent()
+      : RTT::TaskContext("cyclic-services"),
+        first(RTT::Service::Create("first")),
+        second(RTT::Service::Create("second")) {
+    BOOST_REQUIRE(provides()->addService(first));
+    BOOST_REQUIRE(first->addService(second));
+    second->setOwner(nullptr);
+    BOOST_REQUIRE(second->addService(first));
+  }
+
+  ~CyclicServiceComponent() override { second->removeService("first"); }
+
+  RTT::Service::shared_ptr first;
+  RTT::Service::shared_ptr second;
+};
+
+class DeepServiceComponent final : public RTT::TaskContext {
+public:
+  DeepServiceComponent() : RTT::TaskContext("deep-services") {
+    RTT::Service::shared_ptr parent = provides();
+    for (std::size_t index = 0U; index < 33U; ++index) {
+      auto child = RTT::Service::Create("level" + std::to_string(index));
+      BOOST_REQUIRE(parent->addService(child));
+      services.push_back(child);
+      parent = std::move(child);
+    }
+  }
+
+  std::vector<RTT::Service::shared_ptr> services;
 };
 
 class NonRetainingOutputComponent final : public RTT::TaskContext {
@@ -620,10 +678,62 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   const auto command_write_id = modelNodeId(
       namespace_index,
       {"components", "arm/left", "ports", "Command", "write"});
+  const auto trigger_write_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "ports", "Trigger", "write"});
+  const auto command_service_operations_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "Command", "operations"});
+  const auto command_service_read_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "Command",
+                        "operations", "read"});
+  const auto command_service_clear_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "Command",
+                        "operations", "clear"});
+  const auto feedback_service_operations_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "Feedback", "operations"});
+  const auto feedback_service_write_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "Feedback",
+                        "operations", "write"});
+  const auto feedback_service_last_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "Feedback",
+                        "operations", "last"});
+  const auto trigger_service_read_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "Trigger",
+                        "operations", "read"});
+  const auto motion_operations_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "motion/raw",
+                        "operations"});
+  const auto motion_offset_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "motion/raw",
+                        "operations", "offset"});
   const auto service_property_id = modelNodeId(
       namespace_index,
       {"components", "arm/left", "services", "motion/raw", "properties",
        "Scale"});
+  const auto service_attribute_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "motion/raw", "attributes",
+       "Mode"});
+  const auto service_constant_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "motion/raw", "attributes",
+       "Units"});
+  const auto nested_output_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "motion/raw", "ports",
+       "MotionFeedback"});
+  const auto nested_input_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "motion/raw", "ports",
+       "MotionCommand"});
+  const auto nested_port_service_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "motion/raw",
+                        "services", "MotionFeedback", "operations", "last"});
+  const auto deep_service_property_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "services", "motion/raw",
+                        "services", "limits", "properties", "Maximum"});
   const auto revision_id = modelNodeId(namespace_index, {"model", "revision"});
 
   BOOST_TEST(::opcua::services::readBrowseName(client, component_id)
@@ -667,9 +777,43 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   BOOST_TEST(::opcua::services::readValue(client, command_direction_id)
                  .value()
                  .to<std::string>() == "input");
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, trigger_write_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, command_service_read_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, command_service_clear_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, feedback_service_write_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, feedback_service_last_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, trigger_service_read_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, nested_output_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, nested_input_id)));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, nested_port_service_id)));
   BOOST_TEST(::opcua::services::readValue(client, service_property_id)
                  .value()
                  .to<std::uint16_t>() == 2U);
+  BOOST_TEST(::opcua::services::readValue(client, service_attribute_id)
+                 .value()
+                 .to<std::string>() == "automatic");
+  BOOST_TEST(::opcua::services::readValue(client, service_constant_id)
+                 .value()
+                 .to<std::string>() == "counts");
+  BOOST_TEST(::opcua::services::readValue(client, deep_service_property_id)
+                 .value()
+                 .to<std::int32_t>() == 100);
+
+  const auto offset_result = ::opcua::services::call(
+      client, motion_operations_id, motion_offset_id,
+      {::opcua::Variant(std::int32_t{40})});
+  BOOST_REQUIRE(offset_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(offset_result.outputArguments().size(), 1U);
+  BOOST_TEST(offset_result.outputArguments()[0].to<std::int32_t>() == 42);
 
   const auto unwritten_feedback = ::opcua::services::readAttribute(
       client, feedback_value_id, ::opcua::AttributeId::Value,
@@ -755,11 +899,83 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
 
   BOOST_REQUIRE(component.command.read(commanded_value) == RTT::NewData);
   BOOST_TEST(commanded_value == 74U);
+
+  const auto adapter_read_result = ::opcua::services::call(
+      client, command_service_operations_id, command_service_read_id,
+      {::opcua::Variant(std::uint16_t{0})});
+  BOOST_REQUIRE(adapter_read_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(adapter_read_result.outputArguments().size(), 2U);
+  BOOST_TEST(adapter_read_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::OldData));
+  BOOST_TEST(adapter_read_result.outputArguments()[1].to<std::uint16_t>() ==
+             74U);
+  const auto adapter_clear_result = ::opcua::services::call(
+      client, command_service_operations_id, command_service_clear_id, {});
+  BOOST_REQUIRE(adapter_clear_result.statusCode().isGood());
+  BOOST_TEST(component.command.read(commanded_value) == RTT::NoData);
+
+  const auto adapter_write_result = ::opcua::services::call(
+      client, feedback_service_operations_id, feedback_service_write_id,
+      {::opcua::Variant(8.25)});
+  BOOST_REQUIRE(adapter_write_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(adapter_write_result.outputArguments().size(), 1U);
+  BOOST_TEST(adapter_write_result.outputArguments()[0].to<std::int32_t>() ==
+             static_cast<std::int32_t>(RTT::WriteSuccess));
+  const auto adapter_last_result = ::opcua::services::call(
+      client, feedback_service_operations_id, feedback_service_last_id, {});
+  BOOST_REQUIRE(adapter_last_result.statusCode().isGood());
+  BOOST_REQUIRE_EQUAL(adapter_last_result.outputArguments().size(), 1U);
+  BOOST_TEST(adapter_last_result.outputArguments()[0].to<double>() == 8.25);
   BOOST_TEST(::opcua::services::readValue(client, revision_id)
                  .value()
                  .to<std::uint64_t>() == 1U);
 
   client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(service_cycles_reject_the_whole_component,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  CyclicServiceComponent component;
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::UnsupportedResource> diagnostics;
+  BOOST_TEST(!model.publishComponent(component, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].path == "first.second.first");
+  BOOST_TEST(diagnostics[0].kind == "service");
+  BOOST_TEST(diagnostics[0].reason.find("cycle") != std::string::npos);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(service_depth_overflow_rejects_the_whole_component,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  DeepServiceComponent component;
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::UnsupportedResource> diagnostics;
+  BOOST_TEST(!model.publishComponent(component, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].path.starts_with("level0.level1"));
+  BOOST_TEST(diagnostics[0].path.ends_with("level32"));
+  BOOST_TEST(diagnostics[0].kind == "service");
+  BOOST_TEST(diagnostics[0].reason.find("depth") != std::string::npos);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
   server.stop();
 }
 
@@ -854,8 +1070,8 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
   BOOST_TEST(!model.publishComponent(component, &error, &diagnostics));
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
-  BOOST_TEST(diagnostics.size() == 6U);
-  BOOST_REQUIRE_EQUAL(diagnostics.size(), 6U);
+  BOOST_TEST(diagnostics.size() == 9U);
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 9U);
   BOOST_TEST(model.unsupportedResources(component.getName()) == diagnostics,
              boost::test_tools::per_element());
   BOOST_TEST(std::ranges::is_sorted(diagnostics));
@@ -866,7 +1082,10 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
   const std::vector<std::pair<std::string, std::string>> expected_resources{
       {"unsupported.UnsupportedAttribute", "attribute"},
       {"unsupported.UnsupportedInput", "input port"},
+      {"unsupported.UnsupportedInput.read", "operation"},
       {"unsupported.UnsupportedOutput", "output port"},
+      {"unsupported.UnsupportedOutput.last", "operation"},
+      {"unsupported.UnsupportedOutput.write", "operation"},
       {"unsupported.UnsupportedProperty", "property"},
       {"unsupported.consume", "operation"},
       {"unsupported.produce", "operation"},
@@ -1347,6 +1566,52 @@ BOOST_FIXTURE_TEST_CASE(timed_out_operation_is_reaped_without_graph_activity,
   const auto operation_id =
       modelNodeId(namespace_index, {"components", "gated-operation",
                                     "operations", "waitForRelease"});
+
+  const auto call_started = std::chrono::steady_clock::now();
+  const auto result =
+      ::opcua::services::call(client, operations_id, operation_id, {});
+  const auto call_elapsed = std::chrono::steady_clock::now() - call_started;
+  BOOST_TEST(result.statusCode() == UA_STATUSCODE_BADTIMEOUT);
+  BOOST_TEST(call_elapsed < std::chrono::seconds(1));
+  BOOST_REQUIRE(component.waitUntilEntered());
+  BOOST_TEST(component.invocationCount() == 1U);
+  BOOST_TEST(model.pendingOperationCount() == 1U);
+
+  component.release();
+  BOOST_REQUIRE(waitUntil([&] { return model.pendingOperationCount() == 0U; }));
+  BOOST_TEST(component.completionCount() == 1U);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    timed_out_synchronous_operation_is_reaped_without_graph_activity,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::opcua::ObjectModelOptions options;
+  options.operation_timeout = std::chrono::milliseconds(30);
+  GatedOperationComponent component;
+  RTT::opcua::ObjectModel model(server, options);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(component, &error), error);
+  GatedOperationRelease release_on_exit(component);
+
+  ::opcua::ClientConfig client_config;
+  client_config.setTimeout(2000U);
+  ::opcua::Client client(std::move(client_config));
+  client.connect(server.endpointUrl());
+  const auto operations_id = modelNodeId(
+      namespace_index, {"components", "gated-operation", "operations"});
+  const auto operation_id = modelNodeId(
+      namespace_index,
+      {"components", "gated-operation", "operations",
+       "waitSynchronouslyForRelease"});
 
   const auto call_started = std::chrono::steady_clock::now();
   const auto result =

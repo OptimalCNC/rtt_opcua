@@ -133,7 +133,7 @@ public:
 
     RTT::Service::shared_ptr math = RTT::Service::Create("math");
     math->doc("Math utilities.");
-    math->addLocalPort(math_feedback).doc("Nested calculation feedback.");
+    math->addPort(math_feedback).doc("Nested calculation feedback.");
     math->addProperty("Offset", offset).doc("Scale offset.");
     math->addAttribute("Mode", mode);
     math->addConstant("Unit", unit);
@@ -151,7 +151,7 @@ public:
 
   ~ProxyTarget() override {
     if (RTT::Service::shared_ptr math = provides()->getService("math")) {
-      math->removeLocalPort(math_feedback.getName());
+      math->removePort(math_feedback.getName());
       math->clear();
     }
   }
@@ -234,6 +234,17 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_TEST(proxy->provides()->doc() == "Remote calculator.");
   BOOST_TEST(proxy->connectionState() ==
              RTT::opcua::ProxyConnectionState::connected);
+
+  RTT::Service::shared_ptr feedback_service =
+      proxy->provides()->getService("Feedback");
+  RTT::Service::shared_ptr command_service =
+      proxy->provides()->getService("Command");
+  BOOST_REQUIRE(feedback_service);
+  BOOST_REQUIRE(command_service);
+  BOOST_REQUIRE(proxy->ports()->getPort("Feedback") != nullptr);
+  BOOST_REQUIRE(proxy->ports()->getPort("Command") != nullptr);
+  BOOST_REQUIRE(feedback_service->getOperation("last") != nullptr);
+  BOOST_REQUIRE(command_service->getOperation("read") != nullptr);
 
   BOOST_TEST(proxy->isActive());
   BOOST_TEST(proxy->activate());
@@ -326,6 +337,16 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_REQUIRE(waitUntil(
       [&] { return feedback_sink.read(feedback_value) == RTT::NewData; }));
   BOOST_TEST(feedback_value == 41);
+
+  std::int32_t generated_last_value = 0;
+  RTT::OperationInterfacePart *generated_last =
+      feedback_service->getOperation("last");
+  RTT::internal::OperationCallerC generated_last_caller(
+      generated_last, "last", RTT::internal::GlobalEngine::Instance());
+  generated_last_caller.ret(generated_last_value);
+  generated_last_caller.check();
+  BOOST_REQUIRE(generated_last_caller.call());
+  BOOST_TEST(generated_last_value == 41);
   RTT::InputPort<std::int32_t> initialized_feedback_sink(
       "InitializedFeedbackSink");
   BOOST_REQUIRE(remote_feedback->createConnection(
@@ -390,6 +411,10 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   auto *remote_math_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
       math->getPort("MathFeedback"));
   BOOST_REQUIRE(remote_math_feedback != nullptr);
+  RTT::Service::shared_ptr math_feedback_service =
+      math->getService("MathFeedback");
+  BOOST_REQUIRE(math_feedback_service);
+  BOOST_REQUIRE(math_feedback_service->getOperation("last") != nullptr);
   BOOST_TEST(remote_math_feedback->getDescription() ==
              "Nested calculation feedback.");
   RTT::InputPort<std::int32_t> math_feedback_sink("MathFeedbackSink");

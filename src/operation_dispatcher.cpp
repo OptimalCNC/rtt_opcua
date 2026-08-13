@@ -16,6 +16,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <exception>
+#include <future>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -81,8 +82,21 @@ OperationSchema unsupportedValueSchema(const RTT::types::TypeInfo *type,
   return unsupportedSchema(type, "does not support OPC UA values");
 }
 
-struct PendingInvocation {
-  PendingInvocation(
+class PendingInvocation {
+public:
+  virtual ~PendingInvocation() = default;
+  virtual bool collectIfDone() noexcept = 0;
+
+  void wait() noexcept {
+    while (!collectIfDone()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+};
+
+class PendingSendInvocation final : public PendingInvocation {
+public:
+  PendingSendInvocation(
       ComponentLease &&component_lease,
       std::unique_ptr<RTT::internal::SendHandleC> operation_handle,
       std::vector<RTT::base::DataSourceBase::shared_ptr>
@@ -90,7 +104,7 @@ struct PendingInvocation {
       : lease(std::move(component_lease)), handle(std::move(operation_handle)),
         values(std::move(collected_values)) {}
 
-  bool collectIfDone() noexcept {
+  bool collectIfDone() noexcept override {
     try {
       return handle->collectIfDone() != RTT::SendNotReady;
     } catch (...) {
@@ -98,16 +112,54 @@ struct PendingInvocation {
     }
   }
 
-  void wait() noexcept {
-    while (!collectIfDone()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-
   ComponentLease lease;
   std::unique_ptr<RTT::internal::SendHandleC> handle;
   std::vector<RTT::base::DataSourceBase::shared_ptr> values;
 };
+
+class PendingCallInvocation final : public PendingInvocation {
+public:
+  PendingCallInvocation(
+      ComponentLease &&component_lease, std::future<bool> operation_result,
+      std::vector<RTT::base::DataSourceBase::shared_ptr>
+          collected_values) noexcept
+      : lease(std::move(component_lease)), result(std::move(operation_result)),
+        values(std::move(collected_values)) {}
+
+  bool collectIfDone() noexcept override {
+    try {
+      if (result.wait_for(std::chrono::milliseconds::zero()) !=
+          std::future_status::ready) {
+        return false;
+      }
+      static_cast<void>(result.get());
+    } catch (...) {
+    }
+    return true;
+  }
+
+  ComponentLease lease;
+  std::future<bool> result;
+  std::vector<RTT::base::DataSourceBase::shared_ptr> values;
+};
+
+::opcua::StatusCode encodeOutputs(
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
+    const std::vector<RTT::base::DataSourceBase::shared_ptr> &values,
+    ::opcua::Span<::opcua::Variant> outputs) {
+  if (values.size() != outputs.size()) {
+    return UA_STATUSCODE_BADINTERNALERROR;
+  }
+  for (std::size_t index = 0U; index < outputs.size(); ++index) {
+    const TypeCodec *codec =
+        type_registry ? type_registry->codecForDataSource(values[index])
+                      : nullptr;
+    if (codec == nullptr || !codec->toVariant(values[index], &outputs[index])) {
+      return UA_STATUSCODE_BADINTERNALERROR;
+    }
+  }
+  return UA_STATUSCODE_GOOD;
+}
 
 void waitForCompletion(RTT::internal::SendHandleC &handle) noexcept {
   while (true) {
@@ -138,28 +190,25 @@ public:
     try {
       auto retained_handle =
           std::make_unique<RTT::internal::SendHandleC>(handle);
-      auto pending = std::make_shared<PendingInvocation>(
+      auto pending = std::make_shared<PendingSendInvocation>(
           std::move(lease), std::move(retained_handle), std::move(values));
-      bool retained = false;
-      try {
-        {
-          std::lock_guard<std::mutex> lock(mutex);
-          if (!draining) {
-            invocations.push_back(pending);
-            retained = true;
-          }
-        }
-      } catch (...) {
-        pending->wait();
-        return;
-      }
-      if (retained) {
-        wake.notify_one();
-        return;
-      }
-      pending->wait();
+      retainPending(std::move(pending));
     } catch (...) {
       waitForCompletion(handle);
+    }
+  }
+
+  void retain(
+      ComponentLease &&lease, std::future<bool> result,
+      std::vector<RTT::base::DataSourceBase::shared_ptr> values) noexcept {
+    try {
+      retainPending(std::make_shared<PendingCallInvocation>(
+          std::move(lease), std::move(result), std::move(values)));
+    } catch (...) {
+      try {
+        result.wait();
+      } catch (...) {
+      }
     }
   }
 
@@ -199,6 +248,27 @@ public:
   std::jthread reaper;
 
 private:
+  void retainPending(std::shared_ptr<PendingInvocation> pending) noexcept {
+    bool retained = false;
+    try {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!draining) {
+          invocations.push_back(pending);
+          retained = true;
+        }
+      }
+    } catch (...) {
+      pending->wait();
+      return;
+    }
+    if (retained) {
+      wake.notify_one();
+      return;
+    }
+    pending->wait();
+  }
+
   void reapOnce() noexcept {
     std::erase_if(invocations, [](const auto &invocation) {
       return invocation->collectIfDone();
@@ -347,6 +417,8 @@ OperationDispatcher::invoke(const std::shared_ptr<ComponentState> &state,
     RTT::internal::OperationCallerC caller(
         &operation, operation.getName(),
         RTT::internal::GlobalEngine::Instance());
+    std::vector<RTT::base::DataSourceBase::shared_ptr> input_values;
+    input_values.reserve(inputs.size());
     for (std::size_t index = 0U; index < inputs.size(); ++index) {
       const RTT::types::TypeInfo *type =
           operation.getArgumentType(static_cast<unsigned int>(index + 1U));
@@ -359,11 +431,59 @@ OperationDispatcher::invoke(const std::shared_ptr<ComponentState> &state,
       if (!value) {
         return UA_STATUSCODE_BADINVALIDARGUMENT;
       }
+      input_values.push_back(value);
       caller.arg(value);
     }
     caller.check();
     if (!caller.ready()) {
       return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + impl_->timeout;
+    if (!caller.getSendDataSource()) {
+      const OperationSchema schema = describe(operation);
+      if (!schema.supported || schema.output_sources.size() != outputs.size()) {
+        return UA_STATUSCODE_BADNOTSUPPORTED;
+      }
+      std::vector<RTT::base::DataSourceBase::shared_ptr> collected_values;
+      collected_values.reserve(outputs.size());
+      for (std::size_t index = 0U; index < schema.output_sources.size();
+           ++index) {
+        const std::int32_t source = schema.output_sources[index];
+        RTT::base::DataSourceBase::shared_ptr value;
+        if (source == -1) {
+          const RTT::types::TypeInfo *type =
+              operation.getCollectType(static_cast<unsigned int>(index + 1U));
+          value = type == nullptr ? RTT::base::DataSourceBase::shared_ptr{}
+                                  : type->buildValue();
+          if (value) {
+            caller.ret(value);
+          }
+        } else if (source >= 0 &&
+                   static_cast<std::size_t>(source) < input_values.size()) {
+          value = input_values[static_cast<std::size_t>(source)];
+        }
+        if (!value) {
+          return UA_STATUSCODE_BADNOTSUPPORTED;
+        }
+        collected_values.push_back(std::move(value));
+      }
+
+      std::future<bool> result = std::async(
+          std::launch::async,
+          [caller = std::move(caller)]() mutable { return caller.call(); });
+      while (result.wait_for(std::chrono::milliseconds(1)) !=
+             std::future_status::ready) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          impl_->retain(std::move(lease), std::move(result),
+                        std::move(collected_values));
+          return UA_STATUSCODE_BADTIMEOUT;
+        }
+      }
+      if (!result.get()) {
+        return UA_STATUSCODE_BADRESOURCEUNAVAILABLE;
+      }
+      return encodeOutputs(impl_->type_registry, collected_values, outputs);
     }
 
     RTT::internal::SendHandleC handle = caller.send();
@@ -385,21 +505,10 @@ OperationDispatcher::invoke(const std::shared_ptr<ComponentState> &state,
       return UA_STATUSCODE_BADINTERNALERROR;
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + impl_->timeout;
     while (true) {
       const RTT::SendStatus status = handle.collectIfDone();
       if (status == RTT::SendSuccess) {
-        for (std::size_t index = 0U; index < outputs.size(); ++index) {
-          const TypeCodec *codec =
-              impl_->type_registry ? impl_->type_registry->codecForDataSource(
-                                         collected_values[index])
-                                   : nullptr;
-          if (codec == nullptr ||
-              !codec->toVariant(collected_values[index], &outputs[index])) {
-            return UA_STATUSCODE_BADINTERNALERROR;
-          }
-        }
-        return UA_STATUSCODE_GOOD;
+        return encodeOutputs(impl_->type_registry, collected_values, outputs);
       }
       if (status != RTT::SendNotReady) {
         return UA_STATUSCODE_BADRESOURCEUNAVAILABLE;
