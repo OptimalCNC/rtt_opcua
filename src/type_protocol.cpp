@@ -9,6 +9,7 @@
 
 #include <rtt/FlowStatus.hpp>
 #include <rtt/OutputPort.hpp>
+#include <rtt/base/TaskCore.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
 #include <rtt/rt_string.hpp>
@@ -48,6 +49,30 @@ template <typename T, typename Wire> Wire encodeScalar(const T &value) {
   }
 }
 
+bool isTaskStateCode(std::int32_t value) noexcept {
+  return value >= static_cast<std::int32_t>(RTT::base::TaskCore::Init) &&
+         value <=
+             static_cast<std::int32_t>(RTT::base::TaskCore::RunTimeError);
+}
+
+template <typename T, typename Wire>
+bool isValidScalarValue(const T &value) noexcept {
+  if constexpr (std::is_same_v<T, RTT::base::TaskCore::TaskState> &&
+                std::is_same_v<Wire, std::int32_t>) {
+    return isTaskStateCode(static_cast<std::int32_t>(value));
+  }
+  return true;
+}
+
+template <typename T, typename Wire>
+bool isValidScalarWireValue(const Wire &value) noexcept {
+  if constexpr (std::is_same_v<T, RTT::base::TaskCore::TaskState> &&
+                std::is_same_v<Wire, std::int32_t>) {
+    return isTaskStateCode(value);
+  }
+  return true;
+}
+
 template <typename T, typename Wire> T decodeScalarValue(const Wire &value) {
   if constexpr (std::is_same_v<T, RTT::rt_string> &&
                 std::is_same_v<Wire, std::string>) {
@@ -64,7 +89,11 @@ bool decodeScalar(const ::opcua::Variant &value,
     return false;
   }
   try {
-    *decoded = decodeScalarValue<T, Wire>(value.to<Wire>());
+    const Wire wire_value = value.to<Wire>();
+    if (!isValidScalarWireValue<T, Wire>(wire_value)) {
+      return false;
+    }
+    *decoded = decodeScalarValue<T, Wire>(wire_value);
     return true;
   } catch (const std::exception &) {
     return false;
@@ -150,6 +179,9 @@ public:
   void
   set(typename RTT::internal::AssignableDataSource<T>::param_t value) override {
     try {
+      if (!isValidScalarValue<T, Wire>(value)) {
+        return;
+      }
       const ::opcua::Variant encoded(encodeScalar<T, Wire>(value));
       if (writer_ && writer_(encoded)) {
         last_value_ = value;
@@ -351,7 +383,11 @@ public:
       return false;
     }
     typed->evaluate();
-    *value = ::opcua::Variant(encodeScalar<T, Wire>(typed->value()));
+    const T local_value = typed->value();
+    if (!isValidScalarValue<T, Wire>(local_value)) {
+      return false;
+    }
+    *value = ::opcua::Variant(encodeScalar<T, Wire>(local_value));
     return true;
   }
 
@@ -365,7 +401,11 @@ public:
       return false;
     }
     try {
-      typed->set(decodeScalarValue<T, Wire>(value.to<Wire>()));
+      const Wire wire_value = value.to<Wire>();
+      if (!isValidScalarWireValue<T, Wire>(wire_value)) {
+        return false;
+      }
+      typed->set(decodeScalarValue<T, Wire>(wire_value));
       return true;
     } catch (const std::exception &) {
       return false;
@@ -378,8 +418,12 @@ public:
       return {};
     }
     try {
+      const Wire wire_value = value.to<Wire>();
+      if (!isValidScalarWireValue<T, Wire>(wire_value)) {
+        return {};
+      }
       return new RTT::internal::ValueDataSource<T>(
-          decodeScalarValue<T, Wire>(value.to<Wire>()));
+          decodeScalarValue<T, Wire>(wire_value));
     } catch (const std::exception &) {
       return {};
     }
@@ -408,6 +452,9 @@ public:
     T sample{};
     if (!typed->getLastWrittenValue(sample)) {
       return PortValueStatus::waiting_for_initial_data;
+    }
+    if (!isValidScalarValue<T, Wire>(sample)) {
+      return PortValueStatus::error;
     }
     *value = ::opcua::Variant(encodeScalar<T, Wire>(sample));
     return PortValueStatus::value;
@@ -699,6 +746,11 @@ makeCanonicalProtocol(std::string_view type_name) {
   if (type_name == "WriteStatus") {
     return std::make_unique<
         ScalarTypeProtocol<RTT::WriteStatus, std::int32_t>>(
+        descriptor->data_type, fingerprint);
+  }
+  if (type_name == "TaskState") {
+    return std::make_unique<ScalarTypeProtocol<
+        RTT::base::TaskCore::TaskState, std::int32_t>>(
         descriptor->data_type, fingerprint);
   }
   if (type_name == "Void") {

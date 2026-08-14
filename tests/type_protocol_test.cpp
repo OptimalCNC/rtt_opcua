@@ -11,6 +11,7 @@
 #include <rtt/ConnPolicy.hpp>
 #include <rtt/FlowStatus.hpp>
 #include <rtt/OutputPort.hpp>
+#include <rtt/base/TaskCore.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
 #include <rtt/rt_string.hpp>
@@ -251,6 +252,106 @@ BOOST_AUTO_TEST_CASE(status_protocols_use_documented_int32_codes) {
       ::opcua::Variant(std::string("NewData"))));
   BOOST_TEST(!write->makeDataSource(
       ::opcua::Variant(std::string("WriteSuccess"))));
+}
+
+BOOST_AUTO_TEST_CASE(task_state_protocol_is_a_strict_bounded_int32_scalar) {
+  using TaskState = RTT::base::TaskCore::TaskState;
+
+  const auto registry = makeRegistry();
+  const RTT::opcua::TypeCodec *codec =
+      registry->codecForTypeName("TaskState");
+  BOOST_REQUIRE(codec != nullptr);
+  BOOST_CHECK(codec->dataTypeNodeId() ==
+              ::opcua::NodeId(::opcua::DataTypeId::Int32));
+  BOOST_CHECK(codec->valueRank() == ::opcua::ValueRank::Scalar);
+
+  const std::array<std::pair<TaskState, std::int32_t>, 7> values{{
+      {RTT::base::TaskCore::Init, 0},
+      {RTT::base::TaskCore::PreOperational, 1},
+      {RTT::base::TaskCore::FatalError, 2},
+      {RTT::base::TaskCore::Exception, 3},
+      {RTT::base::TaskCore::Stopped, 4},
+      {RTT::base::TaskCore::Running, 5},
+      {RTT::base::TaskCore::RunTimeError, 6},
+  }};
+  for (const auto &[state, code] : values) {
+    RTT::internal::ValueDataSource<TaskState>::shared_ptr source =
+        new RTT::internal::ValueDataSource<TaskState>(state);
+    ::opcua::Variant encoded;
+    BOOST_REQUIRE(codec->toVariant(source, &encoded));
+    BOOST_TEST(encoded.isScalar());
+    BOOST_TEST(encoded.isType(::opcua::NodeId(::opcua::DataTypeId::Int32)));
+    BOOST_TEST(encoded.to<std::int32_t>() == code);
+
+    BOOST_REQUIRE(codec->assignVariant(::opcua::Variant(code), source));
+    BOOST_TEST(static_cast<std::int32_t>(source->get()) == code);
+
+    const auto decoded = codec->makeDataSource(::opcua::Variant(code));
+    const auto typed = boost::dynamic_pointer_cast<
+        RTT::internal::DataSource<TaskState>>(decoded);
+    BOOST_REQUIRE(typed);
+    BOOST_TEST(static_cast<std::int32_t>(typed->get()) == code);
+
+    RTT::OutputPort<TaskState> port("state");
+    port.write(state);
+    ::opcua::Variant port_value;
+    BOOST_CHECK(codec->portValue(&port, &port_value) ==
+                RTT::opcua::PortValueStatus::value);
+    BOOST_TEST(port_value.to<std::int32_t>() == code);
+  }
+
+  RTT::internal::ValueDataSource<TaskState>::shared_ptr destination =
+      new RTT::internal::ValueDataSource<TaskState>(
+          RTT::base::TaskCore::Stopped);
+  for (const std::int32_t invalid : {-1, 7}) {
+    BOOST_TEST(!codec->assignVariant(::opcua::Variant(invalid), destination));
+    BOOST_TEST(destination->get() == RTT::base::TaskCore::Stopped);
+    BOOST_TEST(!codec->makeDataSource(::opcua::Variant(invalid)));
+  }
+  BOOST_TEST(!codec->assignVariant(::opcua::Variant(std::uint32_t{4}),
+                                   destination));
+  BOOST_TEST(!codec->assignVariant(::opcua::Variant(std::string("Stopped")),
+                                   destination));
+  BOOST_TEST(!codec->assignVariant(
+      ::opcua::Variant(std::vector<std::int32_t>{4}), destination));
+
+  ::opcua::Variant remote(std::int32_t{4});
+  RTT::opcua::VariantReader reader = [&remote](::opcua::Variant *value) {
+    *value = remote;
+    return true;
+  };
+  bool wrote = false;
+  RTT::opcua::VariantWriter writer =
+      [&remote, &wrote](const ::opcua::Variant &value) {
+        remote = value;
+        wrote = true;
+        return true;
+      };
+  const auto writable = boost::dynamic_pointer_cast<
+      RTT::internal::AssignableDataSource<TaskState>>(
+      codec->makeProxyDataSource(reader, writer));
+  BOOST_REQUIRE(writable);
+  for (const std::int32_t invalid : {-1, 7}) {
+    writable->set(static_cast<TaskState>(invalid));
+    BOOST_TEST(!wrote);
+    BOOST_TEST(remote.to<std::int32_t>() == 4);
+  }
+
+  remote = ::opcua::Variant(std::int32_t{7});
+  BOOST_TEST(!writable->evaluate());
+
+  ::opcua::Variant invalid_encoded;
+  for (const std::int32_t invalid : {-1, 7}) {
+    RTT::internal::ValueDataSource<TaskState>::shared_ptr invalid_source =
+        new RTT::internal::ValueDataSource<TaskState>(
+            static_cast<TaskState>(invalid));
+    BOOST_TEST(!codec->toVariant(invalid_source, &invalid_encoded));
+  }
+
+  RTT::OutputPort<TaskState> invalid_port("invalid-state");
+  invalid_port.write(static_cast<TaskState>(7));
+  BOOST_CHECK(codec->portValue(&invalid_port, &invalid_encoded) ==
+              RTT::opcua::PortValueStatus::error);
 }
 
 BOOST_AUTO_TEST_CASE(output_port_value_distinguishes_unwritten_from_current) {
