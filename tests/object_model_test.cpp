@@ -1040,9 +1040,9 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   requirePortDirection(client, nested_input_id, motion_command_direction_id,
                        RTT::opcua::PortDirection::input);
   requirePortValueSchema(client, command_value_id, ::opcua::DataTypeId::UInt16,
-                         ::opcua::ValueRank::Scalar, false, true);
+                         ::opcua::ValueRank::Scalar, true, true);
   requirePortValueSchema(client, trigger_value_id, ::opcua::DataTypeId::Int32,
-                         ::opcua::ValueRank::Scalar, false, true);
+                         ::opcua::ValueRank::Scalar, true, true);
   requirePortValueSchema(client, feedback_value_id, ::opcua::DataTypeId::Double,
                          ::opcua::ValueRank::Scalar, true, false);
   requireMissingNode(client, feedback_read_id);
@@ -1191,24 +1191,28 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       client, command_value_id, ::opcua::AttributeId::Value,
       ::opcua::TimestampsToReturn::Neither);
   BOOST_REQUIRE(command_read);
-  BOOST_TEST(command_read->status() == UA_STATUSCODE_BADNOTREADABLE);
+  BOOST_TEST(command_read->status() == UA_STATUSCODE_BADWAITINGFORINITIALDATA);
 
   ::opcua::SubscriptionParameters subscription_parameters;
   subscription_parameters.publishingInterval = 10.0;
   ::opcua::Subscription<::opcua::Client> subscription(client,
                                                       subscription_parameters);
   std::optional<::opcua::StatusCode> input_monitor_status;
+  std::optional<std::uint16_t> input_monitor_value;
   auto input_monitor = subscription.subscribeDataChange(
       command_value_id, ::opcua::AttributeId::Value,
       [&](::opcua::IntegerId, ::opcua::IntegerId,
           const ::opcua::DataValue &data) {
         input_monitor_status = data.status();
+        if (data.status().isGood() && data.hasValue()) {
+          input_monitor_value = data.value().to<std::uint16_t>();
+        }
       });
   BOOST_REQUIRE(waitUntil([&] {
     client.runIterate(10U);
     return input_monitor_status.has_value();
   }));
-  BOOST_TEST(*input_monitor_status == UA_STATUSCODE_BADNOTREADABLE);
+  BOOST_TEST(*input_monitor_status == UA_STATUSCODE_BADWAITINGFORINITIALDATA);
 
   std::mutex notification_mutex;
   std::vector<double> notifications;
@@ -1254,6 +1258,12 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                  client, command_value_id,
                  ::opcua::Variant(std::vector<std::uint16_t>{73U})) ==
              UA_STATUSCODE_BADTYPEMISMATCH);
+  const auto unwritten_command = ::opcua::services::readAttribute(
+      client, command_value_id, ::opcua::AttributeId::Value,
+      ::opcua::TimestampsToReturn::Neither);
+  BOOST_REQUIRE(unwritten_command);
+  BOOST_TEST(unwritten_command->status() ==
+             UA_STATUSCODE_BADWAITINGFORINITIALDATA);
   std::uint16_t commanded_value = 0U;
   BOOST_TEST(component.command.read(commanded_value) == RTT::NoData);
 
@@ -1263,18 +1273,31 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
           .isGood());
   BOOST_REQUIRE(component.command.read(commanded_value) == RTT::NewData);
   BOOST_TEST(commanded_value == 73U);
+  BOOST_TEST(::opcua::services::readValue(client, command_value_id)
+                 .value()
+                 .to<std::uint16_t>() == 73U);
+  BOOST_REQUIRE(waitUntil([&] {
+    client.runIterate(10U);
+    return input_monitor_value == 73U;
+  }));
   BOOST_REQUIRE(
       ::opcua::services::writeValue(client, command_value_id,
                                     ::opcua::Variant(std::uint16_t{73U}))
           .isGood());
   BOOST_REQUIRE(component.command.read(commanded_value) == RTT::NewData);
   BOOST_TEST(commanded_value == 73U);
+  BOOST_TEST(::opcua::services::readValue(client, command_value_id)
+                 .value()
+                 .to<std::uint16_t>() == 73U);
   BOOST_REQUIRE(
       ::opcua::services::writeValue(client, command_value_id,
                                     ::opcua::Variant(std::uint16_t{74U}))
           .isGood());
   BOOST_REQUIRE(component.command.read(commanded_value) == RTT::NewData);
   BOOST_TEST(commanded_value == 74U);
+  BOOST_TEST(::opcua::services::readValue(client, command_value_id)
+                 .value()
+                 .to<std::uint16_t>() == 74U);
 
   const auto adapter_read_result = ::opcua::services::call(
       client, command_service_operations_id, command_service_read_id,
@@ -1289,6 +1312,15 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       client, command_service_operations_id, command_service_clear_id, {});
   BOOST_REQUIRE(adapter_clear_result.statusCode().isGood());
   BOOST_TEST(component.command.read(commanded_value) == RTT::NoData);
+
+  component.command.disconnect();
+  BOOST_TEST(
+      ::opcua::services::writeValue(client, command_value_id,
+                                    ::opcua::Variant(std::uint16_t{75U})) ==
+      UA_STATUSCODE_BADNOTCONNECTED);
+  BOOST_TEST(::opcua::services::readValue(client, command_value_id)
+                 .value()
+                 .to<std::uint16_t>() == 74U);
 
   const auto adapter_write_result = ::opcua::services::call(
       client, feedback_service_operations_id, feedback_service_write_id,

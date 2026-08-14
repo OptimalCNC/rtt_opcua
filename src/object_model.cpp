@@ -123,10 +123,6 @@ bool sharedRootEnsured(const ::opcua::Result<::opcua::NodeId> &result,
   return ::opcua::AccessLevel::CurrentRead;
 }
 
-::opcua::Bitmask<::opcua::AccessLevel> writeOnlyAccess() {
-  return ::opcua::AccessLevel::CurrentWrite;
-}
-
 ::opcua::Bitmask<::opcua::AccessLevel> readWriteAccess() {
   return ::opcua::AccessLevel::CurrentRead | ::opcua::AccessLevel::CurrentWrite;
 }
@@ -202,10 +198,24 @@ public:
       : state_(std::move(state)), bridge_(std::move(bridge)) {}
 
   ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
-                           const ::opcua::NumericRange *,
+                           const ::opcua::NumericRange *range,
                            ::opcua::DataValue &value, bool) override {
-    value.setStatus(UA_STATUSCODE_BADNOTREADABLE);
-    return UA_STATUSCODE_BADNOTREADABLE;
+    if (range != nullptr) {
+      value.setStatus(UA_STATUSCODE_BADINDEXRANGEINVALID);
+      return UA_STATUSCODE_BADINDEXRANGEINVALID;
+    }
+    ComponentLease lease(state_.lock());
+    if (!lease || !bridge_) {
+      value.setStatus(UA_STATUSCODE_BADNOTCONNECTED);
+      return UA_STATUSCODE_BADNOTCONNECTED;
+    }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!has_last_value_) {
+      value.setStatus(UA_STATUSCODE_BADWAITINGFORINITIALDATA);
+      return UA_STATUSCODE_BADWAITINGFORINITIALDATA;
+    }
+    value.setValue(last_value_);
+    return UA_STATUSCODE_GOOD;
   }
 
   ::opcua::StatusCode write(::opcua::Session &, const ::opcua::NodeId &,
@@ -221,12 +231,21 @@ public:
     if (!lease || !bridge_) {
       return UA_STATUSCODE_BADNOTCONNECTED;
     }
-    return bridge_->write(value.value());
+    const std::lock_guard<std::mutex> lock(mutex_);
+    const ::opcua::StatusCode status = bridge_->write(value.value());
+    if (status.isGood()) {
+      last_value_ = value.value();
+      has_last_value_ = true;
+    }
+    return status;
   }
 
 private:
   std::weak_ptr<ComponentState> state_;
   std::shared_ptr<PortBridge> bridge_;
+  std::mutex mutex_;
+  ::opcua::Variant last_value_;
+  bool has_last_value_{false};
 };
 
 class OutputPortValueDataSource final : public ::opcua::DataSourceBase {
@@ -755,8 +774,8 @@ inputPortValueSpec(const std::string &port_path,
     if (codec->valueRank() == ::opcua::ValueRank::OneDimension) {
       attributes.setArrayDimensions({0U});
     }
-    attributes.setAccessLevel(writeOnlyAccess());
-    attributes.setUserAccessLevel(writeOnlyAccess());
+    attributes.setAccessLevel(readWriteAccess());
+    attributes.setUserAccessLevel(readWriteAccess());
     const auto result = ::opcua::services::addVariable(
         server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
         "value", attributes, ::opcua::VariableTypeId::BaseDataVariableType,
