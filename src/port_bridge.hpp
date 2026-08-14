@@ -2,11 +2,12 @@
 
 #include <open62541pp/types.hpp>
 
-#include <cstddef>
 #include <memory>
 #include <string>
 
 namespace RTT::base {
+class InputPortInterface;
+class OutputPortInterface;
 class PortInterface;
 }
 
@@ -19,18 +20,19 @@ namespace RTT::opcua::detail {
 class PortBridge final {
 public:
   static std::shared_ptr<PortBridge>
-  create(RTT::base::PortInterface &port,
+  create(RTT::base::InputPortInterface &port,
          std::shared_ptr<const EndpointTypeRegistry> type_registry,
-         std::size_t buffer_size, std::string *error = nullptr);
+         std::string *error = nullptr);
+
+  static std::shared_ptr<PortBridge>
+  observe(RTT::base::OutputPortInterface &port, std::string *error = nullptr);
 
   ~PortBridge();
 
   PortBridge(const PortBridge &) = delete;
   PortBridge &operator=(const PortBridge &) = delete;
 
-  ::opcua::StatusCode read(::opcua::Span<::opcua::Variant> outputs) noexcept;
-  ::opcua::StatusCode write(::opcua::Span<const ::opcua::Variant> inputs,
-                            ::opcua::Span<::opcua::Variant> outputs) noexcept;
+  ::opcua::StatusCode write(const ::opcua::Variant &value) noexcept;
 
 private:
   PortBridge(std::shared_ptr<const EndpointTypeRegistry> type_registry,

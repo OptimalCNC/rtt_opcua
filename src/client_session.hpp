@@ -62,8 +62,15 @@ struct RemotePortDescription {
   std::string type_name;
   RemoteServicePath service_path;
   PortDirection direction{PortDirection::input};
-  ::opcua::NodeId object_id;
-  ::opcua::NodeId method_id;
+  ::opcua::NodeId value_id;
+};
+
+enum class RemotePortReadStatus { value, waiting, failed };
+
+struct RemotePortReadResult {
+  RemotePortReadStatus status{RemotePortReadStatus::failed};
+  ::opcua::Variant value;
+  std::string error;
 };
 
 class ClientSession final {
@@ -95,12 +102,12 @@ public:
   bool readValue(const ::opcua::NodeId &node_id, ::opcua::Variant *value);
   bool writeValue(const ::opcua::NodeId &node_id,
                   const ::opcua::Variant &value);
+  RemotePortReadResult readPortValue(const ::opcua::NodeId &node_id);
+  bool writePortValue(const ::opcua::NodeId &node_id,
+                      const ::opcua::Variant &value);
   RemoteCallResult call(const ::opcua::NodeId &object_id,
                         const ::opcua::NodeId &method_id,
                         const std::vector<::opcua::Variant> &inputs);
-  RemoteCallResult callPort(const ::opcua::NodeId &object_id,
-                            const ::opcua::NodeId &method_id,
-                            const std::vector<::opcua::Variant> &inputs);
   RemoteCallResult callOperation(const std::string &component_name,
                                  const RemoteServicePath &service_path,
                                  const std::string &operation_name,
@@ -117,8 +124,7 @@ private:
   RemoteCallResult callLocked(const ::opcua::NodeId &object_id,
                               const ::opcua::NodeId &method_id,
                               const std::vector<::opcua::Variant> &inputs,
-                              bool require_interface_access,
-                              bool tolerate_not_connected);
+                              bool require_interface_access);
 
   const std::string endpoint_url_;
   const std::chrono::milliseconds request_timeout_;

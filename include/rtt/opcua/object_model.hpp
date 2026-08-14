@@ -35,7 +35,6 @@ struct UnsupportedResource {
 
 struct ObjectModelOptions {
   std::chrono::milliseconds operation_timeout{std::chrono::seconds(5)};
-  std::size_t port_buffer_size{64U};
   std::function<void(const std::string &)> warning_sink;
 };
 

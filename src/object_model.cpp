@@ -31,7 +31,6 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -124,6 +123,10 @@ bool sharedRootEnsured(const ::opcua::Result<::opcua::NodeId> &result,
   return ::opcua::AccessLevel::CurrentRead;
 }
 
+::opcua::Bitmask<::opcua::AccessLevel> writeOnlyAccess() {
+  return ::opcua::AccessLevel::CurrentWrite;
+}
+
 ::opcua::Bitmask<::opcua::AccessLevel> readWriteAccess() {
   return ::opcua::AccessLevel::CurrentRead | ::opcua::AccessLevel::CurrentWrite;
 }
@@ -192,14 +195,49 @@ private:
   bool writable_;
 };
 
-class PortValueDataSource final : public ::opcua::DataSourceBase {
+class InputPortValueDataSource final : public ::opcua::DataSourceBase {
 public:
-  PortValueDataSource(std::weak_ptr<ComponentState> state,
-                      RTT::base::OutputPortInterface *port,
-                      std::shared_ptr<const EndpointTypeRegistry> type_registry,
-                      const TypeCodec *codec)
+  InputPortValueDataSource(std::weak_ptr<ComponentState> state,
+                           std::shared_ptr<PortBridge> bridge)
+      : state_(std::move(state)), bridge_(std::move(bridge)) {}
+
+  ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
+                           const ::opcua::NumericRange *,
+                           ::opcua::DataValue &value, bool) override {
+    value.setStatus(UA_STATUSCODE_BADNOTREADABLE);
+    return UA_STATUSCODE_BADNOTREADABLE;
+  }
+
+  ::opcua::StatusCode write(::opcua::Session &, const ::opcua::NodeId &,
+                            const ::opcua::NumericRange *range,
+                            const ::opcua::DataValue &value) override {
+    if (range != nullptr) {
+      return UA_STATUSCODE_BADINDEXRANGEINVALID;
+    }
+    if (!value.hasValue()) {
+      return UA_STATUSCODE_BADTYPEMISMATCH;
+    }
+    ComponentLease lease(state_.lock());
+    if (!lease || !bridge_) {
+      return UA_STATUSCODE_BADNOTCONNECTED;
+    }
+    return bridge_->write(value.value());
+  }
+
+private:
+  std::weak_ptr<ComponentState> state_;
+  std::shared_ptr<PortBridge> bridge_;
+};
+
+class OutputPortValueDataSource final : public ::opcua::DataSourceBase {
+public:
+  OutputPortValueDataSource(
+      std::weak_ptr<ComponentState> state, RTT::base::OutputPortInterface *port,
+      std::shared_ptr<const EndpointTypeRegistry> type_registry,
+      const TypeCodec *codec, std::shared_ptr<PortBridge> observer)
       : state_(std::move(state)), port_(port),
-        type_registry_(std::move(type_registry)), codec_(codec) {}
+        type_registry_(std::move(type_registry)), codec_(codec),
+        observer_(std::move(observer)) {}
 
   ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
                            const ::opcua::NumericRange *range,
@@ -242,6 +280,7 @@ private:
   RTT::base::OutputPortInterface *port_;
   std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   const TypeCodec *codec_;
+  std::shared_ptr<PortBridge> observer_;
 };
 
 enum class NodeKind { object, variable, method };
@@ -670,10 +709,74 @@ dataSourceSpec(const std::string &parent_path, const std::string &name,
 }
 
 NodeSpec
-portValueSpec(const std::string &port_path,
-              RTT::base::OutputPortInterface &port,
-              const std::shared_ptr<ComponentState> &state,
-              std::shared_ptr<const EndpointTypeRegistry> type_registry) {
+inputPortValueSpec(const std::string &port_path,
+                   RTT::base::InputPortInterface &port,
+                   const std::shared_ptr<ComponentState> &state,
+                   std::shared_ptr<const EndpointTypeRegistry> type_registry) {
+  NodeSpec spec;
+  spec.kind = NodeKind::variable;
+  spec.parent_path = port_path;
+  spec.path = appendNodeSegment(port_path, "value");
+  spec.browse_name = "value";
+  spec.fingerprint = "input-port-value|" + pointerFingerprint(&port);
+  spec.create = [path = spec.path, parent = spec.parent_path, port = &port,
+                 weak_state = std::weak_ptr<ComponentState>(state),
+                 type_registry = std::move(type_registry)](
+                    ::opcua::Server &server, std::uint16_t namespace_index,
+                    bool *created, std::string *error) {
+    ComponentLease lease(weak_state.lock());
+    if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
+      assignError(
+          error,
+          "RTT input port became unavailable while creating OPC UA value");
+      return false;
+    }
+    const TypeCodec *codec =
+        type_registry ? type_registry->codecForTypeInfo(port->getTypeInfo())
+                      : nullptr;
+    if (codec == nullptr || !codec->hasValue()) {
+      assignError(error, "RTT input port type has no OPC UA protocol");
+      return false;
+    }
+
+    std::string bridge_error;
+    const auto bridge = PortBridge::create(*port, type_registry, &bridge_error);
+    if (!bridge) {
+      assignError(error, std::move(bridge_error));
+      return false;
+    }
+
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", "value"));
+    attributes.setDescription(::opcua::LocalizedText(
+        "en-US", "Write one sample to the RTT input port."));
+    attributes.setDataType(codec->dataTypeNodeId());
+    attributes.setValueRank(codec->valueRank());
+    if (codec->valueRank() == ::opcua::ValueRank::OneDimension) {
+      attributes.setArrayDimensions({0U});
+    }
+    attributes.setAccessLevel(writeOnlyAccess());
+    attributes.setUserAccessLevel(writeOnlyAccess());
+    const auto result = ::opcua::services::addVariable(
+        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
+        "value", attributes, ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::HasComponent);
+    if (!componentNodeCreated(result, path, created, error)) {
+      return false;
+    }
+    ::opcua::setVariableNodeValueBackend(
+        server, nodeId(namespace_index, path),
+        std::make_unique<InputPortValueDataSource>(weak_state, bridge));
+    return true;
+  };
+  return spec;
+}
+
+NodeSpec
+outputPortValueSpec(const std::string &port_path,
+                    RTT::base::OutputPortInterface &port,
+                    const std::shared_ptr<ComponentState> &state,
+                    std::shared_ptr<const EndpointTypeRegistry> type_registry) {
   NodeSpec spec;
   spec.kind = NodeKind::variable;
   spec.parent_path = port_path;
@@ -700,6 +803,13 @@ portValueSpec(const std::string &port_path,
       return false;
     }
 
+    std::string observer_error;
+    const auto observer = PortBridge::observe(*port, &observer_error);
+    if (!observer) {
+      assignError(error, std::move(observer_error));
+      return false;
+    }
+
     ::opcua::VariableAttributes attributes;
     attributes.setDisplayName(::opcua::LocalizedText("en-US", "value"));
     attributes.setDescription(
@@ -720,8 +830,8 @@ portValueSpec(const std::string &port_path,
     }
     ::opcua::setVariableNodeValueBackend(
         server, nodeId(namespace_index, path),
-        std::make_unique<PortValueDataSource>(weak_state, port, type_registry,
-                                              codec));
+        std::make_unique<OutputPortValueDataSource>(
+            weak_state, port, type_registry, codec, observer));
     return true;
   };
   return spec;
@@ -784,139 +894,6 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
         name, std::move(callback), schema.inputs, schema.outputs, attributes,
         ::opcua::ReferenceTypeId::HasComponent);
     return componentNodeCreated(result, path, created, error);
-  };
-  return spec;
-}
-
-enum class PortMethodKind { read, write };
-
-std::pair<std::vector<::opcua::Argument>, std::vector<::opcua::Argument>>
-portMethodArguments(const TypeCodec &sample_codec,
-                    const TypeCodec &status_codec, bool reads) {
-  std::vector<::opcua::Argument> inputs;
-  std::vector<::opcua::Argument> outputs;
-  const ::opcua::Argument status_argument(
-      "status", ::opcua::LocalizedText("en-US", "RTT port flow status."),
-      status_codec.dataTypeNodeId(), status_codec.valueRank());
-  const ::opcua::Argument value_argument(
-      "value", ::opcua::LocalizedText("en-US", "RTT port sample."),
-      sample_codec.dataTypeNodeId(), sample_codec.valueRank());
-  if (reads) {
-    outputs.push_back(status_argument);
-    outputs.push_back(value_argument);
-  } else {
-    inputs.push_back(value_argument);
-    outputs.push_back(status_argument);
-  }
-  return {std::move(inputs), std::move(outputs)};
-}
-
-NodeSpec
-portMethodSpec(const std::string &port_path, RTT::base::PortInterface &port,
-               const std::shared_ptr<ComponentState> &state,
-               std::shared_ptr<const EndpointTypeRegistry> type_registry,
-               std::size_t buffer_size, PortMethodKind method_kind) {
-  const bool reads = method_kind == PortMethodKind::read;
-  const std::string method_name = reads ? "read" : "write";
-  NodeSpec spec;
-  spec.kind = NodeKind::method;
-  spec.parent_path = port_path;
-  spec.path = appendNodeSegment(port_path, method_name);
-  spec.browse_name = method_name;
-  spec.fingerprint = "port-method|" + pointerFingerprint(&port) + "|" +
-                     method_name + "|" + std::to_string(buffer_size);
-  spec.expects_input_arguments = !reads;
-  spec.expects_output_arguments = true;
-  const TypeCodec *expected_codec =
-      type_registry && port.getTypeInfo()
-          ? type_registry->codecForTypeInfo(port.getTypeInfo())
-          : nullptr;
-  const TypeCodec *expected_status_codec =
-      type_registry
-          ? type_registry->codecForTypeName(reads ? "FlowStatus"
-                                                  : "WriteStatus")
-          : nullptr;
-  if (expected_codec != nullptr && expected_status_codec != nullptr) {
-    auto [inputs, outputs] =
-        portMethodArguments(*expected_codec, *expected_status_codec, reads);
-    spec.expected_input_arguments = std::move(inputs);
-    spec.expected_output_arguments = std::move(outputs);
-  }
-  const auto bridge_slot = std::make_shared<std::shared_ptr<PortBridge>>();
-  spec.create = [path = spec.path, parent = spec.parent_path, method_name,
-                 port = &port,
-                 weak_state = std::weak_ptr<ComponentState>(state), buffer_size,
-                 type_registry = std::move(type_registry), reads, bridge_slot,
-                 inputs = spec.expected_input_arguments,
-                 outputs = spec.expected_output_arguments](
-                    ::opcua::Server &server, std::uint16_t namespace_index,
-                    bool *created, std::string *error) {
-    const auto current_state = weak_state.lock();
-    ComponentLease lease(current_state);
-    if (!lease || port == nullptr || port->getTypeInfo() == nullptr) {
-      assignError(error,
-                  "RTT port became unavailable while creating OPC UA method");
-      return false;
-    }
-    const TypeCodec *codec =
-        type_registry ? type_registry->codecForTypeInfo(port->getTypeInfo())
-                      : nullptr;
-    const TypeCodec *status_codec =
-        type_registry
-            ? type_registry->codecForTypeName(reads ? "FlowStatus"
-                                                    : "WriteStatus")
-            : nullptr;
-    if (codec == nullptr || !codec->hasValue() || status_codec == nullptr ||
-        !status_codec->hasValue()) {
-      assignError(error, "RTT port type has no OPC UA protocol");
-      return false;
-    }
-
-    std::string bridge_error;
-    const auto bridge =
-        PortBridge::create(*port, type_registry, buffer_size, &bridge_error);
-    if (!bridge) {
-      assignError(error, std::move(bridge_error));
-      return false;
-    }
-
-    ::opcua::MethodAttributes attributes;
-    attributes.setDisplayName(::opcua::LocalizedText("en-US", method_name));
-    attributes.setDescription(::opcua::LocalizedText(
-        "en-US", reads ? "Read the next RTT output-port sample."
-                       : "Write a sample to the RTT input port."));
-    attributes.setExecutable(true);
-    attributes.setUserExecutable(true);
-
-    ::opcua::services::MethodCallback callback =
-        std::function<::opcua::StatusCode(
-            ::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
-            ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
-            const ::opcua::NodeId &)>(
-            [weak_bridge = std::weak_ptr<PortBridge>(bridge), weak_state,
-             reads](::opcua::Session &,
-                    ::opcua::Span<const ::opcua::Variant> method_inputs,
-                    ::opcua::Span<::opcua::Variant> method_outputs,
-                    const ::opcua::NodeId &, const ::opcua::NodeId &) {
-              ComponentLease callback_lease(weak_state.lock());
-              const auto current_bridge = weak_bridge.lock();
-              if (!callback_lease || !current_bridge) {
-                return ::opcua::StatusCode(UA_STATUSCODE_BADNOTCONNECTED);
-              }
-              return reads
-                         ? current_bridge->read(method_outputs)
-                         : current_bridge->write(method_inputs, method_outputs);
-            });
-
-    const auto result = ::opcua::services::addMethod(
-        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
-        method_name, std::move(callback), inputs, outputs, attributes,
-        ::opcua::ReferenceTypeId::HasComponent);
-    if (!componentNodeCreated(result, path, created, error)) {
-      return false;
-    }
-    *bridge_slot = bridge;
-    return true;
   };
   return spec;
 }
@@ -1070,8 +1047,7 @@ void appendPortNodes(
     const RTT::Service::shared_ptr &service, const std::string &owner_path,
     const std::string &diagnostic_path,
     const std::shared_ptr<ComponentState> &state,
-    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
-    std::size_t buffer_size) {
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
   const std::string ports_path = appendNodeSegment(owner_path, "ports");
   for (const std::string &name : service->getPortNames()) {
     RTT::base::PortInterface *port = service->getPort(name);
@@ -1119,16 +1095,15 @@ void appendPortNodes(
                           port->getDescription()));
 
     if (is_input) {
-      insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
-                                       buffer_size, PortMethodKind::write));
+      auto *input = dynamic_cast<RTT::base::InputPortInterface *>(port);
+      insertNode(nodes,
+                 inputPortValueSpec(port_path, *input, state, type_registry));
     } else if (is_output) {
       auto *output = dynamic_cast<RTT::base::OutputPortInterface *>(port);
       if (output != nullptr && output->keepsLastWrittenValue()) {
-        insertNode(nodes,
-                   portValueSpec(port_path, *output, state, type_registry));
+        insertNode(nodes, outputPortValueSpec(port_path, *output, state,
+                                              type_registry));
       }
-      insertNode(nodes, portMethodSpec(port_path, *port, state, type_registry,
-                                       buffer_size, PortMethodKind::read));
     }
   }
 }
@@ -1140,8 +1115,7 @@ void appendServiceContents(
     const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
     const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
-    std::size_t port_buffer_size, std::set<const RTT::Service *> &ancestry,
-    std::size_t depth) {
+    std::set<const RTT::Service *> &ancestry, std::size_t depth) {
   if (!service) {
     return;
   }
@@ -1153,7 +1127,7 @@ void appendServiceContents(
   appendOperationNodes(nodes, unsupported, service, service_path,
                        diagnostic_path, state, dispatcher);
   appendPortNodes(nodes, unsupported, service, service_path, diagnostic_path,
-                  state, type_registry, port_buffer_size);
+                  state, type_registry);
 
   const std::string services_path = appendNodeSegment(service_path, "services");
   for (const std::string &name : service->getProviderNames()) {
@@ -1185,7 +1159,7 @@ void appendServiceContents(
                objectSpec(child_path, services_path, name, child->doc()));
     appendServiceContents(nodes, unsupported, child, child_path,
                           child_diagnostic_path, state, dispatcher,
-                          type_registry, port_buffer_size, ancestry, depth + 1U);
+                          type_registry, ancestry, depth + 1U);
   }
 
   pruneEmptyResourceFolders(nodes, service_path);
@@ -1195,8 +1169,7 @@ void appendServiceContents(
 ComponentSnapshot snapshotComponent(
     const std::shared_ptr<ComponentState> &state, RTT::TaskContext &component,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
-    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
-    std::size_t port_buffer_size) {
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
   ComponentSnapshot snapshot;
   const std::string components_path = appendNodeSegment("rtt", "components");
   const std::string component_path =
@@ -1208,8 +1181,7 @@ ComponentSnapshot snapshotComponent(
   std::set<const RTT::Service *> ancestry;
   appendServiceContents(snapshot.nodes, snapshot.unsupported,
                         component.provides(), component_path, {}, state,
-                        dispatcher, type_registry, port_buffer_size, ancestry,
-                        0U);
+                        dispatcher, type_registry, ancestry, 0U);
   std::sort(snapshot.unsupported.begin(), snapshot.unsupported.end());
   snapshot.unsupported.erase(
       std::unique(snapshot.unsupported.begin(), snapshot.unsupported.end()),
@@ -1436,16 +1408,9 @@ public:
       return setFailure("object model operation timeout must be positive",
                         error);
     }
-    if (options.port_buffer_size == 0U ||
-        options.port_buffer_size >
-            static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      return setFailure("object model port buffer size is out of range", error);
-    }
-
     auto state = std::make_shared<ComponentState>(component);
     ComponentSnapshot snapshot =
-        snapshotComponent(state, component, dispatcher, type_registry,
-                          options.port_buffer_size);
+        snapshotComponent(state, component, dispatcher, type_registry);
     if (!snapshot.unsupported.empty()) {
       failed_publications.insert_or_assign(component_name,
                                            snapshot.unsupported);

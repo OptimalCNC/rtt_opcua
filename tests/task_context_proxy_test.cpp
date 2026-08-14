@@ -148,6 +148,49 @@ void replaceDirectionMetadata(
   BOOST_REQUIRE(replaced);
 }
 
+void replacePortValueVariable(RTT::opcua::Server &server,
+                              std::uint16_t namespace_index,
+                              std::string_view component_name,
+                              std::string_view port_name,
+                              ::opcua::Variant value, ::opcua::NodeId data_type,
+                              ::opcua::ValueRank value_rank,
+                              ::opcua::Bitmask<::opcua::AccessLevel> access) {
+  const auto port_id = modelNodeId(
+      namespace_index, {"components", component_name, "ports", port_name});
+  const auto value_id =
+      modelNodeId(namespace_index,
+                  {"components", component_name, "ports", port_name, "value"});
+  bool replaced = false;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&, value = std::move(value), data_type = std::move(data_type),
+           value_rank, access](::opcua::Server &native) mutable {
+            const auto deleted =
+                ::opcua::services::deleteNode(native, value_id, true);
+            if (!deleted.isGood()) {
+              throw ::opcua::BadStatus(deleted);
+            }
+            ::opcua::VariableAttributes attributes;
+            attributes.setDisplayName(::opcua::LocalizedText("en-US", "value"));
+            attributes.setValue(std::move(value));
+            attributes.setDataType(data_type);
+            attributes.setValueRank(value_rank);
+            if (value_rank == ::opcua::ValueRank::OneDimension) {
+              attributes.setArrayDimensions({0U});
+            }
+            attributes.setAccessLevel(access);
+            attributes.setUserAccessLevel(access);
+            replaced = static_cast<bool>(::opcua::services::addVariable(
+                native, port_id, value_id, "value", attributes,
+                ::opcua::VariableTypeId::BaseDataVariableType,
+                ::opcua::ReferenceTypeId::HasComponent));
+          },
+          std::chrono::seconds(1), &error),
+      error);
+  BOOST_REQUIRE(replaced);
+}
+
 template <typename T>
 void addArrayMetadata(::opcua::Server &server, const ::opcua::NodeId &parent,
                       const ::opcua::NodeId &id, std::string_view name,
@@ -483,6 +526,18 @@ public:
   SparseRootTarget()
       : RTT::TaskContext("remote/sparse-root",
                          RTT::TaskContext::PreOperational) {}
+};
+
+class NonRetainingProxyTarget final : public RTT::TaskContext {
+public:
+  NonRetainingProxyTarget()
+      : RTT::TaskContext("remote/non-retaining",
+                         RTT::TaskContext::PreOperational),
+        output("Ephemeral", false) {
+    addPort(output);
+  }
+
+  RTT::OutputPort<std::int32_t> output;
 };
 
 class DivergentLifecycleTarget final : public RTT::TaskContext {
@@ -1077,6 +1132,67 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(proxy_output_mirror_starts_with_latest_retained_value,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  BOOST_TEST(target.feedback.write(std::int32_t{1}) == RTT::WriteSuccess);
+  BOOST_TEST(target.feedback.write(std::int32_t{2}) == RTT::WriteSuccess);
+  BOOST_TEST(target.feedback.write(std::int32_t{3}) == RTT::WriteSuccess);
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  options.port_poll_interval = std::chrono::milliseconds(5);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  auto *remote_feedback = dynamic_cast<RTT::base::OutputPortInterface *>(
+      proxy->ports()->getPort("Feedback"));
+  BOOST_REQUIRE(remote_feedback != nullptr);
+  RTT::InputPort<std::int32_t> sink("LatestFeedbackSink");
+  BOOST_REQUIRE(remote_feedback->createConnection(
+      sink, RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+
+  std::int32_t sample = 0;
+  BOOST_REQUIRE(waitUntil([&] { return sink.read(sample) == RTT::NewData; }));
+  BOOST_TEST(sample == 3);
+
+  sink.disconnect();
+  proxy.reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_omits_non_retaining_output_without_value,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  NonRetainingProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), {}, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  BOOST_TEST(proxy->ports()->getPort("Ephemeral") == nullptr);
+  RTT::Service::shared_ptr generated =
+      proxy->provides()->getService("Ephemeral");
+  BOOST_REQUIRE(generated);
+  BOOST_REQUIRE(generated->getOperation("last") != nullptr);
+
+  proxy.reset();
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(proxy_round_trips_an_endpoint_bound_custom_datatype,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -1457,7 +1573,7 @@ BOOST_AUTO_TEST_CASE(proxy_creation_rejects_an_invalid_port_poll_interval) {
              "OPC UA port poll interval is outside the supported range");
 }
 
-BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_incompatible_port_method_signature,
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_incompatible_port_value_type,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
   server_options.port = unusedLoopbackPort();
@@ -1468,61 +1584,81 @@ BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_incompatible_port_method_signature,
   ProxyTarget target;
   RTT::opcua::ObjectModel model(server);
   BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
-  const std::uint16_t namespace_index = server.namespaceIndex().value();
-  const std::vector<std::string_view> port_segments{
-      "components", target.getName(), "ports", "Feedback"};
-  const std::vector<std::string_view> method_segments{
-      "components", target.getName(), "ports", "Feedback", "read"};
-  const ::opcua::NodeId port_id(namespace_index,
-                                RTT::opcua::makeNodePath(port_segments));
-  const ::opcua::NodeId method_id(namespace_index,
-                                  RTT::opcua::makeNodePath(method_segments));
-  bool replaced = false;
-  BOOST_REQUIRE(server.invoke(
-      [&](::opcua::Server &native) {
-        const ::opcua::StatusCode deleted =
-            ::opcua::services::deleteNode(native, method_id, true);
-        if (!deleted.isGood()) {
-          return;
-        }
-        ::opcua::MethodAttributes attributes;
-        attributes.setDisplayName(::opcua::LocalizedText("en-US", "read"));
-        attributes.setExecutable(true);
-        attributes.setUserExecutable(true);
-        ::opcua::services::MethodCallback callback =
-            std::function<::opcua::StatusCode(
-                ::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
-                ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
-                const ::opcua::NodeId &)>(
-                [](::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
-                   ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
-                   const ::opcua::NodeId &) {
-                  return ::opcua::StatusCode(UA_STATUSCODE_GOOD);
-                });
-        const std::vector<::opcua::Argument> outputs{
-            ::opcua::Argument(
-                "status",
-                ::opcua::LocalizedText("en-US", "Legacy string status."),
-                ::opcua::DataTypeId::String, ::opcua::ValueRank::Scalar),
-            ::opcua::Argument(
-                "value", ::opcua::LocalizedText("en-US", "Port sample."),
-                ::opcua::DataTypeId::Int32, ::opcua::ValueRank::Scalar),
-        };
-        replaced =
-            ::opcua::services::addMethod(
-                native, port_id, method_id, "read", std::move(callback), {},
-                outputs, attributes, ::opcua::ReferenceTypeId::HasComponent)
-                .hasValue();
-      },
-      std::chrono::seconds(1), &error));
-  BOOST_REQUIRE_MESSAGE(replaced, error);
+  replacePortValueVariable(server, *server.namespaceIndex(), target.getName(),
+                           "Feedback", ::opcua::Variant(std::string("wrong")),
+                           ::opcua::NodeId(::opcua::DataTypeId::String),
+                           ::opcua::ValueRank::Scalar,
+                           ::opcua::AccessLevel::CurrentRead);
 
   RTT::opcua::TaskContextProxyOptions proxy_options;
   proxy_options.request_timeout = std::chrono::milliseconds(500);
   auto proxy = RTT::opcua::TaskContextProxy::create(
       server.endpointUrl(), target.getName(), proxy_options, &error);
   BOOST_TEST(proxy == nullptr);
-  BOOST_TEST(error.find("incompatible method signature") != std::string::npos);
+  BOOST_TEST(error.find("incompatible value Variable") != std::string::npos);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_incompatible_port_value_access,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  replacePortValueVariable(
+      server, *server.namespaceIndex(), target.getName(), "Feedback",
+      ::opcua::Variant(std::int32_t{0}),
+      ::opcua::NodeId(::opcua::DataTypeId::Int32), ::opcua::ValueRank::Scalar,
+      ::opcua::AccessLevel::CurrentRead | ::opcua::AccessLevel::CurrentWrite);
+
+  RTT::opcua::TaskContextProxyOptions proxy_options;
+  proxy_options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), proxy_options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("incompatible value Variable") != std::string::npos);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_input_port_without_a_value_variable,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  const auto value_id =
+      modelNodeId(*server.namespaceIndex(), {"components", target.getName(),
+                                             "ports", "Command", "value"});
+  BOOST_REQUIRE_MESSAGE(server.invoke(
+                            [&](::opcua::Server &native) {
+                              const auto status = ::opcua::services::deleteNode(
+                                  native, value_id, true);
+                              if (!status.isGood()) {
+                                throw ::opcua::BadStatus(status);
+                              }
+                            },
+                            std::chrono::seconds(1), &error),
+                        error);
+
+  RTT::opcua::TaskContextProxyOptions proxy_options;
+  proxy_options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), proxy_options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("remote port 'Command' does not expose its value "
+                        "Variable") != std::string::npos);
 
   server.stop();
 }

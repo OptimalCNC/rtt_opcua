@@ -245,61 +245,59 @@ bool readInputDescriptions(::opcua::Client &client,
   return true;
 }
 
-bool argumentMatches(const ::opcua::Argument &argument,
-                     const ::opcua::NodeId &data_type,
-                     ::opcua::ValueRank value_rank) {
-  return argument.dataType() == data_type && argument.valueRank() == value_rank;
-}
-
-bool validatePortMethod(::opcua::Client &client,
-                        const EndpointTypeRegistry &type_registry,
-                        const RemotePortDescription &port, std::string *error) {
+bool validatePortValue(::opcua::Client &client,
+                       const EndpointTypeRegistry &type_registry,
+                       const RemotePortDescription &port, bool *missing,
+                       std::string *error) {
+  *missing = false;
   const TypeCodec *codec = type_registry.codecForTypeName(port.type_name);
-  const TypeCodec *status_codec = type_registry.codecForTypeName(
-      port.direction == PortDirection::input ? "WriteStatus" : "FlowStatus");
-  if (codec == nullptr || !codec->hasValue() || status_codec == nullptr ||
-      !status_codec->hasValue()) {
+  if (codec == nullptr || !codec->hasValue()) {
     assignError(error, "remote port '" + port.name +
                            "' uses unsupported RTT type '" + port.type_name +
                            "'");
     return false;
   }
 
-  const auto executable =
-      ::opcua::services::readExecutable(client, port.method_id);
-  const auto user_executable =
-      ::opcua::services::readUserExecutable(client, port.method_id);
-  if (!executable || !user_executable) {
-    assignError(error, "failed to read execution metadata for remote port '" +
-                           port.name + "'");
-    return false;
-  }
-  if (!executable.value() || !user_executable.value()) {
-    assignError(error, "remote port '" + port.name +
-                           "' method is not executable for the current user");
+  const auto node_class =
+      ::opcua::services::readNodeClass(client, port.value_id);
+  if (!node_class) {
+    if (node_class.code().get() == UA_STATUSCODE_BADNODEIDUNKNOWN) {
+      *missing = true;
+      return true;
+    }
+    assignError(
+        error, statusMessage("failed to read value metadata for remote port '" +
+                                 port.name + "'",
+                             node_class.code()));
     return false;
   }
 
-  std::vector<::opcua::Argument> inputs;
-  std::vector<::opcua::Argument> outputs;
-  if (!readMethodArguments(client, port.method_id, &inputs, &outputs, error)) {
+  const auto data_type = ::opcua::services::readDataType(client, port.value_id);
+  const auto value_rank =
+      ::opcua::services::readValueRank(client, port.value_id);
+  const auto access = ::opcua::services::readAccessLevel(client, port.value_id);
+  const auto user_access =
+      ::opcua::services::readUserAccessLevel(client, port.value_id);
+  if (!data_type || !value_rank || !access || !user_access) {
+    assignError(error, "failed to read value metadata for remote port '" +
+                           port.name + "'");
     return false;
   }
-  const bool status_output =
-      !outputs.empty() &&
-      argumentMatches(outputs.front(), status_codec->dataTypeNodeId(),
-                      status_codec->valueRank());
-  const bool valid =
-      port.direction == PortDirection::input
-          ? inputs.size() == 1U && outputs.size() == 1U && status_output &&
-                argumentMatches(inputs.front(), codec->dataTypeNodeId(),
-                                codec->valueRank())
-          : inputs.empty() && outputs.size() == 2U && status_output &&
-                argumentMatches(outputs[1], codec->dataTypeNodeId(),
-                                codec->valueRank());
+
+  const bool readable = port.direction == PortDirection::output;
+  const bool writable = port.direction == PortDirection::input;
+  const auto accessMatches = [readable, writable](const auto &level) {
+    return level.anyOf(::opcua::AccessLevel::CurrentRead) == readable &&
+           level.anyOf(::opcua::AccessLevel::CurrentWrite) == writable;
+  };
+  const bool valid = node_class.value() == ::opcua::NodeClass::Variable &&
+                     data_type.value() == codec->dataTypeNodeId() &&
+                     value_rank.value() == codec->valueRank() &&
+                     accessMatches(access.value()) &&
+                     accessMatches(user_access.value());
   if (!valid) {
     assignError(error, "remote port '" + port.name +
-                           "' exposes an incompatible method signature");
+                           "' exposes an incompatible value Variable");
     return false;
   }
   return true;
@@ -903,7 +901,7 @@ ClientSession::discoverPorts(const std::string &component_name,
       RemotePortDescription port;
       port.name = std::string(reference.browseName().name());
       port.service_path = service_path;
-      port.object_id = reference.nodeId().nodeId();
+      const ::opcua::NodeId object_id = reference.nodeId().nodeId();
       if (port.name.empty()) {
         continue;
       }
@@ -930,7 +928,7 @@ ClientSession::discoverPorts(const std::string &component_name,
       }
 
       const auto description =
-          ::opcua::services::readDescription(*client_, port.object_id);
+          ::opcua::services::readDescription(*client_, object_id);
       if (!description) {
         last_error_ = statusMessage(
             "failed to read description for remote port '" + port.name + "'",
@@ -941,50 +939,27 @@ ClientSession::discoverPorts(const std::string &component_name,
       }
       port.description = std::string(description.value().text());
 
-      const std::string_view method_name =
-          port.direction == PortDirection::input ? "write" : "read";
-      const ::opcua::BrowseDescription method_browse(
-          port.object_id, ::opcua::BrowseDirection::Forward,
-          ::opcua::ReferenceTypeId::HasComponent, false,
-          ::opcua::NodeClass::Method, ::opcua::BrowseResultMask::All);
-      const auto method_result =
-          ::opcua::services::browseAll(*client_, method_browse);
-      if (!method_result) {
-        last_error_ = statusMessage("failed to browse remote port methods",
-                                    method_result.code());
+      const std::vector<std::string_view> value_segments{"ports", port.name,
+                                                         "value"};
+      port.value_id = ::opcua::NodeId(
+          namespace_index_,
+          modelPath(component_name, service_path, value_segments));
+      bool missing_value = false;
+      if (!type_registry_ || !validatePortValue(*client_, *type_registry_, port,
+                                                &missing_value, &last_error_)) {
         assignError(error, last_error_);
         ports.clear();
         return ports;
       }
-      bool found_method = false;
-      for (const ::opcua::ReferenceDescription &method_reference :
-           method_result.value()) {
-        if (!method_reference.nodeId().isLocal() ||
-            method_reference.browseName().name() != method_name) {
-          continue;
-        }
-        if (found_method) {
-          last_error_ = "remote port '" + port.name + "' exposes duplicate " +
-                        std::string(method_name) + " methods";
-          assignError(error, last_error_);
-          ports.clear();
-          return ports;
-        }
-        port.method_id = method_reference.nodeId().nodeId();
-        found_method = true;
-      }
-      if (!found_method) {
+      if (missing_value && port.direction == PortDirection::input) {
         last_error_ = "remote port '" + port.name + "' does not expose its " +
-                      std::string(method_name) + " method";
+                      "value Variable";
         assignError(error, last_error_);
         ports.clear();
         return ports;
       }
-      if (!type_registry_ ||
-          !validatePortMethod(*client_, *type_registry_, port, &last_error_)) {
-        assignError(error, last_error_);
-        ports.clear();
-        return ports;
+      if (missing_value) {
+        continue;
       }
       ports.push_back(std::move(port));
     }
@@ -1088,20 +1063,96 @@ bool ClientSession::writeValue(const ::opcua::NodeId &node_id,
   }
 }
 
+RemotePortReadResult
+ClientSession::readPortValue(const ::opcua::NodeId &node_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  RemotePortReadResult read_result;
+  if (!interface_access_enabled_.load()) {
+    read_result.error =
+        "remote RTT interface is stale; synchronize it before reading ports";
+    last_error_ = read_result.error;
+    return read_result;
+  }
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    read_result.error = "OPC UA client is not connected";
+    last_error_ = read_result.error;
+    return read_result;
+  }
+
+  try {
+    const auto result = ::opcua::services::readValue(*client_, node_id);
+    if (!result) {
+      const ::opcua::StatusCode status = result.code();
+      if (status.get() == UA_STATUSCODE_BADWAITINGFORINITIALDATA) {
+        read_result.status = RemotePortReadStatus::waiting;
+        last_error_.clear();
+        return read_result;
+      }
+      read_result.error =
+          statusMessage("failed to read remote RTT output port", status);
+      last_error_ = read_result.error;
+      if ((status.get() != UA_STATUSCODE_BADNOTCONNECTED &&
+           invalidatesInterface(status)) ||
+          !client_->isConnected()) {
+        invalidateInterfaceLocked();
+      }
+      return read_result;
+    }
+    read_result.status = RemotePortReadStatus::value;
+    read_result.value = result.value();
+    last_error_.clear();
+    return read_result;
+  } catch (const std::exception &exception) {
+    read_result.error = std::string("failed to read remote RTT output port: ") +
+                        exception.what();
+    last_error_ = read_result.error;
+    invalidateInterfaceLocked();
+    return read_result;
+  }
+}
+
+bool ClientSession::writePortValue(const ::opcua::NodeId &node_id,
+                                   const ::opcua::Variant &value) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!interface_access_enabled_.load()) {
+    last_error_ =
+        "remote RTT interface is stale; synchronize it before writing ports";
+    return false;
+  }
+  if (!client_ || state_.load() != ProxyConnectionState::connected) {
+    last_error_ = "OPC UA client is not connected";
+    return false;
+  }
+
+  try {
+    const ::opcua::StatusCode status =
+        ::opcua::services::writeValue(*client_, node_id, value);
+    if (!status.isGood()) {
+      last_error_ =
+          statusMessage("failed to write remote RTT input port", status);
+      if ((status.get() != UA_STATUSCODE_BADNOTCONNECTED &&
+           invalidatesInterface(status)) ||
+          !client_->isConnected()) {
+        invalidateInterfaceLocked();
+      }
+      return false;
+    }
+    last_error_.clear();
+    return true;
+  } catch (const std::exception &exception) {
+    last_error_ = std::string("failed to write remote RTT input port: ") +
+                  exception.what();
+    invalidateInterfaceLocked();
+    return false;
+  }
+}
+
 RemoteCallResult
 ClientSession::call(const ::opcua::NodeId &object_id,
                     const ::opcua::NodeId &method_id,
                     const std::vector<::opcua::Variant> &inputs) {
   std::lock_guard<std::mutex> lock(mutex_);
-  return callLocked(object_id, method_id, inputs, true, false);
-}
-
-RemoteCallResult
-ClientSession::callPort(const ::opcua::NodeId &object_id,
-                        const ::opcua::NodeId &method_id,
-                        const std::vector<::opcua::Variant> &inputs) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return callLocked(object_id, method_id, inputs, true, true);
+  return callLocked(object_id, method_id, inputs, true);
 }
 
 RemoteCallResult
@@ -1118,7 +1169,7 @@ ClientSession::callOperation(const std::string &component_name,
                                                   operation_folder)),
       ::opcua::NodeId(namespace_index_, modelPath(component_name, service_path,
                                                   operation_method)),
-      inputs, false, false);
+      inputs, false);
 }
 
 void ClientSession::setInterfaceAccessEnabled(bool enabled) {
@@ -1137,10 +1188,11 @@ void ClientSession::invalidateInterfaceLocked() noexcept {
   state_.store(ProxyConnectionState::stale);
 }
 
-RemoteCallResult ClientSession::callLocked(
-    const ::opcua::NodeId &object_id, const ::opcua::NodeId &method_id,
-    const std::vector<::opcua::Variant> &inputs, bool require_interface_access,
-    bool tolerate_not_connected) {
+RemoteCallResult
+ClientSession::callLocked(const ::opcua::NodeId &object_id,
+                          const ::opcua::NodeId &method_id,
+                          const std::vector<::opcua::Variant> &inputs,
+                          bool require_interface_access) {
   RemoteCallResult call_result;
   if (require_interface_access && !interface_access_enabled_.load()) {
     call_result.error =
@@ -1162,11 +1214,7 @@ RemoteCallResult ClientSession::callLocked(
       const ::opcua::StatusCode status = result.statusCode();
       call_result.error = statusMessage("remote RTT operation failed", status);
       last_error_ = call_result.error;
-      const bool expected_port_disconnect =
-          tolerate_not_connected &&
-          status.get() == UA_STATUSCODE_BADNOTCONNECTED;
-      if ((!expected_port_disconnect && invalidatesInterface(status)) ||
-          !client_->isConnected()) {
+      if (invalidatesInterface(status) || !client_->isConnected()) {
         invalidateInterfaceLocked();
       }
       return call_result;
