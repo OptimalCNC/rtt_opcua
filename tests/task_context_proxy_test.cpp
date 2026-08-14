@@ -1627,6 +1627,32 @@ BOOST_FIXTURE_TEST_CASE(proxy_rejects_incompatible_port_value_access,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_write_only_input_port_value_access,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  replacePortValueVariable(server, *server.namespaceIndex(), target.getName(),
+                           "Command", ::opcua::Variant(std::int32_t{0}),
+                           ::opcua::NodeId(::opcua::DataTypeId::Int32),
+                           ::opcua::ValueRank::Scalar,
+                           ::opcua::AccessLevel::CurrentWrite);
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("incompatible value Variable") != std::string::npos);
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_input_port_without_a_value_variable,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;

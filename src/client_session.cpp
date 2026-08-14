@@ -284,7 +284,7 @@ bool validatePortValue(::opcua::Client &client,
     return false;
   }
 
-  const bool readable = port.direction == PortDirection::output;
+  const bool readable = true;
   const bool writable = port.direction == PortDirection::input;
   const auto accessMatches = [readable, writable](const auto &level) {
     return level.anyOf(::opcua::AccessLevel::CurrentRead) == readable &&
