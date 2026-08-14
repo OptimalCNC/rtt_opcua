@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+
+#include <rtt/opcua/port_direction.hpp>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,14 +56,12 @@ struct RemoteServiceDescription {
   std::string description;
 };
 
-enum class RemotePortDirection { input, output };
-
 struct RemotePortDescription {
   std::string name;
   std::string description;
   std::string type_name;
   RemoteServicePath service_path;
-  RemotePortDirection direction{RemotePortDirection::input};
+  PortDirection direction{PortDirection::input};
   ::opcua::NodeId object_id;
   ::opcua::NodeId method_id;
 };

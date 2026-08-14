@@ -6,6 +6,7 @@
 
 #include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/node_id.hpp>
+#include <rtt/opcua/port_direction.hpp>
 
 #include <open62541pp/plugin/nodestore.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
@@ -581,6 +582,40 @@ NodeSpec staticStringSpec(std::string path, std::string parent_path,
   return spec;
 }
 
+NodeSpec portDirectionSpec(const std::string &port_path,
+                           PortDirection direction) {
+  NodeSpec spec;
+  spec.kind = NodeKind::variable;
+  spec.parent_path = port_path;
+  spec.path = appendNodeSegment(port_path, "direction");
+  spec.browse_name = "direction";
+  const auto value = static_cast<std::int32_t>(direction);
+  spec.fingerprint = "port-direction|" + spec.parent_path + "|" +
+                     spec.browse_name + "|" + std::to_string(value);
+  spec.create = [path = spec.path, parent = spec.parent_path,
+                 value](::opcua::Server &server,
+                        std::uint16_t namespace_index, bool *created,
+                        std::string *error) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(
+        ::opcua::LocalizedText("en-US", "direction"));
+    attributes.setDescription(
+        ::opcua::LocalizedText("en-US", "RTT port direction."));
+    attributes.setValue(::opcua::Variant(value));
+    attributes.setDataType(::opcua::DataTypeId::Int32);
+    attributes.setValueRank(::opcua::ValueRank::Scalar);
+    attributes.setAccessLevel(readOnlyAccess());
+    attributes.setUserAccessLevel(readOnlyAccess());
+    const auto result = ::opcua::services::addVariable(
+        server, nodeId(namespace_index, parent),
+        nodeId(namespace_index, path), "direction", attributes,
+        ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::HasComponent);
+    return componentNodeCreated(result, path, created, error);
+  };
+  return spec;
+}
+
 template <typename T>
 NodeSpec staticArrayPropertySpec(std::string path, std::string parent_path,
                                  std::string browse_name,
@@ -1150,6 +1185,17 @@ void appendPortNodes(
         dynamic_cast<RTT::base::InputPortInterface *>(port) != nullptr;
     const bool is_output =
         dynamic_cast<RTT::base::OutputPortInterface *>(port) != nullptr;
+    if (is_input == is_output) {
+      appendUnsupported(
+          unsupported, state->component_name,
+          appendDiagnosticSegment(diagnostic_path, name), "port",
+          typeName(type),
+          is_input ? "matches both RTT input and output interfaces"
+                   : "matches neither RTT input nor output interface");
+      continue;
+    }
+    const PortDirection direction =
+        is_input ? PortDirection::input : PortDirection::output;
     if (codec == nullptr || !codec->hasValue()) {
       appendUnsupported(unsupported, state->component_name,
                         appendDiagnosticSegment(diagnostic_path, name),
@@ -1166,16 +1212,7 @@ void appendPortNodes(
                                 "type", "Canonical RTT port type.",
                                 port->getTypeInfo()->getTypeName()));
 
-    std::string direction = "unknown";
-    if (is_input) {
-      direction = "input";
-    } else if (is_output) {
-      direction = "output";
-    }
-    insertNode(nodes,
-               staticStringSpec(appendNodeSegment(port_path, "direction"),
-                                port_path, "direction", "RTT port direction.",
-                                std::move(direction)));
+    insertNode(nodes, portDirectionSpec(port_path, direction));
     insertNode(nodes, staticStringSpec(
                           appendNodeSegment(port_path, "description"),
                           port_path, "description", "RTT port description.",

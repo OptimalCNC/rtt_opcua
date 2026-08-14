@@ -3,6 +3,7 @@
 
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/object_model.hpp>
+#include <rtt/opcua/port_direction.hpp>
 #include <rtt/opcua/server.hpp>
 #include <rtt/opcua/type_protocol.hpp>
 
@@ -17,7 +18,9 @@
 #include <rtt/OutputPort.hpp>
 #include <rtt/Service.hpp>
 #include <rtt/TaskContext.hpp>
+#include <rtt/base/PortInterface.hpp>
 #include <rtt/internal/GlobalEngine.hpp>
+#include <rtt/internal/SharedConnection.hpp>
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/TemplateTypeInfo.hpp>
 #include <rtt/types/Types.hpp>
@@ -42,6 +45,7 @@
 #include <vector>
 
 BOOST_TEST_DONT_PRINT_LOG_VALUE(RTT::opcua::UnsupportedResource)
+BOOST_TEST_DONT_PRINT_LOG_VALUE(::opcua::ValueRank)
 
 namespace {
 
@@ -95,6 +99,72 @@ void requireMissingNode(::opcua::Client &client, const ::opcua::NodeId &id) {
   const auto result = ::opcua::services::readNodeClass(client, id);
   BOOST_REQUIRE(!result);
   BOOST_TEST(result.code() == UA_STATUSCODE_BADNODEIDUNKNOWN);
+}
+
+void requirePortDirection(::opcua::Client &client,
+                          const ::opcua::NodeId &parent_id,
+                          const ::opcua::NodeId &id,
+                          RTT::opcua::PortDirection expected) {
+  const auto value = ::opcua::services::readValue(client, id);
+  BOOST_REQUIRE(value);
+  BOOST_TEST(value.value().isScalar());
+  BOOST_TEST(value.value().isType(
+      ::opcua::NodeId(::opcua::DataTypeId::Int32)));
+  BOOST_TEST(value.value().to<std::int32_t>() ==
+             static_cast<std::int32_t>(expected));
+
+  const auto data_type = ::opcua::services::readDataType(client, id);
+  const auto node_class = ::opcua::services::readNodeClass(client, id);
+  const auto value_rank = ::opcua::services::readValueRank(client, id);
+  const auto access = ::opcua::services::readAccessLevel(client, id);
+  const auto user_access =
+      ::opcua::services::readUserAccessLevel(client, id);
+  BOOST_REQUIRE(data_type);
+  BOOST_REQUIRE(node_class);
+  BOOST_REQUIRE(value_rank);
+  BOOST_REQUIRE(access);
+  BOOST_REQUIRE(user_access);
+  BOOST_CHECK(data_type.value() ==
+              ::opcua::NodeId(::opcua::DataTypeId::Int32));
+  BOOST_CHECK(node_class.value() == ::opcua::NodeClass::Variable);
+  BOOST_TEST(value_rank.value() == ::opcua::ValueRank::Scalar);
+  BOOST_TEST(access.value().allOf(::opcua::AccessLevel::CurrentRead));
+  BOOST_TEST(access.value().noneOf(::opcua::AccessLevel::CurrentWrite));
+  BOOST_TEST(user_access.value().allOf(::opcua::AccessLevel::CurrentRead));
+  BOOST_TEST(
+      user_access.value().noneOf(::opcua::AccessLevel::CurrentWrite));
+
+  BOOST_TEST(::opcua::services::writeValue(
+                 client, id,
+                 ::opcua::Variant(static_cast<std::int32_t>(expected))) ==
+             UA_STATUSCODE_BADNOTWRITABLE);
+
+  const ::opcua::BrowseDescription parent_browse(
+      id, ::opcua::BrowseDirection::Inverse,
+      ::opcua::ReferenceTypeId::HasComponent, false,
+      ::opcua::NodeClass::Object, ::opcua::BrowseResultMask::All);
+  const auto parents = ::opcua::services::browseAll(client, parent_browse);
+  BOOST_REQUIRE(parents);
+  BOOST_TEST(std::ranges::any_of(
+      parents.value(), [&](const auto &reference) {
+        return reference.nodeId().isLocal() &&
+               reference.nodeId().nodeId() == parent_id;
+      }));
+
+  const ::opcua::BrowseDescription type_browse(
+      id, ::opcua::BrowseDirection::Forward,
+      ::opcua::ReferenceTypeId::HasTypeDefinition, false,
+      ::opcua::NodeClass::VariableType, ::opcua::BrowseResultMask::All);
+  const auto type_definitions =
+      ::opcua::services::browseAll(client, type_browse);
+  BOOST_REQUIRE(type_definitions);
+  BOOST_TEST(std::ranges::any_of(
+      type_definitions.value(), [](const auto &reference) {
+        return reference.nodeId().isLocal() &&
+               reference.nodeId().nodeId() ==
+                   ::opcua::NodeId(
+                       ::opcua::VariableTypeId::BaseDataVariableType);
+      }));
 }
 
 bool hasHierarchicalReference(::opcua::Client &client,
@@ -355,6 +425,59 @@ public:
   RTT::OutputPort<std::int32_t> motion_feedback{"MotionFeedback"};
   RTT::InputPort<std::int32_t> motion_command{"MotionCommand"};
   std::int32_t maximum{100};
+};
+
+class DirectionlessPort final : public RTT::base::PortInterface {
+public:
+  explicit DirectionlessPort(const std::string &name)
+      : RTT::base::PortInterface(name) {}
+
+  bool connected() const override { return false; }
+  const RTT::types::TypeInfo *getTypeInfo() const override {
+    return RTT::types::Types()->type("Int32");
+  }
+  void disconnect() override {}
+  bool disconnect(RTT::base::PortInterface *) override { return false; }
+  RTT::base::PortInterface *clone() const override {
+    return new DirectionlessPort(getName());
+  }
+  RTT::base::PortInterface *antiClone() const override {
+    return new DirectionlessPort(getName());
+  }
+  bool connectTo(RTT::base::PortInterface *,
+                 const RTT::ConnPolicy &) override {
+    return false;
+  }
+  bool connectTo(RTT::base::PortInterface *) override { return false; }
+  bool createStream(const RTT::ConnPolicy &) override { return false; }
+  bool createConnection(
+      RTT::internal::SharedConnectionBase::shared_ptr,
+      const RTT::ConnPolicy &) override {
+    return false;
+  }
+  bool addConnection(RTT::internal::ConnID *,
+                     RTT::base::ChannelElementBase::shared_ptr,
+                     const RTT::ConnPolicy &) override {
+    return false;
+  }
+  RTT::base::ChannelElementBase *getEndpoint() const override {
+    return nullptr;
+  }
+};
+
+class DirectionlessPortComponent final : public RTT::TaskContext {
+public:
+  DirectionlessPortComponent()
+      : RTT::TaskContext("directionless-port-component"),
+        directionless("Directionless") {
+    ports()->addLocalPort(directionless);
+  }
+
+  ~DirectionlessPortComponent() override {
+    ports()->removeLocalPort(directionless.getName());
+  }
+
+  DirectionlessPort directionless;
 };
 
 class CyclicServiceComponent final : public RTT::TaskContext {
@@ -717,6 +840,11 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   const auto feedback_direction_id =
       modelNodeId(namespace_index,
                   {"components", "arm/left", "ports", "Feedback", "direction"});
+  const auto trigger_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "ports", "Trigger"});
+  const auto trigger_direction_id =
+      modelNodeId(namespace_index,
+                  {"components", "arm/left", "ports", "Trigger", "direction"});
   const auto command_direction_id =
       modelNodeId(namespace_index,
                   {"components", "arm/left", "ports", "Command", "direction"});
@@ -775,6 +903,14 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       namespace_index,
       {"components", "arm/left", "services", "motion/raw", "ports",
        "MotionCommand"});
+  const auto motion_feedback_direction_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "motion/raw", "ports",
+       "MotionFeedback", "direction"});
+  const auto motion_command_direction_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "services", "motion/raw", "ports",
+       "MotionCommand", "direction"});
   const auto nested_port_service_id = modelNodeId(
       namespace_index, {"components", "arm/left", "services", "motion/raw",
                         "services", "MotionFeedback", "operations", "last"});
@@ -820,12 +956,17 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   BOOST_TEST(::opcua::services::readValue(client, feedback_type_id)
                  .value()
                  .to<std::string>() == "Float64");
-  BOOST_TEST(::opcua::services::readValue(client, feedback_direction_id)
-                 .value()
-                 .to<std::string>() == "output");
-  BOOST_TEST(::opcua::services::readValue(client, command_direction_id)
-                 .value()
-                 .to<std::string>() == "input");
+  requirePortDirection(client, feedback_id, feedback_direction_id,
+                       RTT::opcua::PortDirection::output);
+  requirePortDirection(client, command_id, command_direction_id,
+                       RTT::opcua::PortDirection::input);
+  requirePortDirection(client, trigger_id, trigger_direction_id,
+                       RTT::opcua::PortDirection::input);
+  requirePortDirection(client, nested_output_id,
+                       motion_feedback_direction_id,
+                       RTT::opcua::PortDirection::output);
+  requirePortDirection(client, nested_input_id, motion_command_direction_id,
+                       RTT::opcua::PortDirection::input);
   BOOST_TEST(static_cast<bool>(
       ::opcua::services::readNodeClass(client, trigger_write_id)));
   BOOST_TEST(static_cast<bool>(
@@ -1075,6 +1216,36 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
                  .value()
                  .to<std::uint64_t>() == 1U);
 
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(directionless_port_rejects_the_whole_component,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  DirectionlessPortComponent component;
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::UnsupportedResource> diagnostics;
+  BOOST_TEST(!model.publishComponent(component, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics.front().path == "Directionless");
+  BOOST_TEST(diagnostics.front().kind == "port");
+  BOOST_TEST(diagnostics.front().type_name == "Int32");
+  BOOST_TEST(diagnostics.front().reason ==
+             "matches neither RTT input nor output interface");
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  requireMissingNode(
+      client, modelNodeId(*server.namespaceIndex(),
+                          {"components", component.getName()}));
   client.disconnect();
   server.stop();
 }

@@ -126,6 +126,43 @@ bool readStringValue(::opcua::Client &client, const ::opcua::NodeId &node_id,
   }
 }
 
+bool readPortDirection(::opcua::Client &client,
+                       const ::opcua::NodeId &node_id,
+                       std::string_view port_name,
+                       PortDirection *direction, std::string *error) {
+  const auto result = ::opcua::services::readValue(client, node_id);
+  if (!result) {
+    assignError(error,
+                statusMessage("failed to read RTT port direction metadata",
+                              result.code()));
+    return false;
+  }
+
+  const ::opcua::Variant &value = result.value();
+  if (!value.isScalar() ||
+      !value.isType(::opcua::NodeId(::opcua::DataTypeId::Int32))) {
+    assignError(error, "remote port '" + std::string(port_name) +
+                           "' has invalid direction metadata: expected "
+                           "scalar Int32");
+    return false;
+  }
+
+  const std::int32_t code = value.to<std::int32_t>();
+  switch (code) {
+  case static_cast<std::int32_t>(PortDirection::input):
+    *direction = PortDirection::input;
+    return true;
+  case static_cast<std::int32_t>(PortDirection::output):
+    *direction = PortDirection::output;
+    return true;
+  default:
+    assignError(error, "remote port '" + std::string(port_name) +
+                           "' has unsupported direction code " +
+                           std::to_string(code));
+    return false;
+  }
+}
+
 bool readMethodArguments(::opcua::Client &client,
                          const ::opcua::NodeId &method_id,
                          std::vector<::opcua::Argument> *inputs,
@@ -219,8 +256,7 @@ bool validatePortMethod(::opcua::Client &client,
                         const RemotePortDescription &port, std::string *error) {
   const TypeCodec *codec = type_registry.codecForTypeName(port.type_name);
   const TypeCodec *status_codec = type_registry.codecForTypeName(
-      port.direction == RemotePortDirection::input ? "WriteStatus"
-                                                   : "FlowStatus");
+      port.direction == PortDirection::input ? "WriteStatus" : "FlowStatus");
   if (codec == nullptr || !codec->hasValue() || status_codec == nullptr ||
       !status_codec->hasValue()) {
     assignError(error, "remote port '" + port.name +
@@ -254,7 +290,7 @@ bool validatePortMethod(::opcua::Client &client,
       argumentMatches(outputs.front(), status_codec->dataTypeNodeId(),
                       status_codec->valueRank());
   const bool valid =
-      port.direction == RemotePortDirection::input
+      port.direction == PortDirection::input
           ? inputs.size() == 1U && outputs.size() == 1U && status_output &&
                 argumentMatches(inputs.front(), codec->dataTypeNodeId(),
                                 codec->valueRank())
@@ -917,30 +953,18 @@ ClientSession::discoverPorts(const std::string &component_name,
                                                         "type"};
       const std::vector<std::string_view> direction_segments{"ports", port.name,
                                                              "direction"};
-      std::string direction;
       if (!readStringValue(
               *client_,
               ::opcua::NodeId(
                   namespace_index_,
                   modelPath(component_name, service_path, type_segments)),
               "RTT port type metadata", &port.type_name, &last_error_) ||
-          !readStringValue(
+          !readPortDirection(
               *client_,
               ::opcua::NodeId(
                   namespace_index_,
                   modelPath(component_name, service_path, direction_segments)),
-              "RTT port direction metadata", &direction, &last_error_)) {
-        assignError(error, last_error_);
-        ports.clear();
-        return ports;
-      }
-      if (direction == "input") {
-        port.direction = RemotePortDirection::input;
-      } else if (direction == "output") {
-        port.direction = RemotePortDirection::output;
-      } else {
-        last_error_ = "remote port '" + port.name +
-                      "' has invalid direction metadata '" + direction + "'";
+              port.name, &port.direction, &last_error_)) {
         assignError(error, last_error_);
         ports.clear();
         return ports;
@@ -959,7 +983,7 @@ ClientSession::discoverPorts(const std::string &component_name,
       port.description = std::string(description.value().text());
 
       const std::string_view method_name =
-          port.direction == RemotePortDirection::input ? "write" : "read";
+          port.direction == PortDirection::input ? "write" : "read";
       const ::opcua::BrowseDescription method_browse(
           port.object_id, ::opcua::BrowseDirection::Forward,
           ::opcua::ReferenceTypeId::HasComponent, false,

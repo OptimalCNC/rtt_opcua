@@ -5,6 +5,7 @@
 
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/object_model.hpp>
+#include <rtt/opcua/port_direction.hpp>
 #include <rtt/opcua/server.hpp>
 #include <rtt/opcua/task_context_proxy.hpp>
 #include <rtt/opcua/type_protocol.hpp>
@@ -96,6 +97,53 @@ void removeNodeIfPresent(::opcua::Server &server, const ::opcua::NodeId &id) {
   if (!status.isGood() && status.get() != UA_STATUSCODE_BADNODEIDUNKNOWN) {
     throw ::opcua::BadStatus(status);
   }
+}
+
+void replaceDirectionMetadata(
+    RTT::opcua::Server &server, std::uint16_t namespace_index,
+    std::string_view component_name, std::string_view port_name,
+    ::opcua::Variant value, ::opcua::NodeId data_type,
+    ::opcua::ValueRank value_rank) {
+  const auto port_id = modelNodeId(
+      namespace_index,
+      {"components", component_name, "ports", port_name});
+  const auto direction_id = modelNodeId(
+      namespace_index,
+      {"components", component_name, "ports", port_name, "direction"});
+  bool replaced = false;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&, value = std::move(value), data_type = std::move(data_type),
+           value_rank](
+              ::opcua::Server &native) mutable {
+            const auto deleted =
+                ::opcua::services::deleteNode(native, direction_id, true);
+            if (!deleted.isGood()) {
+              throw ::opcua::BadStatus(deleted);
+            }
+            ::opcua::VariableAttributes attributes;
+            attributes.setDisplayName(
+                ::opcua::LocalizedText("en-US", "direction"));
+            attributes.setDescription(::opcua::LocalizedText(
+                "en-US", "RTT port direction."));
+            attributes.setValue(std::move(value));
+            attributes.setDataType(data_type);
+            attributes.setValueRank(value_rank);
+            if (value_rank == ::opcua::ValueRank::OneDimension) {
+              attributes.setArrayDimensions({0U});
+            }
+            attributes.setAccessLevel(::opcua::AccessLevel::CurrentRead);
+            attributes.setUserAccessLevel(
+                ::opcua::AccessLevel::CurrentRead);
+            replaced = static_cast<bool>(::opcua::services::addVariable(
+                native, port_id, direction_id, "direction", attributes,
+                ::opcua::VariableTypeId::BaseDataVariableType,
+                ::opcua::ReferenceTypeId::HasComponent));
+          },
+          std::chrono::seconds(1), &error),
+      error);
+  BOOST_REQUIRE(replaced);
 }
 
 void ensureEmptyCategory(::opcua::Server &server, const ::opcua::NodeId &parent,
@@ -1005,6 +1053,98 @@ BOOST_FIXTURE_TEST_CASE(
       server.endpointUrl(), target.getName(), proxy_options, &error);
   BOOST_TEST(proxy == nullptr);
   BOOST_TEST(error.find("failed to read RTT port type metadata") !=
+             std::string::npos);
+  BOOST_TEST(error.find("BadNodeIdUnknown") != std::string::npos);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_noncanonical_port_direction_metadata,
+                        CanonicalTypesFixture) {
+  const auto require_rejected =
+      [](::opcua::Variant value, ::opcua::NodeId data_type,
+         ::opcua::ValueRank value_rank, std::string_view port_name,
+         std::string_view expected_error) {
+        RTT::opcua::ServerOptions server_options;
+        server_options.port = unusedLoopbackPort();
+        RTT::opcua::Server server(server_options);
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+        ProxyTarget target;
+        RTT::opcua::ObjectModel model(server);
+        BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+        replaceDirectionMetadata(
+            server, *server.namespaceIndex(), target.getName(), port_name,
+            std::move(value), std::move(data_type), value_rank);
+
+        RTT::opcua::TaskContextProxyOptions options;
+        options.request_timeout = std::chrono::milliseconds(500);
+        auto proxy = RTT::opcua::TaskContextProxy::create(
+            server.endpointUrl(), target.getName(), options, &error);
+        BOOST_TEST(proxy == nullptr);
+        BOOST_TEST(error.find(expected_error) != std::string::npos);
+        server.stop();
+      };
+
+  require_rejected(::opcua::Variant(std::string("input")),
+                   ::opcua::NodeId(::opcua::DataTypeId::String),
+                   ::opcua::ValueRank::Scalar, "Command",
+                   "expected scalar Int32");
+  require_rejected(::opcua::Variant(std::string("output")),
+                   ::opcua::NodeId(::opcua::DataTypeId::String),
+                   ::opcua::ValueRank::Scalar, "Feedback",
+                   "expected scalar Int32");
+  require_rejected(::opcua::Variant(std::uint32_t{1U}),
+                   ::opcua::NodeId(::opcua::DataTypeId::UInt32),
+                   ::opcua::ValueRank::Scalar, "Feedback",
+                   "expected scalar Int32");
+  require_rejected(::opcua::Variant(1.0),
+                   ::opcua::NodeId(::opcua::DataTypeId::Double),
+                   ::opcua::ValueRank::Scalar, "Feedback",
+                   "expected scalar Int32");
+  require_rejected(::opcua::Variant(std::vector<std::int32_t>{1}),
+                   ::opcua::NodeId(::opcua::DataTypeId::Int32),
+                   ::opcua::ValueRank::OneDimension, "Feedback",
+                   "expected scalar Int32");
+  require_rejected(::opcua::Variant(std::int32_t{7}),
+                   ::opcua::NodeId(::opcua::DataTypeId::Int32),
+                   ::opcua::ValueRank::Scalar, "Feedback",
+                   "remote port 'Feedback' has unsupported direction code 7");
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_missing_port_direction_metadata,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  const auto direction_id = modelNodeId(
+      *server.namespaceIndex(),
+      {"components", target.getName(), "ports", "Feedback", "direction"});
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&](::opcua::Server &native) {
+            const auto status =
+                ::opcua::services::deleteNode(native, direction_id, true);
+            if (!status.isGood()) {
+              throw ::opcua::BadStatus(status);
+            }
+          },
+          std::chrono::seconds(1), &error),
+      error);
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("failed to read RTT port direction metadata") !=
              std::string::npos);
   BOOST_TEST(error.find("BadNodeIdUnknown") != std::string::npos);
 

@@ -73,7 +73,7 @@ RemotePortAdapter::create(std::shared_ptr<ClientSession> session,
   const TypeCodec *status_codec =
       type_registry
           ? type_registry->codecForTypeName(
-                description.direction == RemotePortDirection::input
+                description.direction == PortDirection::input
                     ? "WriteStatus"
                     : "FlowStatus")
           : nullptr;
@@ -87,7 +87,7 @@ RemotePortAdapter::create(std::shared_ptr<ClientSession> session,
   }
 
   std::unique_ptr<RTT::base::PortInterface> port(
-      description.direction == RemotePortDirection::input
+      description.direction == PortDirection::input
           ? static_cast<RTT::base::PortInterface *>(
                 type_info->inputPort(description.name))
           : static_cast<RTT::base::PortInterface *>(
@@ -137,7 +137,7 @@ RTT::base::PortInterface &RemotePortAdapter::port() const { return *port_; }
 
 void RemotePortAdapter::pump() noexcept {
   try {
-    if (description_.direction == RemotePortDirection::input) {
+    if (description_.direction == PortDirection::input) {
       pumpInput();
     } else {
       pumpOutput();
