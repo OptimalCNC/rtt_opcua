@@ -2,13 +2,16 @@
 #include <boost/test/included/unit_test.hpp>
 
 #include <rtt/opcua/node_id.hpp>
+#include <rtt/opcua/port_direction.hpp>
 #include <rtt/opcua/server_options.hpp>
 #include <rtt/opcua/type_descriptor.hpp>
 
 #include <open62541pp/ua/nodeids.hpp>
 
 #include <array>
+#include <cstdint>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 BOOST_AUTO_TEST_CASE(node_id_segments_are_stably_escaped) {
@@ -26,6 +29,15 @@ BOOST_AUTO_TEST_CASE(node_paths_never_embed_unescaped_names) {
 
   BOOST_TEST(RTT::opcua::makeNodePath(segments) ==
              "rtt/components/arm%2Fleft/services/motion%25raw");
+}
+
+BOOST_AUTO_TEST_CASE(port_direction_codes_are_stable) {
+  using RTT::opcua::PortDirection;
+
+  static_assert(
+      std::is_same_v<std::underlying_type_t<PortDirection>, std::int32_t>);
+  BOOST_TEST(static_cast<std::int32_t>(PortDirection::input) == 0);
+  BOOST_TEST(static_cast<std::int32_t>(PortDirection::output) == 1);
 }
 
 BOOST_AUTO_TEST_CASE(server_defaults_are_loopback_only) {
