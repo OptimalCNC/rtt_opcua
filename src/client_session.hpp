@@ -92,8 +92,6 @@ public:
   bool readServiceDescription(const std::string &component_name,
                               const RemoteServicePath &service_path,
                               std::string *description, std::string *error);
-  bool readLifecycleState(const std::string &component_name,
-                          std::string *lifecycle_state, std::string *error);
   bool readValue(const ::opcua::NodeId &node_id, ::opcua::Variant *value);
   bool writeValue(const ::opcua::NodeId &node_id,
                   const ::opcua::Variant &value);

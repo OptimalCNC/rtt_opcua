@@ -5,6 +5,8 @@
 #include "remote_operation.hpp"
 #include "remote_port.hpp"
 
+#include <open62541pp/ua/nodeids.hpp>
+
 #include <rtt/OperationInterfacePart.hpp>
 #include <rtt/Service.hpp>
 #include <rtt/base/AttributeBase.hpp>
@@ -13,6 +15,7 @@
 #include <rtt/types/Types.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -38,31 +41,6 @@ void assignError(std::string *output, const std::string &message) {
 }
 
 constexpr std::size_t kMaximumServiceDepth = 32U;
-
-bool parseTaskState(std::string_view name,
-                    RTT::base::TaskCore::TaskState *state) {
-  if (state == nullptr) {
-    return false;
-  }
-  if (name == "Init") {
-    *state = RTT::base::TaskCore::Init;
-  } else if (name == "PreOperational") {
-    *state = RTT::base::TaskCore::PreOperational;
-  } else if (name == "FatalError") {
-    *state = RTT::base::TaskCore::FatalError;
-  } else if (name == "Exception") {
-    *state = RTT::base::TaskCore::Exception;
-  } else if (name == "Stopped") {
-    *state = RTT::base::TaskCore::Stopped;
-  } else if (name == "Running") {
-    *state = RTT::base::TaskCore::Running;
-  } else if (name == "RunTimeError") {
-    *state = RTT::base::TaskCore::RunTimeError;
-  } else {
-    return false;
-  }
-  return true;
-}
 
 template <typename Callback> class ScopeExit final {
 public:
@@ -96,6 +74,45 @@ struct StagedService {
   std::vector<std::shared_ptr<detail::RemotePortAdapter>> ports;
   std::vector<std::unique_ptr<StagedService>> children;
 };
+
+struct RequiredRootOperation {
+  std::string_view name;
+  std::string_view output_type;
+};
+
+constexpr std::array<RequiredRootOperation, 8U> kRequiredRootOperations{{
+    {"getTaskState", "TaskState"},
+    {"getTargetState", "TaskState"},
+    {"isConfigured", "Bool"},
+    {"isActive", "Bool"},
+    {"isRunning", "Bool"},
+    {"inFatalError", "Bool"},
+    {"inException", "Bool"},
+    {"inRunTimeError", "Bool"},
+}};
+
+void validateRequiredRootOperations(
+    const std::vector<detail::RemoteOperationDescription> &operations) {
+  for (const RequiredRootOperation &required : kRequiredRootOperations) {
+    const auto found = std::find_if(
+        operations.begin(), operations.end(), [&](const auto &operation) {
+          return operation.name == required.name;
+        });
+    if (found == operations.end()) {
+      throw std::runtime_error("remote RTT root operation '" +
+                               std::string(required.name) + "' is required");
+    }
+    if (!found->input_types.empty() || found->output_types.size() != 1U ||
+        found->output_types.front() != required.output_type ||
+        found->output_sources.size() != 1U ||
+        found->output_sources.front() != -1) {
+      throw std::runtime_error(
+          "remote RTT root operation '" + std::string(required.name) +
+          "' must have no inputs and one return output of RTT type '" +
+          std::string(required.output_type) + "'");
+    }
+  }
+}
 
 void collectStagedPorts(
     const StagedService &staged,
@@ -156,6 +173,9 @@ stageRemoteService(const std::shared_ptr<detail::ClientSession> &session,
                                   &discovery_error);
   if (!discovery_error.empty()) {
     throw std::runtime_error(discovery_error);
+  }
+  if (service_path.empty()) {
+    validateRequiredRootOperations(operation_descriptions);
   }
   std::vector<detail::RemoteValueDescription> property_descriptions =
       session->discoverValues(component_name, service_path,
@@ -413,7 +433,7 @@ public:
   }
 
   RTT::base::TaskCore::TaskState
-  readTaskState(const std::string &component_name) {
+  invokeTaskStateOperation(std::string_view operation_name) {
     const std::lock_guard<std::mutex> lock(synchronize_mutex);
     if (!interface_ready.load()) {
       setControlError("remote RTT interface is not ready");
@@ -423,22 +443,52 @@ public:
       return RTT::base::TaskCore::Init;
     }
 
-    clearControlError();
-    std::string state_name;
-    std::string state_error;
-    if (!session->readLifecycleState(component_name, &state_name,
-                                     &state_error)) {
-      markInterfaceStale(std::move(state_error));
+    detail::RemoteCallResult result = session->callOperation(
+        component_name, {}, std::string(operation_name), {});
+    if (!result.success) {
+      markInterfaceStale(result.error.empty()
+                             ? "remote RTT task state operation failed"
+                             : std::move(result.error));
       return RTT::base::TaskCore::Init;
     }
-    RTT::base::TaskCore::TaskState state = RTT::base::TaskCore::Init;
-    if (!parseTaskState(state_name, &state)) {
-      markInterfaceStale(
-          "remote RTT component returned unknown lifecycle state '" +
-          state_name + "'");
+    if (result.outputs.size() != 1U) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' returned an invalid result count");
       return RTT::base::TaskCore::Init;
     }
-    return state;
+    const ::opcua::Variant &output = result.outputs.front();
+    if (!output.isScalar() ||
+        !output.isType(::opcua::NodeId(::opcua::DataTypeId::Int32))) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' did not return a scalar Int32 TaskState");
+      return RTT::base::TaskCore::Init;
+    }
+    try {
+      const std::int32_t code = output.to<std::int32_t>();
+      if (code < static_cast<std::int32_t>(RTT::base::TaskCore::Init) ||
+          code > static_cast<std::int32_t>(
+                     RTT::base::TaskCore::RunTimeError)) {
+        markInterfaceStale("remote RTT operation '" +
+                           std::string(operation_name) +
+                           "' returned invalid TaskState code " +
+                           std::to_string(code));
+        return RTT::base::TaskCore::Init;
+      }
+      clearControlError();
+      return static_cast<RTT::base::TaskCore::TaskState>(code);
+    } catch (const std::exception &exception) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' returned an incompatible TaskState: " +
+                         exception.what());
+    } catch (...) {
+      markInterfaceStale("remote RTT operation '" +
+                         std::string(operation_name) +
+                         "' returned an incompatible TaskState");
+    }
+    return RTT::base::TaskCore::Init;
   }
 
   std::string lastControlError() const {
@@ -849,7 +899,7 @@ bool TaskContextProxy::ready() {
   if (impl_ == nullptr || !impl_->interface_ready.load()) {
     return false;
   }
-  static_cast<void>(impl_->readTaskState(getName()));
+  static_cast<void>(impl_->invokeTaskStateOperation("getTaskState"));
   return impl_->connectionState() == ProxyConnectionState::connected;
 }
 
@@ -878,7 +928,7 @@ bool TaskContextProxy::recover() {
 }
 
 bool TaskContextProxy::isConfigured() const {
-  return getTaskState() >= RTT::base::TaskCore::Stopped;
+  return impl_ && impl_->invokeOperation<bool>("isConfigured", false);
 }
 
 bool TaskContextProxy::isActive() const {
@@ -886,27 +936,29 @@ bool TaskContextProxy::isActive() const {
 }
 
 bool TaskContextProxy::isRunning() const {
-  return getTaskState() >= RTT::base::TaskCore::Running;
+  return impl_ && impl_->invokeOperation<bool>("isRunning", false);
 }
 
 bool TaskContextProxy::inFatalError() const {
-  return getTaskState() == RTT::base::TaskCore::FatalError;
+  return impl_ && impl_->invokeOperation<bool>("inFatalError", false);
 }
 
 bool TaskContextProxy::inException() const {
-  return getTaskState() == RTT::base::TaskCore::Exception;
+  return impl_ && impl_->invokeOperation<bool>("inException", false);
 }
 
 bool TaskContextProxy::inRunTimeError() const {
-  return getTaskState() == RTT::base::TaskCore::RunTimeError;
+  return impl_ && impl_->invokeOperation<bool>("inRunTimeError", false);
 }
 
 TaskContextProxy::TaskState TaskContextProxy::getTaskState() const {
-  return impl_ ? impl_->readTaskState(getName()) : RTT::base::TaskCore::Init;
+  return impl_ ? impl_->invokeTaskStateOperation("getTaskState")
+               : RTT::base::TaskCore::Init;
 }
 
 TaskContextProxy::TaskState TaskContextProxy::getTargetState() const {
-  return getTaskState();
+  return impl_ ? impl_->invokeTaskStateOperation("getTargetState")
+               : RTT::base::TaskCore::Init;
 }
 
 Seconds TaskContextProxy::getPeriod() const {

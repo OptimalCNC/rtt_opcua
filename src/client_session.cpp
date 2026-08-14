@@ -754,47 +754,6 @@ bool ClientSession::readServiceDescription(
   }
 }
 
-bool ClientSession::readLifecycleState(const std::string &component_name,
-                                       std::string *lifecycle_state,
-                                       std::string *error) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (lifecycle_state == nullptr) {
-    last_error_ = "remote RTT lifecycle state destination must not be null";
-    assignError(error, last_error_);
-    return false;
-  }
-  if (!client_ || state_.load() != ProxyConnectionState::connected) {
-    last_error_ = "OPC UA client is not connected";
-    assignError(error, last_error_);
-    return false;
-  }
-
-  try {
-    const std::vector<std::string_view> state_segment{"lifecycleState"};
-    const ::opcua::NodeId state_id(
-        namespace_index_, modelPath(component_name, {}, state_segment));
-    if (!readStringValue(*client_, state_id, "remote RTT lifecycle state",
-                         lifecycle_state, &last_error_)) {
-      if (!client_->isConnected()) {
-        state_.store(ProxyConnectionState::stale);
-      }
-      assignError(error, last_error_);
-      return false;
-    }
-    last_error_.clear();
-    assignError(error, "");
-    return true;
-  } catch (const std::exception &exception) {
-    last_error_ = std::string("failed to read remote RTT lifecycle state: ") +
-                  exception.what();
-    if (!client_->isConnected()) {
-      state_.store(ProxyConnectionState::stale);
-    }
-    assignError(error, last_error_);
-    return false;
-  }
-}
-
 std::vector<RemoteServiceDescription>
 ClientSession::discoverServices(const std::string &component_name,
                                 const RemoteServicePath &service_path,

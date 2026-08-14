@@ -28,6 +28,7 @@
 
 #include <open62541pp/exception.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
+#include <open62541pp/services/method.hpp>
 #include <open62541pp/services/nodemanagement.hpp>
 
 #include <arpa/inet.h>
@@ -40,6 +41,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
@@ -140,6 +142,142 @@ void replaceDirectionMetadata(
                 native, port_id, direction_id, "direction", attributes,
                 ::opcua::VariableTypeId::BaseDataVariableType,
                 ::opcua::ReferenceTypeId::HasComponent));
+          },
+          std::chrono::seconds(1), &error),
+      error);
+  BOOST_REQUIRE(replaced);
+}
+
+template <typename T>
+void addArrayMetadata(::opcua::Server &server, const ::opcua::NodeId &parent,
+                      const ::opcua::NodeId &id, std::string_view name,
+                      std::vector<T> values,
+                      const ::opcua::NodeId &data_type) {
+  ::opcua::VariableAttributes attributes;
+  attributes.setDisplayName(::opcua::LocalizedText("en-US", name));
+  attributes.setValue(::opcua::Variant(std::move(values)));
+  attributes.setDataType(data_type);
+  attributes.setValueRank(::opcua::ValueRank::OneDimension);
+  attributes.setArrayDimensions({0U});
+  attributes.setAccessLevel(::opcua::AccessLevel::CurrentRead);
+  attributes.setUserAccessLevel(::opcua::AccessLevel::CurrentRead);
+  const auto added = ::opcua::services::addVariable(
+      server, parent, id, name, attributes,
+      ::opcua::VariableTypeId::BaseDataVariableType,
+      ::opcua::ReferenceTypeId::HasProperty);
+  if (!added) {
+    throw ::opcua::BadStatus(added.code());
+  }
+}
+
+void replaceStateGetterWithStringResult(
+    RTT::opcua::Server &server, std::uint16_t namespace_index,
+    std::string_view component_name, std::string_view operation_name) {
+  const auto operations_id = modelNodeId(
+      namespace_index, {"components", component_name, "operations"});
+  const auto method_id = modelNodeId(
+      namespace_index,
+      {"components", component_name, "operations", operation_name});
+  const auto output_types_id = modelNodeId(
+      namespace_index, {"components", component_name, "operations",
+                        operation_name, "rttOutputTypes"});
+  const auto output_sources_id = modelNodeId(
+      namespace_index, {"components", component_name, "operations",
+                        operation_name, "rttOutputSources"});
+  bool replaced = false;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&](::opcua::Server &native) {
+            removeNodeIfPresent(native, output_types_id);
+            removeNodeIfPresent(native, output_sources_id);
+            removeNodeIfPresent(native, method_id);
+
+            ::opcua::MethodAttributes attributes;
+            attributes.setDisplayName(
+                ::opcua::LocalizedText("en-US", operation_name));
+            attributes.setExecutable(true);
+            attributes.setUserExecutable(true);
+            ::opcua::services::MethodCallback callback =
+                std::function<::opcua::StatusCode(
+                    ::opcua::Session &,
+                    ::opcua::Span<const ::opcua::Variant>,
+                    ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
+                    const ::opcua::NodeId &)>(
+                    [](::opcua::Session &,
+                       ::opcua::Span<const ::opcua::Variant>,
+                       ::opcua::Span<::opcua::Variant> outputs,
+                       const ::opcua::NodeId &, const ::opcua::NodeId &) {
+                      if (outputs.size() != 1U) {
+                        return ::opcua::StatusCode(
+                            UA_STATUSCODE_BADINVALIDARGUMENT);
+                      }
+                      outputs[0] = ::opcua::Variant(std::string("invalid"));
+                      return ::opcua::StatusCode(UA_STATUSCODE_GOOD);
+                    });
+            const std::vector<::opcua::Argument> outputs{
+                ::opcua::Argument(
+                    "result",
+                    ::opcua::LocalizedText("en-US", "Invalid state result."),
+                    ::opcua::DataTypeId::String, ::opcua::ValueRank::Scalar)};
+            const auto method = ::opcua::services::addMethod(
+                native, operations_id, method_id, operation_name,
+                std::move(callback), {}, outputs, attributes,
+                ::opcua::ReferenceTypeId::HasComponent);
+            if (!method) {
+              throw ::opcua::BadStatus(method.code());
+            }
+            addArrayMetadata(native, method_id, output_types_id,
+                             "rttOutputTypes",
+                             std::vector<std::string>{"String"},
+                             ::opcua::DataTypeId::String);
+            addArrayMetadata(native, method_id, output_sources_id,
+                             "rttOutputSources",
+                             std::vector<std::int32_t>{-1},
+                             ::opcua::DataTypeId::Int32);
+            replaced = true;
+          },
+          std::chrono::seconds(1), &error),
+      error);
+  BOOST_REQUIRE(replaced);
+}
+
+void replaceStateGetterCallbackWithCode(
+    RTT::opcua::Server &server, std::uint16_t namespace_index,
+    std::string_view component_name, std::string_view operation_name,
+    std::int32_t code) {
+  const auto method_id = modelNodeId(
+      namespace_index,
+      {"components", component_name, "operations", operation_name});
+  bool replaced = false;
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&](::opcua::Server &native) {
+            ::opcua::services::MethodCallback callback =
+                std::function<::opcua::StatusCode(
+                    ::opcua::Session &,
+                    ::opcua::Span<const ::opcua::Variant>,
+                    ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
+                    const ::opcua::NodeId &)>(
+                    [code](::opcua::Session &,
+                           ::opcua::Span<const ::opcua::Variant>,
+                           ::opcua::Span<::opcua::Variant> outputs,
+                           const ::opcua::NodeId &, const ::opcua::NodeId &) {
+                      if (outputs.size() != 1U) {
+                        return ::opcua::StatusCode(
+                            UA_STATUSCODE_BADINVALIDARGUMENT);
+                      }
+                      outputs[0] = ::opcua::Variant(code);
+                      return ::opcua::StatusCode(UA_STATUSCODE_GOOD);
+                    });
+            const ::opcua::StatusCode status =
+                ::opcua::services::setMethodCallback(native, method_id,
+                                                     std::move(callback));
+            if (!status.isGood()) {
+              throw ::opcua::BadStatus(status);
+            }
+            replaced = true;
           },
           std::chrono::seconds(1), &error),
       error);
@@ -347,9 +485,166 @@ public:
                          RTT::TaskContext::PreOperational) {}
 };
 
+class DivergentLifecycleTarget final : public RTT::TaskContext {
+public:
+  DivergentLifecycleTarget()
+      : RTT::TaskContext("remote/divergent-lifecycle",
+                         RTT::TaskContext::PreOperational) {}
+
+  TaskState getTaskState() const override { return Init; }
+  TaskState getTargetState() const override { return Running; }
+  bool isConfigured() const override { return true; }
+  bool isActive() const override { return false; }
+  bool isRunning() const override { return true; }
+  bool inFatalError() const override { return false; }
+  bool inException() const override { return true; }
+  bool inRunTimeError() const override { return false; }
+};
+
 } // namespace
 
 BOOST_GLOBAL_FIXTURE(CustomDatatypeFixture);
+
+BOOST_FIXTURE_TEST_CASE(proxy_calls_each_native_lifecycle_operation,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  DivergentLifecycleTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  BOOST_TEST(proxy->ready());
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::Init);
+  BOOST_TEST(proxy->getTargetState() == RTT::TaskContext::Running);
+  BOOST_TEST(proxy->isConfigured());
+  BOOST_TEST(!proxy->isActive());
+  BOOST_TEST(proxy->isRunning());
+  BOOST_TEST(!proxy->inFatalError());
+  BOOST_TEST(proxy->inException());
+  BOOST_TEST(!proxy->inRunTimeError());
+
+  proxy.reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_requires_both_native_state_getters,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SparseRootTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  const auto method_id = modelNodeId(
+      *server.namespaceIndex(),
+      {"components", target.getName(), "operations", "getTargetState"});
+  BOOST_REQUIRE_MESSAGE(
+      server.invoke(
+          [&](::opcua::Server &native) {
+            removeNodeIfPresent(native, method_id);
+          },
+          std::chrono::seconds(1), &error),
+      error);
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("getTargetState") != std::string::npos);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_incompatible_native_state_schema,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SparseRootTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  replaceStateGetterWithStringResult(
+      server, *server.namespaceIndex(), target.getName(), "getTargetState");
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_TEST(proxy == nullptr);
+  BOOST_TEST(error.find("getTargetState") != std::string::npos);
+  BOOST_TEST(error.find("TaskState") != std::string::npos);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_rejects_out_of_range_native_task_state,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SparseRootTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  replaceStateGetterCallbackWithCode(
+      server, *server.namespaceIndex(), target.getName(), "getTaskState", 7);
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::Init);
+  BOOST_TEST(proxy->connectionState() ==
+             RTT::opcua::ProxyConnectionState::stale);
+  BOOST_TEST(proxy->lastError().find("getTaskState") != std::string::npos);
+  BOOST_TEST(proxy->lastError().find("7") != std::string::npos);
+
+  proxy.reset();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(proxy_ready_marks_server_loss_stale,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SparseRootTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  BOOST_TEST(proxy->ready());
+
+  server.stop();
+  BOOST_TEST(!proxy->ready());
+  BOOST_TEST(proxy->connectionState() ==
+             RTT::opcua::ProxyConnectionState::stale);
+}
 
 BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
                         CanonicalTypesFixture) {
