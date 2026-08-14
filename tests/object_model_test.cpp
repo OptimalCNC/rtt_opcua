@@ -817,6 +817,26 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
       modelNodeId(namespace_index, {"components", "arm/left"});
   const auto lifecycle_id = modelNodeId(
       namespace_index, {"components", "arm/left", "lifecycleState"});
+  const auto operations_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "operations"});
+  const auto get_task_state_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "operations", "getTaskState"});
+  const auto get_target_state_id = modelNodeId(
+      namespace_index,
+      {"components", "arm/left", "operations", "getTargetState"});
+  const auto get_task_state_types_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "operations",
+                        "getTaskState", "rttOutputTypes"});
+  const auto get_task_state_sources_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "operations",
+                        "getTaskState", "rttOutputSources"});
+  const auto get_target_state_types_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "operations",
+                        "getTargetState", "rttOutputTypes"});
+  const auto get_target_state_sources_id = modelNodeId(
+      namespace_index, {"components", "arm/left", "operations",
+                        "getTargetState", "rttOutputSources"});
   const auto gain_id = modelNodeId(
       namespace_index, {"components", "arm/left", "properties", "Gain"});
   const auto gain_type_id =
@@ -924,9 +944,41 @@ BOOST_FIXTURE_TEST_CASE(publish_component_creates_one_complete_static_snapshot,
   BOOST_TEST(::opcua::services::readBrowseName(client, component_id)
                  .value()
                  .name() == "arm/left");
-  BOOST_TEST(::opcua::services::readValue(client, lifecycle_id)
+  requireMissingNode(client, lifecycle_id);
+  BOOST_TEST(::opcua::services::readValue(client, get_task_state_types_id)
                  .value()
-                 .to<std::string>() == "Stopped");
+                 .to<std::vector<std::string>>() ==
+             std::vector<std::string>({"TaskState"}));
+  BOOST_TEST(::opcua::services::readValue(client, get_task_state_sources_id)
+                 .value()
+                 .to<std::vector<std::int32_t>>() ==
+             std::vector<std::int32_t>({-1}));
+  BOOST_TEST(::opcua::services::readValue(client, get_target_state_types_id)
+                 .value()
+                 .to<std::vector<std::string>>() ==
+             std::vector<std::string>({"TaskState"}));
+  BOOST_TEST(::opcua::services::readValue(client, get_target_state_sources_id)
+                 .value()
+                 .to<std::vector<std::int32_t>>() ==
+             std::vector<std::int32_t>({-1}));
+  for (const auto &[method_name, method_id] :
+       std::array<std::pair<std::string_view, ::opcua::NodeId>, 2>{
+           {{"getTaskState", get_task_state_id},
+            {"getTargetState", get_target_state_id}}}) {
+    requireMissingNode(
+        client,
+        modelNodeId(namespace_index,
+                    {"components", "arm/left", "operations", method_name,
+                     "rttInputTypes"}));
+    const auto result =
+        ::opcua::services::call(client, operations_id, method_id, {});
+    BOOST_REQUIRE(result.statusCode().isGood());
+    BOOST_REQUIRE_EQUAL(result.outputArguments().size(), 1U);
+    BOOST_TEST(result.outputArguments()[0].isScalar());
+    BOOST_TEST(result.outputArguments()[0].isType(
+        ::opcua::NodeId(::opcua::DataTypeId::Int32)));
+    BOOST_TEST(result.outputArguments()[0].to<std::int32_t>() == 4);
+  }
   BOOST_TEST(::opcua::services::readValue(client, gain_id)
                  .value()
                  .to<std::int32_t>() == 7);

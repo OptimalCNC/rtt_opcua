@@ -120,26 +120,6 @@ bool sharedRootEnsured(const ::opcua::Result<::opcua::NodeId> &result,
   return false;
 }
 
-std::string taskStateName(RTT::base::TaskCore::TaskState state) {
-  switch (state) {
-  case RTT::base::TaskCore::Init:
-    return "Init";
-  case RTT::base::TaskCore::PreOperational:
-    return "PreOperational";
-  case RTT::base::TaskCore::FatalError:
-    return "FatalError";
-  case RTT::base::TaskCore::Exception:
-    return "Exception";
-  case RTT::base::TaskCore::Stopped:
-    return "Stopped";
-  case RTT::base::TaskCore::Running:
-    return "Running";
-  case RTT::base::TaskCore::RunTimeError:
-    return "RunTimeError";
-  }
-  return "Unknown";
-}
-
 ::opcua::Bitmask<::opcua::AccessLevel> readOnlyAccess() {
   return ::opcua::AccessLevel::CurrentRead;
 }
@@ -262,39 +242,6 @@ private:
   RTT::base::OutputPortInterface *port_;
   std::shared_ptr<const EndpointTypeRegistry> type_registry_;
   const TypeCodec *codec_;
-};
-
-class LifecycleDataSource final : public ::opcua::DataSourceBase {
-public:
-  explicit LifecycleDataSource(std::weak_ptr<ComponentState> state)
-      : state_(std::move(state)) {}
-
-  ::opcua::StatusCode read(::opcua::Session &, const ::opcua::NodeId &,
-                           const ::opcua::NumericRange *range,
-                           ::opcua::DataValue &value, bool) override {
-    if (range != nullptr) {
-      value.setStatus(UA_STATUSCODE_BADINDEXRANGEINVALID);
-      return UA_STATUSCODE_BADINDEXRANGEINVALID;
-    }
-    const auto state = state_.lock();
-    ComponentLease lease(state);
-    if (!lease) {
-      value.setStatus(UA_STATUSCODE_BADNOTCONNECTED);
-      return UA_STATUSCODE_BADNOTCONNECTED;
-    }
-    value.setValue(
-        ::opcua::Variant(taskStateName(lease.get()->getTaskState())));
-    return UA_STATUSCODE_GOOD;
-  }
-
-  ::opcua::StatusCode write(::opcua::Session &, const ::opcua::NodeId &,
-                            const ::opcua::NumericRange *,
-                            const ::opcua::DataValue &) override {
-    return UA_STATUSCODE_BADNOTWRITABLE;
-  }
-
-private:
-  std::weak_ptr<ComponentState> state_;
 };
 
 enum class NodeKind { object, variable, method };
@@ -658,53 +605,6 @@ NodeSpec staticArrayPropertySpec(std::string path, std::string parent_path,
         name, attributes, ::opcua::VariableTypeId::BaseDataVariableType,
         ::opcua::ReferenceTypeId::HasProperty);
     return componentNodeCreated(result, path, created, error);
-  };
-  return spec;
-}
-
-NodeSpec lifecycleSpec(const std::string &component_path,
-                       const std::shared_ptr<ComponentState> &state) {
-  NodeSpec spec;
-  spec.kind = NodeKind::variable;
-  spec.parent_path = component_path;
-  spec.path = appendNodeSegment(component_path, "lifecycleState");
-  spec.browse_name = "lifecycleState";
-  spec.fingerprint = "lifecycle|" + state->component_name;
-  spec.create = [path = spec.path, parent = spec.parent_path,
-                 weak_state = std::weak_ptr<ComponentState>(state)](
-                    ::opcua::Server &server, std::uint16_t namespace_index,
-                    bool *created, std::string *error) {
-    const auto current_state = weak_state.lock();
-    ComponentLease lease(current_state);
-    if (!lease) {
-      assignError(
-          error,
-          "component became unavailable while publishing lifecycle state");
-      return false;
-    }
-    ::opcua::VariableAttributes attributes;
-    attributes.setDisplayName(
-        ::opcua::LocalizedText("en-US", "lifecycleState"));
-    attributes.setDescription(::opcua::LocalizedText(
-        "en-US", "Current RTT component lifecycle state."));
-    attributes.setValue(
-        ::opcua::Variant(taskStateName(lease.get()->getTaskState())));
-    attributes.setDataType(::opcua::DataTypeId::String);
-    attributes.setValueRank(::opcua::ValueRank::Scalar);
-    attributes.setAccessLevel(readOnlyAccess());
-    attributes.setUserAccessLevel(readOnlyAccess());
-    const auto result = ::opcua::services::addVariable(
-        server, nodeId(namespace_index, parent), nodeId(namespace_index, path),
-        "lifecycleState", attributes,
-        ::opcua::VariableTypeId::BaseDataVariableType,
-        ::opcua::ReferenceTypeId::HasComponent);
-    if (!componentNodeCreated(result, path, created, error)) {
-      return false;
-    }
-    ::opcua::setVariableNodeValueBackend(
-        server, nodeId(namespace_index, path),
-        std::make_unique<LifecycleDataSource>(weak_state));
-    return true;
   };
   return spec;
 }
@@ -1304,7 +1204,6 @@ ComponentSnapshot snapshotComponent(
   insertNode(snapshot.nodes,
              objectSpec(component_path, components_path, state->component_name,
                         component.provides()->doc()));
-  insertNode(snapshot.nodes, lifecycleSpec(component_path, state));
 
   std::set<const RTT::Service *> ancestry;
   appendServiceContents(snapshot.nodes, snapshot.unsupported,
