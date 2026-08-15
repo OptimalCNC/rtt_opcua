@@ -427,6 +427,12 @@ public:
         .arg("value", "Unexpected mandatory input.");
   }
 
+  void addLateOperation() {
+    addOperation("late", &SelectableResourceComponent::echo, this,
+                 RTT::ClientThread)
+        .arg("value", "Late value to echo.");
+  }
+
   std::int32_t echo(std::int32_t value) const { return value; }
   std::int32_t adjust(std::int32_t value) const { return value + nested_gain; }
   bool incompatibleIsConfigured(std::int32_t value) const { return value != 0; }
@@ -1723,6 +1729,292 @@ BOOST_FIXTURE_TEST_CASE(publish_component_is_idempotent_for_the_same_instance,
 }
 
 BOOST_FIXTURE_TEST_CASE(
+    selected_publication_identity_uses_the_normalized_effective_resource_set,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SelectableResourceComponent component("selected-identity");
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(
+          component, {"services/motion%2Fraw%2A/**"}, &error, &diagnostics),
+      error);
+  const std::uint64_t first_revision = model.revision();
+
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(
+          component,
+          {"services/motion%2Fraw%2A/properties/NestedGain",
+           "services/motion%2Fraw%2A/**",
+           "services/motion%2Fraw%2A/operations/adjust",
+           "services/motion%2Fraw%2A/**"},
+          &error, &diagnostics),
+      error);
+  BOOST_TEST(first_revision == 1U);
+  BOOST_TEST(model.revision() == first_revision);
+  BOOST_TEST(model.componentCount() == 1U);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.publicationDiagnostics(component.getName()).empty());
+  BOOST_TEST(model.lastError().empty());
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selected_publication_rejects_a_changed_effective_set_and_preserves_nodes,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  std::vector<std::string> messages;
+  RTT::opcua::ObjectModelOptions options;
+  options.warning_sink = [&messages](const std::string &message) {
+    messages.push_back(message);
+  };
+  SelectableResourceComponent component("selected-set-conflict");
+  RTT::opcua::ObjectModel model(server, options);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            component, {"properties/Gain"}, &error),
+                        error);
+  const std::uint64_t first_revision = model.revision();
+
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(
+      component, {"attributes/Status"}, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::publication_conflict);
+  BOOST_TEST(diagnostics[0].component == component.getName());
+  BOOST_TEST(diagnostics[0].reason.find("effective resource set") !=
+             std::string::npos);
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) == diagnostics,
+             boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(messages.size(), 1U);
+  BOOST_TEST(messages[0] == diagnostics[0].message());
+  BOOST_TEST(model.lastError() == error);
+  BOOST_TEST(model.revision() == first_revision);
+  BOOST_TEST(model.componentCount() == 1U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index,
+                          {"components", component.getName(), "properties",
+                           "Gain"}))));
+  requireMissingNode(
+      client, modelNodeId(namespace_index,
+                          {"components", component.getName(), "attributes",
+                           "Status"}));
+
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            component, {"properties/Gain"}, &error,
+                            &diagnostics),
+                        error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.publicationDiagnostics(component.getName()).empty());
+  BOOST_TEST(model.lastError().empty());
+  BOOST_TEST(model.revision() == first_revision);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    full_and_selected_publication_modes_conflict_in_both_directions,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  std::vector<std::string> messages;
+  RTT::opcua::ObjectModelOptions options;
+  options.warning_sink = [&messages](const std::string &message) {
+    messages.push_back(message);
+  };
+  SelectableResourceComponent selected_first("selected-first");
+  SelectableResourceComponent full_first("full-first");
+  RTT::opcua::ObjectModel model(server, options);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            selected_first, {"properties/Gain"}, &error),
+                        error);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(full_first, &error), error);
+  const std::uint64_t published_revision = model.revision();
+
+  BOOST_TEST(!model.publishComponent(selected_first, &error));
+  auto diagnostics = model.publicationDiagnostics(selected_first.getName());
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::publication_conflict);
+  BOOST_TEST(diagnostics[0].reason.find("mode") != std::string::npos);
+
+  BOOST_TEST(!model.publishComponentSelected(
+      full_first, {"properties/Gain"}, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::publication_conflict);
+  BOOST_TEST(diagnostics[0].reason.find("mode") != std::string::npos);
+  BOOST_TEST(model.publicationDiagnostics(full_first.getName()) == diagnostics,
+             boost::test_tools::per_element());
+  BOOST_REQUIRE_EQUAL(messages.size(), 2U);
+  BOOST_TEST(model.revision() == published_revision);
+  BOOST_TEST(model.componentCount() == 2U);
+
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            selected_first, {"properties/Gain"}, &error,
+                            &diagnostics),
+                        error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.publicationDiagnostics(selected_first.getName()).empty());
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(full_first, &error), error);
+  BOOST_TEST(model.publicationDiagnostics(full_first.getName()).empty());
+  BOOST_TEST(model.lastError().empty());
+  BOOST_TEST(model.revision() == published_revision);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selected_publication_reexpands_wildcards_but_ignores_unrelated_resources,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  SelectableResourceComponent wildcard("wildcard-static-selection");
+  SelectableResourceComponent exact("exact-static-selection");
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            wildcard, {"operations/*"}, &error),
+                        error);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            exact, {"properties/Gain"}, &error),
+                        error);
+  const std::uint64_t published_revision = model.revision();
+
+  wildcard.addLateOperation();
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(
+      wildcard, {"operations/*"}, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::publication_conflict);
+
+  exact.addLateOperation();
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            exact, {"properties/Gain"}, &error, &diagnostics),
+                        error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.revision() == published_revision);
+  BOOST_TEST(model.componentCount() == 2U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  requireMissingNode(
+      client, modelNodeId(namespace_index,
+                          {"components", wildcard.getName(), "operations",
+                           "late"}));
+  requireMissingNode(
+      client, modelNodeId(namespace_index,
+                          {"components", exact.getName(), "operations",
+                           "late"}));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selected_publication_rejects_a_removed_effective_resource_as_a_conflict,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SelectableResourceComponent component("removed-static-selection");
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            component, {"operations/echo"}, &error),
+                        error);
+  const std::uint64_t published_revision = model.revision();
+  component.provides()->removeOperation("echo");
+
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(
+      component, {"operations/echo"}, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::publication_conflict);
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) == diagnostics,
+             boost::test_tools::per_element());
+  BOOST_TEST(model.revision() == published_revision);
+  BOOST_TEST(model.componentCount() == 1U);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selected_publication_rejects_a_different_instance_with_the_same_name,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  std::vector<std::string> messages;
+  RTT::opcua::ObjectModelOptions options;
+  options.warning_sink = [&messages](const std::string &message) {
+    messages.push_back(message);
+  };
+  SelectableResourceComponent first("selected-duplicate");
+  SelectableResourceComponent second("selected-duplicate");
+  RTT::opcua::ObjectModel model(server, options);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            first, {"properties/Gain"}, &error),
+                        error);
+  const std::uint64_t first_revision = model.revision();
+
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(
+      second, {"properties/Gain"}, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::publication_conflict);
+  BOOST_TEST(diagnostics[0].reason.find("different RTT component instance") !=
+             std::string::npos);
+  BOOST_TEST(model.publicationDiagnostics(first.getName()) == diagnostics,
+             boost::test_tools::per_element());
+  BOOST_TEST(model.revision() == first_revision);
+  BOOST_TEST(model.componentCount() == 1U);
+  BOOST_REQUIRE_EQUAL(messages.size(), 1U);
+  BOOST_TEST(messages[0] == diagnostics[0].message());
+
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            first, {"properties/Gain"}, &error, &diagnostics),
+                        error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.publicationDiagnostics(first.getName()).empty());
+  BOOST_TEST(model.lastError().empty());
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
     publish_component_rejects_a_different_instance_with_the_same_name,
     CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -2751,6 +3043,76 @@ BOOST_FIXTURE_TEST_CASE(callback_failure_rolls_back_every_candidate_node,
   BOOST_TEST(!::opcua::services::readBrowseName(client, component_root_id));
   BOOST_TEST(!::opcua::services::readBrowseName(client, earlier_property_id));
   BOOST_TEST(!::opcua::services::readBrowseName(client, throwing_port_id));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selected_callback_failure_rolls_back_without_damaging_existing_nodes,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  RTT::TaskContext published("selected-rollback-existing");
+  std::int32_t published_value{31};
+  published.addProperty("Value", published_value);
+  CallbackFailureComponent failing;
+  const ::opcua::NodeId foreign_id(namespace_index,
+                                   "selected-rollback-foreign");
+  bool seeded = false;
+  BOOST_REQUIRE(server.invoke([&](::opcua::Server &native) {
+    ::opcua::VariableAttributes attributes;
+    attributes.setDisplayName(::opcua::LocalizedText("en-US", "Foreign"));
+    attributes.setValue(::opcua::Variant(std::int32_t{99}));
+    attributes.setDataType(::opcua::DataTypeId::Int32);
+    attributes.setValueRank(::opcua::ValueRank::Scalar);
+    seeded = static_cast<bool>(::opcua::services::addVariable(
+        native, ::opcua::ObjectId::ObjectsFolder, foreign_id, "Foreign",
+        attributes, ::opcua::VariableTypeId::BaseDataVariableType,
+        ::opcua::ReferenceTypeId::Organizes));
+  }));
+  BOOST_REQUIRE(seeded);
+
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(published, &error), error);
+  const std::uint64_t published_revision = model.revision();
+
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(
+      failing, {"ports/ThrowingInput"}, &error, &diagnostics));
+  BOOST_TEST(error.find("intentional antiClone failure") != std::string::npos);
+  BOOST_TEST(model.lastError() == error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.publicationDiagnostics(failing.getName()).empty());
+  BOOST_TEST(model.componentCount() == 1U);
+  BOOST_TEST(model.revision() == published_revision);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto published_value_id =
+      modelNodeId(namespace_index, {"components", published.getName(),
+                                    "properties", "Value"});
+  BOOST_TEST(::opcua::services::readValue(client, published_value_id)
+                 .value()
+                 .to<std::int32_t>() == published_value);
+  BOOST_TEST(::opcua::services::readValue(client, foreign_id)
+                 .value()
+                 .to<std::int32_t>() == 99);
+  requireMissingNode(
+      client,
+      modelNodeId(namespace_index, {"components", failing.getName()}));
+  requireMissingNode(
+      client, modelNodeId(namespace_index,
+                          {"components", failing.getName(), "ports"}));
+  requireMissingNode(
+      client, modelNodeId(namespace_index,
+                          {"components", failing.getName(), "ports",
+                           "ThrowingInput"}));
 
   client.disconnect();
   server.stop();

@@ -469,6 +469,7 @@ bool recordMethodArgumentNodes(::opcua::Server &native,
 
 struct ComponentSnapshot {
   NodeMap nodes;
+  std::set<std::string, std::less<>> effective_resources;
   std::vector<UnsupportedResource> unsupported;
   std::vector<PublicationDiagnostic> diagnostics;
   std::string component;
@@ -1517,6 +1518,7 @@ ComponentSnapshot snapshotComponent(
       buildPublicationPlan(mode, inventory, state->component_name, selectors);
   ComponentSnapshot snapshot;
   snapshot.component = state->component_name;
+  snapshot.effective_resources = plan.effective_resources;
   snapshot.diagnostics = plan.diagnostics;
 
   const std::string components_path = appendNodeSegment("rtt", "components");
@@ -1705,9 +1707,13 @@ bool rollbackCreatedNodes(::opcua::Server &native,
 
 struct PublishedComponent {
   PublishedComponent(RTT::TaskContext &original,
+                     PublicationMode publication_mode,
+                     std::set<std::string, std::less<>> resources,
                      std::shared_ptr<ComponentState> callback_state,
                      NodeMap snapshot_nodes, std::string fingerprint)
-      : component(&original), state(std::move(callback_state)),
+      : component(&original), mode(publication_mode),
+        effective_resources(std::move(resources)),
+        state(std::move(callback_state)),
         nodes(std::move(snapshot_nodes)),
         snapshot_fingerprint(std::move(fingerprint)) {}
 
@@ -1717,6 +1723,8 @@ struct PublishedComponent {
   PublishedComponent &operator=(const PublishedComponent &) = delete;
 
   RTT::TaskContext *const component;
+  PublicationMode mode;
+  std::set<std::string, std::less<>> effective_resources;
   std::shared_ptr<ComponentState> state;
   NodeMap nodes;
   std::string snapshot_fingerprint;
@@ -1775,28 +1783,57 @@ private:
     const std::string component_name = component.getName();
     const auto existing = components.find(component_name);
     if (existing != components.end()) {
-      if (existing->second.component == &component) {
+      if (existing->second.component != &component) {
+        return rejectPublicationConflict(
+            component_name,
+            "already published by a different RTT component instance", error,
+            diagnostic_output, lock);
+      }
+      if (existing->second.mode != mode) {
+        return rejectPublicationConflict(
+            component_name,
+            "publication mode differs from the first successful publication",
+            error, diagnostic_output, lock);
+      }
+      if (mode == PublicationMode::full) {
         failed_publications.erase(component_name);
         publication_diagnostics.erase(component_name);
         setSuccess(error);
         return true;
       }
-      const std::string reason =
-          "already published by a different RTT component instance";
-      std::vector<PublicationDiagnostic> diagnostics{
-          PublicationDiagnostic{PublicationDiagnosticKind::publication_conflict,
-                                component_name, {}, {}, reason}};
-      publication_diagnostics.insert_or_assign(component_name, diagnostics);
-      if (diagnostic_output != nullptr) {
-        *diagnostic_output = diagnostics;
+
+      const ComponentInventory inventory = discoverComponent(component);
+      const PublicationPlan plan = buildPublicationPlan(
+          mode, inventory, component_name, selectors);
+      if (existing->second.effective_resources != plan.effective_resources) {
+        return rejectPublicationConflict(
+            component_name,
+            "selection resolves to a different effective resource set",
+            error, diagnostic_output, lock);
       }
-      const std::string failure =
-          "RTT component name '" + component_name + "' is " + reason;
-      last_error = failure;
-      assignError(error, failure);
-      lock.unlock();
-      emitDiagnostics(diagnostics);
-      return false;
+      if (!plan.diagnostics.empty()) {
+        failed_publications.erase(component_name);
+        publication_diagnostics.insert_or_assign(component_name,
+                                                 plan.diagnostics);
+        if (diagnostic_output != nullptr) {
+          *diagnostic_output = plan.diagnostics;
+        }
+        const std::string failure =
+            "selective OPC UA publication rejected component '" +
+            component_name + "' with " +
+            std::to_string(plan.diagnostics.size()) + " diagnostic(s)";
+        last_error = failure;
+        assignError(error, failure);
+        const auto diagnostics = plan.diagnostics;
+        lock.unlock();
+        emitDiagnostics(diagnostics);
+        return false;
+      }
+
+      failed_publications.erase(component_name);
+      publication_diagnostics.erase(component_name);
+      setSuccess(error);
+      return true;
     }
 
     if (shutdown_started.load()) {
@@ -1845,8 +1882,9 @@ private:
       return false;
     }
 
-    PublishedComponent candidate(component, state, std::move(snapshot.nodes),
-                                 std::move(snapshot.fingerprint));
+    PublishedComponent candidate(
+        component, mode, std::move(snapshot.effective_resources), state,
+        std::move(snapshot.nodes), std::move(snapshot.fingerprint));
     std::vector<CreatedNode> ledger;
     std::string transaction_error;
     std::string server_error;
@@ -1982,6 +2020,28 @@ public:
   }
 
 private:
+  bool rejectPublicationConflict(
+      const std::string &component_name, std::string reason,
+      std::string *error,
+      std::vector<PublicationDiagnostic> *diagnostic_output,
+      std::unique_lock<std::mutex> &lock) {
+    std::vector<PublicationDiagnostic> diagnostics{
+        PublicationDiagnostic{PublicationDiagnosticKind::publication_conflict,
+                              component_name, {}, {}, std::move(reason)}};
+    publication_diagnostics.insert_or_assign(component_name, diagnostics);
+    if (diagnostic_output != nullptr) {
+      *diagnostic_output = diagnostics;
+    }
+    const std::string failure = "RTT component publication conflict for '" +
+                                component_name + "': " +
+                                diagnostics.front().reason;
+    last_error = failure;
+    assignError(error, failure);
+    lock.unlock();
+    emitDiagnostics(diagnostics);
+    return false;
+  }
+
   bool setFailure(std::string failure, std::string *error) {
     last_error = failure;
     assignError(error, std::move(failure));
