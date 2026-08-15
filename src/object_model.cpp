@@ -932,13 +932,13 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
   spec.expects_output_arguments = !schema.outputs.empty();
   spec.expected_input_arguments = schema.inputs;
   spec.expected_output_arguments = schema.outputs;
+  const auto expected_operation = operation.getLocalOperation();
   spec.create = [path = spec.path, parent = spec.parent_path, name, description,
-                 service, operation = &operation,
+                 service, expected_operation,
                  weak_state = std::weak_ptr<ComponentState>(state), dispatcher,
-                 schema = std::move(schema)](::opcua::Server &server,
-                                             std::uint16_t namespace_index,
-                                             bool *created,
-                                             std::string *error) {
+                 schema = std::move(schema)](
+                    ::opcua::Server &server, std::uint16_t namespace_index,
+                    bool *created, std::string *error) {
     ::opcua::MethodAttributes attributes;
     attributes.setDisplayName(::opcua::LocalizedText("en-US", name));
     if (!description.empty()) {
@@ -952,17 +952,19 @@ NodeSpec operationSpec(const std::string &parent_path, const std::string &name,
             ::opcua::Session &, ::opcua::Span<const ::opcua::Variant>,
             ::opcua::Span<::opcua::Variant>, const ::opcua::NodeId &,
             const ::opcua::NodeId &)>(
-            [service, operation, weak_state,
+            [service, name, expected_operation, weak_state,
              dispatcher](::opcua::Session &,
                          ::opcua::Span<const ::opcua::Variant> inputs,
                          ::opcua::Span<::opcua::Variant> outputs,
                          const ::opcua::NodeId &, const ::opcua::NodeId &) {
-              static_cast<void>(service);
               const auto current_state = weak_state.lock();
-              if (!current_state || operation == nullptr) {
+              RTT::OperationInterfacePart *current =
+                  service ? service->getOperation(name) : nullptr;
+              if (!current_state || !expected_operation || current == nullptr ||
+                  current->getLocalOperation() != expected_operation) {
                 return ::opcua::StatusCode(UA_STATUSCODE_BADNOTCONNECTED);
               }
-              return dispatcher->invoke(current_state, *operation, inputs,
+              return dispatcher->invoke(current_state, *current, inputs,
                                         outputs);
             });
 
@@ -1296,16 +1298,17 @@ void appendOperationBundle(
   }
   OperationSchema schema = dispatcher->describe(*operation);
   if (!schema.supported) {
+    std::vector<UnsupportedResource> unsupported;
+    appendUnsupported(unsupported, state->component_name, record.legacy_path,
+                      "operation", std::move(schema.unsupported_type_name),
+                      std::move(schema.unsupported_reason));
     if (!mandatory_type.empty()) {
+      snapshot.unsupported.push_back(std::move(unsupported.front()));
       appendMandatorySchemaFailure(
           snapshot, record,
           "mandatory RTT proxy operation has an unsupported schema");
       return;
     }
-    std::vector<UnsupportedResource> unsupported;
-    appendUnsupported(unsupported, state->component_name, record.legacy_path,
-                      "operation", std::move(schema.unsupported_type_name),
-                      std::move(schema.unsupported_reason));
     appendMappingFailure(snapshot, record, std::move(unsupported.front()));
     return;
   }

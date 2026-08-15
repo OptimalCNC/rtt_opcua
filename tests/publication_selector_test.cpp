@@ -135,6 +135,21 @@ BOOST_AUTO_TEST_CASE(canonical_escapes_match_literal_separators_and_wildcards) {
   BOOST_TEST(result.issues.empty());
 }
 
+BOOST_AUTO_TEST_CASE(escaped_literal_star_is_distinct_from_single_wildcard) {
+  const std::vector<std::string> inventory{"operations/%2A", "operations/echo"};
+
+  const auto literal = matchPublicationSelectors({"operations/%2A"}, inventory);
+  const auto wildcard = matchPublicationSelectors({"operations/*"}, inventory);
+
+  BOOST_TEST(literal.resource_paths == paths({"operations/%2A"}),
+             boost::test_tools::per_element());
+  BOOST_TEST(literal.issues.empty());
+  BOOST_TEST(wildcard.resource_paths ==
+                 paths({"operations/%2A", "operations/echo"}),
+             boost::test_tools::per_element());
+  BOOST_TEST(wildcard.issues.empty());
+}
+
 BOOST_AUTO_TEST_CASE(noncanonical_or_invalid_wildcard_selectors_are_malformed) {
   const auto result = matchPublicationSelectors(
       {"services/auto%2fmanual/operations/run%2Anow", "operations/run*now",

@@ -427,6 +427,27 @@ public:
         .arg("value", "Unexpected mandatory input.");
   }
 
+  void makeIsConfiguredUnsupported() {
+    provides()->removeOperation("isConfigured");
+    provides()->addOperation(
+        "isConfigured", &SelectableResourceComponent::unsupportedIsConfigured,
+        this, RTT::ClientThread);
+  }
+
+  void addLiteralStarOperation() {
+    addOperation("*", &SelectableResourceComponent::echo, this,
+                 RTT::ClientThread)
+        .arg("value", "Value to echo.");
+  }
+
+  void removeEchoOperation() { provides()->removeOperation("echo"); }
+
+  void addReplacementEchoOperation() {
+    addOperation("echo", &SelectableResourceComponent::replacementEcho, this,
+                 RTT::ClientThread)
+        .arg("value", "Replacement value to echo.");
+  }
+
   void addLateOperation() {
     addOperation("late", &SelectableResourceComponent::echo, this,
                  RTT::ClientThread)
@@ -436,6 +457,12 @@ public:
   std::int32_t echo(std::int32_t value) const { return value; }
   std::int32_t adjust(std::int32_t value) const { return value + nested_gain; }
   bool incompatibleIsConfigured(std::int32_t value) const { return value != 0; }
+  UnsupportedValue unsupportedIsConfigured() const {
+    return UnsupportedValue{1};
+  }
+  std::int32_t replacementEcho(std::int32_t value) const {
+    return value + 1000;
+  }
 
   std::int32_t gain{7};
   std::string status{"idle"};
@@ -1703,6 +1730,43 @@ BOOST_FIXTURE_TEST_CASE(missing_mandatory_operation_rejects_the_whole_component,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(
+    unsupported_mandatory_operation_preserves_full_legacy_diagnostic,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SelectableResourceComponent component("full-unsupported-mandatory");
+  component.makeIsConfiguredUnsupported();
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::UnsupportedResource> unsupported;
+  BOOST_TEST(!model.publishComponent(component, &error, &unsupported));
+
+  const std::vector<RTT::opcua::UnsupportedResource> expected_unsupported{
+      {component.getName(), "isConfigured", "operation",
+       std::string(kUnsupportedTypeName), std::string(kMissingProtocolReason)}};
+  BOOST_TEST(unsupported == expected_unsupported,
+             boost::test_tools::per_element());
+  BOOST_TEST(model.unsupportedResources(component.getName()) ==
+                 expected_unsupported,
+             boost::test_tools::per_element());
+  const std::vector<RTT::opcua::PublicationDiagnostic> expected_diagnostics{
+      {RTT::opcua::PublicationDiagnosticKind::mandatory_resource,
+       component.getName(),
+       {},
+       "operations/isConfigured",
+       "mandatory RTT proxy operation has an unsupported schema"}};
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) ==
+                 expected_diagnostics,
+             boost::test_tools::per_element());
+
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(publish_component_is_idempotent_for_the_same_instance,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -2433,6 +2497,39 @@ BOOST_FIXTURE_TEST_CASE(
 }
 
 BOOST_FIXTURE_TEST_CASE(
+    escaped_literal_star_selector_does_not_publish_sibling_operations,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  SelectableResourceComponent component("literal-star-selection");
+  component.addLiteralStarOperation();
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(component, {"operations/%2A"}, &error),
+      error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "operations", "*"}))));
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "operations", "isConfigured"}))));
+  requireMissingNode(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "operations", "echo"}));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
     terminal_recursive_selector_maps_service_descendants_and_ancestors,
     CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -2760,6 +2857,7 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(diagnostics[0].kind ==
              RTT::opcua::PublicationDiagnosticKind::mandatory_resource);
   BOOST_TEST(diagnostics[0].resource_path == "operations/getTaskState");
+  BOOST_TEST(model.unsupportedResources(missing.getName()).empty());
 
   SelectableResourceComponent incompatible("selected-wrong-mandatory");
   incompatible.makeIsConfiguredIncompatible();
@@ -2771,6 +2869,44 @@ BOOST_FIXTURE_TEST_CASE(
   BOOST_TEST(diagnostics[0].resource_path == "operations/isConfigured");
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    unsupported_mandatory_operation_preserves_selected_legacy_diagnostic,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SelectableResourceComponent component("selected-unsupported-mandatory");
+  component.makeIsConfiguredUnsupported();
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(component, {"properties/Gain"},
+                                             &error, &diagnostics));
+
+  const std::vector<RTT::opcua::UnsupportedResource> expected_unsupported{
+      {component.getName(), "isConfigured", "operation",
+       std::string(kUnsupportedTypeName), std::string(kMissingProtocolReason)}};
+  BOOST_TEST(model.unsupportedResources(component.getName()) ==
+                 expected_unsupported,
+             boost::test_tools::per_element());
+  const std::vector<RTT::opcua::PublicationDiagnostic> expected_diagnostics{
+      {RTT::opcua::PublicationDiagnosticKind::mandatory_resource,
+       component.getName(),
+       {},
+       "operations/isConfigured",
+       "mandatory RTT proxy operation has an unsupported schema"}};
+  BOOST_TEST(diagnostics == expected_diagnostics,
+             boost::test_tools::per_element());
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) ==
+                 expected_diagnostics,
+             boost::test_tools::per_element());
 
   server.stop();
 }
@@ -3257,6 +3393,46 @@ BOOST_FIXTURE_TEST_CASE(operations_dispatch_on_rtt_engines,
       ::opcua::Variant(std::int32_t{2})};
   BOOST_TEST(::opcua::services::call(client, operations_id, add_id, wrong_inputs)
                  .statusCode() == UA_STATUSCODE_BADINVALIDARGUMENT);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(published_method_rejects_removed_and_replaced_operation,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  SelectableResourceComponent component("stale-operation");
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(component, {"operations/echo"}, &error),
+      error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto operations_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "operations"});
+  const auto echo_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "operations", "echo"});
+  const std::vector<::opcua::Variant> inputs{
+      ::opcua::Variant(std::int32_t{23})};
+  BOOST_REQUIRE(::opcua::services::call(client, operations_id, echo_id, inputs)
+                    .statusCode()
+                    .isGood());
+
+  component.removeEchoOperation();
+  BOOST_TEST(::opcua::services::call(client, operations_id, echo_id, inputs)
+                 .statusCode() == UA_STATUSCODE_BADNOTCONNECTED);
+
+  component.addReplacementEchoOperation();
+  BOOST_TEST(::opcua::services::call(client, operations_id, echo_id, inputs)
+                 .statusCode() == UA_STATUSCODE_BADNOTCONNECTED);
 
   client.disconnect();
   server.stop();

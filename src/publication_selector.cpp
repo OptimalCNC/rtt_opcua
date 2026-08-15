@@ -11,9 +11,15 @@
 namespace RTT::opcua::detail {
 namespace {
 
+enum class SelectorSegmentKind { literal, single_wildcard, recursive_wildcard };
+
+struct SelectorSegment {
+  SelectorSegmentKind kind;
+  std::string literal;
+};
+
 struct ParsedSelector {
-  std::vector<std::string> segments;
-  bool recursive {false};
+  std::vector<SelectorSegment> segments;
 };
 
 struct ParsedResource {
@@ -90,12 +96,11 @@ std::optional<ParsedSelector> parseSelector(std::string_view selector,
         *reason = "recursive wildcard must be terminal";
         return std::nullopt;
       }
-      parsed.segments.emplace_back(segment);
-      parsed.recursive = true;
+      parsed.segments.push_back({SelectorSegmentKind::recursive_wildcard, {}});
       continue;
     }
     if (segment == "*") {
-      parsed.segments.emplace_back(segment);
+      parsed.segments.push_back({SelectorSegmentKind::single_wildcard, {}});
       continue;
     }
     if (segment.find('*') != std::string_view::npos) {
@@ -107,7 +112,7 @@ std::optional<ParsedSelector> parseSelector(std::string_view selector,
       *reason = "literal segment is not canonically escaped";
       return std::nullopt;
     }
-    parsed.segments.push_back(*decoded);
+    parsed.segments.push_back({SelectorSegmentKind::literal, *decoded});
   }
   return parsed;
 }
@@ -135,16 +140,21 @@ std::optional<ParsedResource> parseResource(std::string_view path) {
 
 bool matches(const ParsedSelector& selector,
              const std::vector<std::string>& resource) {
-  const std::size_t fixed = selector.recursive
-                                ? selector.segments.size() - 1U
-                                : selector.segments.size();
-  if ((!selector.recursive && resource.size() != fixed) ||
-      (selector.recursive && resource.size() < fixed)) {
+  const bool recursive =
+      selector.segments.back().kind == SelectorSegmentKind::recursive_wildcard;
+  const std::size_t fixed =
+      recursive ? selector.segments.size() - 1U : selector.segments.size();
+  if ((!recursive && resource.size() != fixed) ||
+      (recursive && resource.size() < fixed)) {
     return false;
   }
   for (std::size_t index = 0U; index < fixed; ++index) {
-    if (selector.segments[index] != "*" &&
-        selector.segments[index] != resource[index]) {
+    const SelectorSegment &segment = selector.segments[index];
+    if (segment.kind == SelectorSegmentKind::single_wildcard) {
+      continue;
+    }
+    if (segment.kind != SelectorSegmentKind::literal ||
+        segment.literal != resource[index]) {
       return false;
     }
   }
