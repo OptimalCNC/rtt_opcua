@@ -591,6 +591,103 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_each_native_lifecycle_operation,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(
+    proxy_reconstructs_a_selected_interface_with_the_mandatory_baseline,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  const std::vector<std::string> selectors{
+      "operations/add",
+      "properties/Gain",
+      "ports/Command",
+      "services/math/operations/scale",
+      "services/math/properties/Offset",
+  };
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(target, selectors, &error), error);
+
+  RTT::opcua::TaskContextProxyOptions options;
+  options.request_timeout = std::chrono::milliseconds(500);
+  auto proxy = RTT::opcua::TaskContextProxy::create(
+      server.endpointUrl(), target.getName(), options, &error);
+  BOOST_REQUIRE_MESSAGE(proxy != nullptr, error);
+  BOOST_TEST(proxy->ready());
+  BOOST_TEST(proxy->getTaskState() == RTT::TaskContext::PreOperational);
+  BOOST_TEST(proxy->getTargetState() == RTT::TaskContext::PreOperational);
+  BOOST_TEST(!proxy->isConfigured());
+  BOOST_TEST(proxy->isActive());
+  BOOST_TEST(!proxy->isRunning());
+  BOOST_TEST(!proxy->inFatalError());
+  BOOST_TEST(!proxy->inException());
+  BOOST_TEST(!proxy->inRunTimeError());
+
+  RTT::OperationInterfacePart *add = proxy->provides()->getOperation("add");
+  BOOST_REQUIRE(add != nullptr);
+  std::int32_t sum = 0;
+  RTT::internal::OperationCallerC add_caller(
+      add, "add", RTT::internal::GlobalEngine::Instance());
+  add_caller.argC(std::int32_t{4}).argC(std::int32_t{5}).ret(sum);
+  add_caller.check();
+  BOOST_REQUIRE(add_caller.call());
+  BOOST_TEST(sum == 9);
+
+  auto *gain = dynamic_cast<RTT::Property<std::int32_t> *>(
+      proxy->provides()->getProperty("Gain"));
+  BOOST_REQUIRE(gain != nullptr);
+  BOOST_TEST(gain->get() == 7);
+  gain->set(11);
+  BOOST_TEST(target.gain == 11);
+
+  auto *command = dynamic_cast<RTT::base::InputPortInterface *>(
+      proxy->ports()->getPort("Command"));
+  BOOST_REQUIRE(command != nullptr);
+  RTT::OutputPort<std::int32_t> command_source("SelectedCommandSource");
+  BOOST_REQUIRE(command_source.createConnection(
+      *command, RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
+  BOOST_TEST(command_source.write(std::int32_t{23}) == RTT::WriteSuccess);
+  std::int32_t command_value = 0;
+  BOOST_REQUIRE(waitUntil(
+      [&] { return target.command.read(command_value) == RTT::NewData; }));
+  BOOST_TEST(command_value == 23);
+
+  RTT::Service::shared_ptr math = proxy->provides()->getService("math");
+  BOOST_REQUIRE(math);
+  RTT::OperationInterfacePart *scale = math->getOperation("scale");
+  BOOST_REQUIRE(scale != nullptr);
+  std::int32_t scaled = 0;
+  RTT::internal::OperationCallerC scale_caller(
+      scale, "scale", RTT::internal::GlobalEngine::Instance());
+  scale_caller.argC(std::int32_t{4}).argC(std::int32_t{5}).ret(scaled);
+  scale_caller.check();
+  BOOST_REQUIRE(scale_caller.call());
+  BOOST_TEST(scaled == 22);
+  auto *offset =
+      dynamic_cast<RTT::Property<std::int32_t> *>(math->getProperty("Offset"));
+  BOOST_REQUIRE(offset != nullptr);
+  BOOST_TEST(offset->get() == 2);
+
+  BOOST_TEST(proxy->provides()->getOperation("increment") == nullptr);
+  BOOST_TEST(proxy->provides()->getAttribute("Status") == nullptr);
+  BOOST_TEST(proxy->provides()->getAttribute("ModelName") == nullptr);
+  BOOST_TEST(proxy->ports()->getPort("Feedback") == nullptr);
+  BOOST_TEST(proxy->provides()->getService("Feedback") == nullptr);
+  BOOST_TEST(math->getService("advanced") == nullptr);
+  BOOST_TEST(math->getAttribute("Mode") == nullptr);
+  BOOST_TEST(math->getAttribute("Unit") == nullptr);
+  BOOST_TEST(math->getPort("MathFeedback") == nullptr);
+  BOOST_TEST(math->getService("MathFeedback") == nullptr);
+
+  command_source.disconnect();
+  proxy.reset();
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(proxy_requires_both_native_state_getters,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;

@@ -13,13 +13,13 @@ provided by OCL.
 - C++20
 - open62541pp 0.21.2 or newer within the 0.21 API series
 - server binding restricted to `127.0.0.1` or `::1`
-- complete publication of each selected component's supported RTT interface
-- no publication allowlist, PKI configuration, or user-level access control
+- static full or selected publication of RTT component interfaces
+- no PKI configuration or user-level access control
 
 Non-loopback binding and PKI are intentionally deferred until their security
 contract is designed and tested.
 
-## Static Publication API
+## Static Publication APIs
 
 Application typekits and their OPC UA transport plugins must register every
 required datatype provider and codec before the endpoint starts. The generic
@@ -43,21 +43,121 @@ if (!server.start(&error)) {
     if (!model.publishComponent(component, &error, &unsupported)) {
         throw std::runtime_error(error); // Nothing was partially published.
     }
-
-    server.stop();
 } // Destroy the ObjectModel before releasing published components.
+
+server.stop();
+```
+
+`ObjectModel` has two publication APIs:
+
+```cpp
+bool publishComponent(
+    RTT::TaskContext& component, std::string* error = nullptr,
+    std::vector<RTT::opcua::UnsupportedResource>* unsupported = nullptr);
+
+bool publishComponentSelected(
+    RTT::TaskContext& component, const std::vector<std::string>& selectors,
+    std::string* error = nullptr,
+    std::vector<RTT::opcua::PublicationDiagnostic>* diagnostics = nullptr);
 ```
 
 `publishComponent` validates the complete component interface before commit.
-It is strict, static, and idempotent for the same component instance. An
-unsupported operation, property, attribute, constant, or port rejects the
-whole component and leaves diagnostics available through
-`unsupportedResources`.
+It is strict and static. An unsupported operation, property, attribute,
+constant, or port rejects the whole component and leaves compatibility
+diagnostics in `UnsupportedResource` through both the output argument and
+`unsupportedResources(component_name)`.
 
-Resources added to an RTT component after publication are not added to the
-address space. This version has no public unpublish or component-replacement
-API. Destroying `ObjectModel` is endpoint teardown; it drains retained timed-out
-operation calls before its published RTT components may be destroyed.
+`publishComponentSelected` requires at least one selector and validates only
+the selected resources, their required service ancestors, and the mandatory
+proxy baseline below. Unsupported resources outside that effective set do not
+reject selected publication. Selector, inventory, selected-resource, mandatory
+baseline, and replay conflicts are reported as structured
+`PublicationDiagnostic` values through the output argument and
+`publicationDiagnostics(component_name)`. Existing callers that inspect
+`unsupportedResources` retain the underlying unsupported-resource records;
+new selective callers should use the structured diagnostics to distinguish
+selector and topology errors.
+
+### Selector syntax
+
+Selectors are glob paths over logical RTT resources, not regular expressions.
+The root resource forms are:
+
+```text
+operations/<operation>
+properties/<property>
+attributes/<attribute>
+ports/<port>
+services/<service>/<root resource form>
+services/<service>/services/<nested service>/...
+```
+
+For example, these selectors publish one root operation, one root property,
+one root port, and two resources in the `math` service:
+
+```cpp
+const std::vector<std::string> selectors{
+    "operations/add",
+    "properties/Gain",
+    "ports/Command",
+    "services/math/operations/scale",
+    "services/math/properties/Offset",
+};
+model.publishComponentSelected(component, selectors, &error);
+```
+
+`*` is a whole-segment wildcard matching exactly one segment. `**` is a
+whole-segment recursive wildcard and must be the final segment; for example,
+`services/math/**` selects resources below `math`. Partial wildcards such as
+`motor*`, regex syntax, empty segments, and a non-terminal `**` are invalid.
+
+Literal selector segments use the same canonical percent escaping as OPC UA
+NodeId path segments. Unreserved ASCII characters (`A-Z`, `a-z`, `0-9`, `-`,
+`.`, `_`, `~`) are literal; every other byte is `%HH` with uppercase hex. Thus
+a service named `motion/raw*` is selected as
+`services/motion%2Fraw%2A/**`, not with a glob. Use
+`RTT::opcua::escapeNodeIdSegment` to construct literal name segments rather
+than hand-escaping them.
+
+### Mandatory proxy baseline
+
+Selected publication always includes these eight root lifecycle-query
+operations, even when no selector matches them:
+
+```text
+getTaskState
+getTargetState
+isConfigured
+isActive
+isRunning
+inFatalError
+inException
+inRunTimeError
+```
+
+They must exist with their proxy-compatible schemas or selected publication is
+rejected. Mutating lifecycle operations such as `configure`, `start`, `stop`,
+and `cleanup` are not part of this baseline. A `TaskContextProxy` can therefore
+reconstruct and report lifecycle state from a deliberately sparse publication
+without remote lifecycle control being exposed.
+
+### Static identity and topology
+
+The first successful publication fixes both the publication mode and effective
+resource set for that component instance. Repeating full publication is
+idempotent. Repeating selected publication may use different selector text,
+but it is accepted only when it resolves to the same effective resource set;
+switching between full and selected modes, changing the effective set, or
+publishing a different component instance with the same name is rejected.
+
+Resources added after publication are not added to the address space. There is
+no public unpublish or component-replacement API. Changing publication
+topology therefore requires endpoint teardown and restart with a new
+`ObjectModel`; clients must reconstruct or synchronize their proxies against
+the restarted endpoint.
+
+Destroying `ObjectModel` drains retained timed-out operation calls before its
+published RTT components may be destroyed.
 
 OCL owns the operator-facing lifecycle. A typical deployment script is:
 
@@ -65,12 +165,13 @@ OCL owns the operator-facing lifecycle. A typical deployment script is:
 import("sample_typekit")
 loadComponent("sample", "SampleComponent")
 opcua.start()
-opcua.publishComponent("sample")
+var StringArray deployer_selectors = StringArray("services/opcua/**")
+opcua.publishComponentSelected("Deployer", deployer_selectors)
 ```
 
-The first `opcua.start()` freezes the registry and publishes the complete
-Deployer interface. Other local components require an explicit
-`publishComponent` call; `Server=true` is not an OPC UA publication rule.
+`opcua.start()` starts the endpoint and freezes the registry; it does not
+publish the Deployer or any local component. Publication is always explicit.
+`Server=true` is not an OPC UA publication rule.
 
 ## Information Model
 
