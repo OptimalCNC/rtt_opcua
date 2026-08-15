@@ -27,6 +27,7 @@ orocos_library(
   src/object_model.cpp
   src/operation_dispatcher.cpp
   src/port_bridge.cpp
+  src/publication_selector.cpp
   src/remote_operation.cpp
   src/remote_port.cpp
   src/server.cpp
@@ -135,6 +136,36 @@ if(BUILD_TESTING)
     endif()
   endif()
   add_test(NAME rtt_opcua_foundation_test COMMAND rtt_opcua_foundation_test)
+
+  add_executable(
+    rtt_opcua_publication_selector_test
+    tests/publication_selector_test.cpp
+  )
+  target_link_libraries(
+    rtt_opcua_publication_selector_test
+    PRIVATE orocos-rtt-opcua
+  )
+  target_include_directories(
+    rtt_opcua_publication_selector_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_compile_features(rtt_opcua_publication_selector_test PRIVATE cxx_std_20)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+      rtt_opcua_publication_selector_test PRIVATE -Wall -Wextra -Wpedantic
+    )
+    if(RTT_OPCUA_WARNINGS_AS_ERRORS)
+      target_compile_options(rtt_opcua_publication_selector_test PRIVATE -Werror)
+    endif()
+  endif()
+  add_test(
+    NAME rtt_opcua_publication_selector_test
+    COMMAND rtt_opcua_publication_selector_test
+  )
+  set_tests_properties(
+    rtt_opcua_publication_selector_test
+    PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_CURRENT_BINARY_DIR}:$ENV{LD_LIBRARY_PATH}"
+  )
 
   add_executable(rtt_opcua_server_test tests/server_test.cpp)
   target_link_libraries(rtt_opcua_server_test PRIVATE orocos-rtt-opcua)
