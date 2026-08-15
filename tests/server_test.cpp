@@ -152,9 +152,9 @@ std::uint16_t unusedLoopbackPort() {
 
 BOOST_GLOBAL_FIXTURE(ServerDatatypeFixture);
 
-BOOST_AUTO_TEST_CASE(non_loopback_server_options_are_rejected_as_unsupported) {
+BOOST_AUTO_TEST_CASE(unsupported_server_bind_addresses_are_rejected) {
   for (const std::string &bind_address :
-       {std::string("0.0.0.0"), std::string("192.0.2.1"), std::string("::")}) {
+       {std::string("192.0.2.1"), std::string("::")}) {
     RTT::opcua::ServerOptions options;
     options.bind_address = bind_address;
 
@@ -165,9 +165,22 @@ BOOST_AUTO_TEST_CASE(non_loopback_server_options_are_rejected_as_unsupported) {
   }
 }
 
-BOOST_AUTO_TEST_CASE(invalid_server_options_fail_without_starting_a_thread) {
+BOOST_AUTO_TEST_CASE(ipv4_wildcard_server_starts_when_explicitly_requested) {
   RTT::opcua::ServerOptions options;
   options.bind_address = "0.0.0.0";
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  BOOST_TEST(server.endpointUrl() ==
+             "opc.tcp://0.0.0.0:" + std::to_string(options.port) + "/rtt");
+  server.stop();
+}
+
+BOOST_AUTO_TEST_CASE(invalid_server_options_fail_without_starting_a_thread) {
+  RTT::opcua::ServerOptions options;
+  options.bind_address = "192.0.2.1";
   RTT::opcua::Server server(options);
 
   std::string error;

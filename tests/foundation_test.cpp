@@ -49,13 +49,21 @@ BOOST_AUTO_TEST_CASE(server_defaults_are_loopback_only) {
   BOOST_TEST(RTT::opcua::endpointUrl(defaults) == "opc.tcp://127.0.0.1:4840/rtt");
 }
 
-BOOST_AUTO_TEST_CASE(server_rejects_unsafe_or_malformed_bindings) {
+BOOST_AUTO_TEST_CASE(server_accepts_explicit_ipv4_wildcard_binding) {
   RTT::opcua::ServerOptions options;
 
   options.bind_address = "0.0.0.0";
-  BOOST_TEST(RTT::opcua::validateServerOptions(options).has_value());
+  BOOST_TEST(!RTT::opcua::validateServerOptions(options).has_value());
+  BOOST_TEST(RTT::opcua::endpointUrl(options) == "opc.tcp://0.0.0.0:4840/rtt");
+}
+
+BOOST_AUTO_TEST_CASE(server_rejects_unsupported_or_malformed_bindings) {
+  RTT::opcua::ServerOptions options;
 
   options.bind_address = "192.0.2.10";
+  BOOST_TEST(RTT::opcua::validateServerOptions(options).has_value());
+
+  options.bind_address = "::";
   BOOST_TEST(RTT::opcua::validateServerOptions(options).has_value());
 
   options.bind_address = "::1";

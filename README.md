@@ -12,12 +12,16 @@ provided by OCL.
 
 - C++20
 - open62541pp 0.21.2 or newer within the 0.21 API series
-- server binding restricted to `127.0.0.1` or `::1`
+- server binding restricted to `127.0.0.1`, `::1`, or the explicit IPv4
+  wildcard `0.0.0.0`
 - static full or selected publication of RTT component interfaces
 - no PKI configuration or user-level access control
 
-Non-loopback binding and PKI are intentionally deferred until their security
-contract is designed and tested.
+The generic server default remains `127.0.0.1`. Setting `bind_address` to
+`0.0.0.0` exposes the endpoint on every IPv4 interface with SecurityPolicy
+None, anonymous access, and no authentication or authorization. Use wildcard
+binding only on a trusted, isolated network. Concrete non-loopback addresses,
+the IPv6 wildcard, and PKI configuration remain unsupported.
 
 ## Static Publication APIs
 

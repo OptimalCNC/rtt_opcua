@@ -25,7 +25,8 @@ std::optional<std::string> validateServerOptions(const ServerOptions &options) {
   if (options.application_name.empty()) {
     return "application name must not be empty";
   }
-  if (!isLoopbackAddress(options.bind_address)) {
+  if (!isLoopbackAddress(options.bind_address) &&
+      options.bind_address != "0.0.0.0") {
     return "non-loopback OPC UA listening is not supported";
   }
   std::set<std::string, std::less<>> namespace_uris;
