@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -543,6 +544,44 @@ public:
   std::vector<RTT::Service::shared_ptr> services;
 };
 
+class ReportedProviderService final : public RTT::Service {
+public:
+  ReportedProviderService(std::string name, ProviderNames reported_names)
+      : RTT::Service(std::move(name)),
+        reported_names_(std::move(reported_names)) {}
+
+  ProviderNames getProviderNames() const override { return reported_names_; }
+
+private:
+  ProviderNames reported_names_;
+};
+
+class NullServiceMemberComponent final : public RTT::TaskContext {
+public:
+  NullServiceMemberComponent()
+      : RTT::TaskContext("null-service-member"),
+        malformed(new ReportedProviderService("malformed", {"missing"})) {
+    BOOST_REQUIRE(provides()->addService(malformed));
+  }
+
+  RTT::Service::shared_ptr malformed;
+};
+
+class DuplicateInventoryPathComponent final : public RTT::TaskContext {
+public:
+  DuplicateInventoryPathComponent()
+      : RTT::TaskContext("duplicate-inventory-path"),
+        repeating(new ReportedProviderService("repeating",
+                                              {"repeated", "repeated"})),
+        repeated(RTT::Service::Create("repeated")) {
+    BOOST_REQUIRE(repeating->addService(repeated));
+    BOOST_REQUIRE(provides()->addService(repeating));
+  }
+
+  RTT::Service::shared_ptr repeating;
+  RTT::Service::shared_ptr repeated;
+};
+
 class NonRetainingOutputComponent final : public RTT::TaskContext {
 public:
   NonRetainingOutputComponent()
@@ -686,6 +725,43 @@ public:
 };
 
 } // namespace
+
+BOOST_AUTO_TEST_CASE(publication_diagnostic_messages_are_stable) {
+  using RTT::opcua::PublicationDiagnostic;
+  using RTT::opcua::PublicationDiagnosticKind;
+
+  const std::array<std::pair<PublicationDiagnostic, std::string_view>, 6U>
+      cases{{
+          {{PublicationDiagnosticKind::malformed_selector, "C", "S", {},
+            "malformed reason."},
+           "OPC UA publication: component 'C' rejected selector 'S': "
+           "malformed reason."},
+          {{PublicationDiagnosticKind::unmatched_selector, "C", "S", {},
+            "ignored reason."},
+           "OPC UA publication: component 'C' selector 'S' matched no RTT "
+           "resource."},
+          {{PublicationDiagnosticKind::inventory_failure, "C", {}, {},
+            "inventory reason."},
+           "OPC UA publication: component 'C' inventory failed: inventory "
+           "reason."},
+          {{PublicationDiagnosticKind::unsupported_resource, "C", {}, "P",
+            "unsupported reason."},
+           "OPC UA publication: component 'C' rejected resource 'P': "
+           "unsupported reason."},
+          {{PublicationDiagnosticKind::mandatory_resource, "C", {}, "P",
+            "mandatory reason."},
+           "OPC UA publication: component 'C' requires resource 'P': "
+           "mandatory reason."},
+          {{PublicationDiagnosticKind::publication_conflict, "C", {}, {},
+            "conflict reason."},
+           "OPC UA publication: component 'C' conflicts with its existing "
+           "publication: conflict reason."},
+      }};
+
+  for (const auto &[diagnostic, expected] : cases) {
+    BOOST_TEST(diagnostic.message() == expected);
+  }
+}
 
 BOOST_FIXTURE_TEST_CASE(canonical_array_value_nodes_publish_and_remain_writable,
                         CanonicalTypesFixture) {
@@ -1431,6 +1507,14 @@ BOOST_FIXTURE_TEST_CASE(service_cycles_reject_the_whole_component,
   BOOST_TEST(diagnostics[0].path == "first.second.first");
   BOOST_TEST(diagnostics[0].kind == "service");
   BOOST_TEST(diagnostics[0].reason.find("cycle") != std::string::npos);
+  const std::vector<RTT::opcua::PublicationDiagnostic> expected{
+      {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+       component.getName(), {},
+       "services/first/services/second/services/first",
+       "service uses RTT type 'RTT::Service' which forms a cycle in the RTT "
+       "service graph"}};
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) == expected,
+             boost::test_tools::per_element());
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
 
@@ -1454,6 +1538,78 @@ BOOST_FIXTURE_TEST_CASE(service_depth_overflow_rejects_the_whole_component,
   BOOST_TEST(diagnostics[0].path.ends_with("level32"));
   BOOST_TEST(diagnostics[0].kind == "service");
   BOOST_TEST(diagnostics[0].reason.find("depth") != std::string::npos);
+  std::string canonical_path;
+  for (std::size_t index = 0U; index < 33U; ++index) {
+    if (!canonical_path.empty()) {
+      canonical_path += '/';
+    }
+    canonical_path += "services/level" + std::to_string(index);
+  }
+  const std::vector<RTT::opcua::PublicationDiagnostic> expected{
+      {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+       component.getName(), {}, canonical_path,
+       "service uses RTT type 'RTT::Service' which exceeds the maximum "
+       "supported service depth of 32"}};
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) == expected,
+             boost::test_tools::per_element());
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(null_service_member_has_a_canonical_diagnostic,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  NullServiceMemberComponent component;
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::UnsupportedResource> unsupported;
+  BOOST_TEST(!model.publishComponent(component, &error, &unsupported));
+  const std::vector<RTT::opcua::UnsupportedResource> expected_unsupported{
+      {component.getName(), "malformed.missing", "service", "RTT::Service",
+       "RTT service is unavailable during inventory discovery"}};
+  BOOST_TEST(unsupported == expected_unsupported,
+             boost::test_tools::per_element());
+  const std::vector<RTT::opcua::PublicationDiagnostic> expected_diagnostics{
+      {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+       component.getName(), {}, "services/malformed/services/missing",
+       "service uses RTT type 'RTT::Service' which RTT service is unavailable "
+       "during inventory discovery"}};
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) ==
+                 expected_diagnostics,
+             boost::test_tools::per_element());
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(duplicate_inventory_path_is_an_inventory_failure,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  DuplicateInventoryPathComponent component;
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::UnsupportedResource> unsupported;
+  BOOST_TEST(!model.publishComponent(component, &error, &unsupported));
+  BOOST_TEST(unsupported.empty());
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+  const std::vector<RTT::opcua::PublicationDiagnostic> expected{
+      {RTT::opcua::PublicationDiagnosticKind::inventory_failure,
+       component.getName(), {}, {},
+       "duplicate canonical resource path "
+       "'services/repeating/services/repeated'"}};
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) == expected,
+             boost::test_tools::per_element());
   BOOST_TEST(model.componentCount() == 0U);
   BOOST_TEST(model.revision() == 0U);
 
