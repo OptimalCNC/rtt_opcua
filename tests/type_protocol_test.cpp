@@ -149,6 +149,19 @@ BOOST_AUTO_TEST_CASE(transport_plugin_rejects_noncanonical_names) {
   BOOST_TEST(!plugin.registerTransport("connpolicy", conn_policy));
 }
 
+BOOST_AUTO_TEST_CASE(canonical_registration_reports_the_rejected_type) {
+  std::string error;
+  BOOST_TEST(!RTT::opcua::registerCanonicalTypeProtocol("Int32", nullptr,
+                                                        &error));
+  BOOST_TEST(error.find("'Int32'") != std::string::npos);
+
+  RTT::types::TypeInfo *int32 = RTT::types::Types()->type("Int32");
+  BOOST_REQUIRE(int32 != nullptr);
+  BOOST_TEST(!RTT::opcua::registerCanonicalTypeProtocol("NotCanonical", int32,
+                                                        &error));
+  BOOST_TEST(error.find("'NotCanonical'") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(all_canonical_types_receive_the_opcua_transport) {
   const auto registry = makeRegistry();
 

@@ -831,9 +831,21 @@ bool registerCanonicalTypeProtocol(std::string_view type_name,
   if (type_name == "ConnPolicy") {
     return registerConnPolicyProtocol(type_info, error);
   }
-  if (type_info == nullptr || type_info->getTypeName() != type_name ||
-      descriptorForType(type_name) == nullptr) {
-    return fail(error, "invalid canonical OPC UA type protocol registration");
+  if (descriptorForType(type_name) == nullptr) {
+    return fail(error, "unsupported canonical RTT type '" +
+                           std::string(type_name) +
+                           "' for OPC UA protocol registration");
+  }
+  if (type_info == nullptr) {
+    return fail(error, "missing canonical RTT type '" +
+                           std::string(type_name) +
+                           "' for OPC UA protocol registration");
+  }
+  if (type_info->getTypeName() != type_name) {
+    return fail(error, "canonical RTT type name mismatch for OPC UA protocol "
+                       "registration: requested '" +
+                           std::string(type_name) + "', actual '" +
+                           type_info->getTypeName() + "'");
   }
   std::lock_guard<std::mutex> lock(registrationMutex());
   return registerTypeProtocolUnlocked(type_info,
