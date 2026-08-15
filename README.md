@@ -67,11 +67,16 @@ constant, or port rejects the whole component and leaves compatibility
 diagnostics in `UnsupportedResource` through both the output argument and
 `unsupportedResources(component_name)`.
 
-`publishComponentSelected` requires at least one selector and validates only
-the selected resources, their required service ancestors, and the mandatory
-proxy baseline below. Unsupported resources outside that effective set do not
-reject selected publication. Selector, inventory, selected-resource, mandatory
-baseline, and replay conflicts are reported as structured
+`publishComponentSelected` requires at least one selector. Every individual
+selector must match at least one logical RTT resource; a malformed or unmatched
+selector rejects the complete publication even when another selector matches.
+Publication is atomic: each selected logical resource is mapped as its complete
+OPC UA node bundle, including required metadata and values, and no component is
+committed when validation fails. Validation covers only those selected resource
+bundles, their required service ancestors, and the mandatory proxy baseline
+below. Unsupported resources outside that effective set do not reject selected
+publication. Selector, inventory, selected-resource, mandatory baseline, and
+replay conflicts are reported as structured
 `PublicationDiagnostic` values through the output argument and
 `publicationDiagnostics(component_name)`. Existing callers that inspect
 `unsupportedResources` retain the underlying unsupported-resource records;
@@ -88,6 +93,7 @@ operations/<operation>
 properties/<property>
 attributes/<attribute>
 ports/<port>
+services/<service>
 services/<service>/<root resource form>
 services/<service>/services/<nested service>/...
 ```
@@ -110,6 +116,14 @@ model.publishComponentSelected(component, selectors, &error);
 whole-segment recursive wildcard and must be the final segment; for example,
 `services/math/**` selects resources below `math`. Partial wildcards such as
 `motor*`, regex syntax, empty segments, and a non-terminal `**` are invalid.
+An exact service selector such as `services/math` selects that service object
+only; use `services/math/**` to select its descendants. The equivalent nested
+form is `services/<service>/services/<nested service>`.
+
+Ports and services with the same name are independent logical resources. For
+example, `ports/Command` selects the `Command` port and its port bundle, while
+`services/Command/**` selects a same-named `Command` service and its contents;
+neither selector implies the other.
 
 Literal selector segments use the same canonical percent escaping as OPC UA
 NodeId path segments. Unreserved ASCII characters (`A-Z`, `a-z`, `0-9`, `-`,

@@ -27,6 +27,7 @@
 #include <rtt/types/Types.hpp>
 
 #include <open62541pp/exception.hpp>
+#include <open62541pp/client.hpp>
 #include <open62541pp/services/attribute_highlevel.hpp>
 #include <open62541pp/services/method.hpp>
 #include <open62541pp/services/nodemanagement.hpp>
@@ -611,6 +612,19 @@ BOOST_FIXTURE_TEST_CASE(
   };
   BOOST_REQUIRE_MESSAGE(
       model.publishComponentSelected(target, selectors, &error), error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  for (const std::string_view operation :
+       {"configure", "start", "stop", "cleanup"}) {
+    const auto node = ::opcua::services::readNodeClass(
+        client, modelNodeId(*server.namespaceIndex(),
+                            {"components", target.getName(), "operations",
+                             operation}));
+    BOOST_TEST(!static_cast<bool>(node));
+    BOOST_TEST(node.code().get() == UA_STATUSCODE_BADNODEIDUNKNOWN);
+  }
+  client.disconnect();
 
   RTT::opcua::TaskContextProxyOptions options;
   options.request_timeout = std::chrono::milliseconds(500);
