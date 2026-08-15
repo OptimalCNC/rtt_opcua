@@ -139,16 +139,17 @@ BOOST_AUTO_TEST_CASE(noncanonical_or_invalid_wildcard_selectors_are_malformed) {
   const auto result = matchPublicationSelectors(
       {"services/auto%2fmanual/operations/run%2Anow", "operations/run*now",
        "services//automatic", "/ports/command", "ports/command/",
-       "services/**/operations"},
+       "services/**/operations", "services/auto%2Fmanual/operations/run%2anow"},
       kInventory);
 
-  BOOST_REQUIRE_EQUAL(result.issues.size(), 6U);
+  BOOST_REQUIRE_EQUAL(result.issues.size(), 7U);
   checkMalformed(result.issues[0], "/ports/command");
   checkMalformed(result.issues[1], "operations/run*now");
   checkMalformed(result.issues[2], "ports/command/");
   checkMalformed(result.issues[3], "services/**/operations");
   checkMalformed(result.issues[4], "services//automatic");
-  checkMalformed(result.issues[5], "services/auto%2fmanual/operations/run%2Anow");
+  checkMalformed(result.issues[5], "services/auto%2Fmanual/operations/run%2anow");
+  checkMalformed(result.issues[6], "services/auto%2fmanual/operations/run%2Anow");
   BOOST_TEST(result.resource_paths.empty());
 }
 
