@@ -71,6 +71,10 @@ public:
   bool publishComponent(
       RTT::TaskContext &component, std::string *error = nullptr,
       std::vector<UnsupportedResource> *unsupported = nullptr);
+  bool publishComponentSelected(
+      RTT::TaskContext &component, const std::vector<std::string> &selectors,
+      std::string *error = nullptr,
+      std::vector<PublicationDiagnostic> *diagnostics = nullptr);
 
   std::uint64_t revision() const noexcept;
   std::size_t componentCount() const noexcept;

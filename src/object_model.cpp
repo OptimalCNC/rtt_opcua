@@ -3,6 +3,7 @@
 #include "component_state.hpp"
 #include "operation_dispatcher.hpp"
 #include "port_bridge.hpp"
+#include "publication_selector.hpp"
 
 #include <rtt/opcua/endpoint_type_registry.hpp>
 #include <rtt/opcua/node_id.hpp>
@@ -57,9 +58,16 @@ constexpr std::array<std::pair<std::string_view, std::string_view>, 5U>
         {"services", "Services"},
     }};
 
-constexpr std::array<std::string_view, 8U> kMandatoryOperationNames{{
-    "getTaskState", "getTargetState", "isConfigured", "isActive",
-    "isRunning",    "inFatalError",   "inException",  "inRunTimeError",
+constexpr std::array<std::pair<std::string_view, std::string_view>, 8U>
+    kMandatoryOperations{{
+        {"getTaskState", "TaskState"},
+        {"getTargetState", "TaskState"},
+        {"isConfigured", "Bool"},
+        {"isActive", "Bool"},
+        {"isRunning", "Bool"},
+        {"inFatalError", "Bool"},
+        {"inException", "Bool"},
+        {"inRunTimeError", "Bool"},
 }};
 
 std::string appendNodeSegment(std::string path, std::string_view segment) {
@@ -483,6 +491,14 @@ struct ResourceRecord {
 struct ComponentInventory {
   std::map<std::string, ResourceRecord, std::less<>> resources;
   std::vector<PublicationDiagnostic> fatal_diagnostics;
+};
+
+enum class PublicationMode { full, selected };
+
+struct PublicationPlan {
+  PublicationMode mode;
+  std::set<std::string, std::less<>> effective_resources;
+  std::vector<PublicationDiagnostic> diagnostics;
 };
 
 std::string appendDiagnosticSegment(std::string_view path,
@@ -1123,17 +1139,97 @@ ComponentInventory discoverComponent(RTT::TaskContext &component) {
   return inventory;
 }
 
-void appendMissingMandatoryDiagnostics(ComponentSnapshot &snapshot,
-                                       const ComponentInventory &inventory) {
-  for (const std::string_view name : kMandatoryOperationNames) {
+void addServiceAncestors(
+    std::string_view owner_path,
+    std::set<std::string, std::less<>> &effective_resources) {
+  std::size_t begin = 0U;
+  while (begin < owner_path.size()) {
+    const std::size_t category_end = owner_path.find('/', begin);
+    if (category_end == std::string_view::npos ||
+        owner_path.substr(begin, category_end - begin) != "services") {
+      return;
+    }
+    const std::size_t name_end = owner_path.find('/', category_end + 1U);
+    const std::size_t ancestor_end =
+        name_end == std::string_view::npos ? owner_path.size() : name_end;
+    effective_resources.emplace(owner_path.substr(0U, ancestor_end));
+    if (name_end == std::string_view::npos) {
+      return;
+    }
+    begin = name_end + 1U;
+  }
+}
+
+PublicationPlan buildPublicationPlan(
+    PublicationMode mode, const ComponentInventory &inventory,
+    const std::string &component, const std::vector<std::string> &selectors) {
+  PublicationPlan plan{mode, {}, inventory.fatal_diagnostics};
+  if (mode == PublicationMode::full) {
+    for (const auto &[path, record] : inventory.resources) {
+      static_cast<void>(record);
+      plan.effective_resources.insert(path);
+    }
+  } else if (selectors.empty()) {
+    plan.diagnostics.push_back(PublicationDiagnostic{
+        PublicationDiagnosticKind::malformed_selector, component, {}, {},
+        "at least one publication selector is required"});
+  } else {
+    std::vector<std::string> resource_paths;
+    resource_paths.reserve(inventory.resources.size());
+    for (const auto &[path, record] : inventory.resources) {
+      static_cast<void>(record);
+      resource_paths.push_back(path);
+    }
+    const SelectorMatch match =
+        matchPublicationSelectors(selectors, resource_paths);
+    plan.effective_resources = match.resource_paths;
+    for (const SelectorIssue &issue : match.issues) {
+      plan.diagnostics.push_back(PublicationDiagnostic{
+          issue.kind == SelectorIssueKind::malformed
+              ? PublicationDiagnosticKind::malformed_selector
+              : PublicationDiagnosticKind::unmatched_selector,
+          component, issue.selector, {}, issue.reason});
+    }
+    for (const std::string &path : match.resource_paths) {
+      const auto record = inventory.resources.find(path);
+      if (record != inventory.resources.end()) {
+        addServiceAncestors(record->second.owner_path,
+                            plan.effective_resources);
+      }
+    }
+  }
+
+  for (const auto &[name, output_type] : kMandatoryOperations) {
+    static_cast<void>(output_type);
     const std::string path = resourcePath({}, ResourceKind::operation, name);
     if (inventory.resources.contains(path)) {
+      plan.effective_resources.insert(path);
       continue;
     }
-    snapshot.diagnostics.push_back(PublicationDiagnostic{
-        PublicationDiagnosticKind::mandatory_resource, snapshot.component, {},
+    plan.diagnostics.push_back(PublicationDiagnostic{
+        PublicationDiagnosticKind::mandatory_resource, component, {},
         path, "mandatory RTT proxy operation is unavailable"});
   }
+  return plan;
+}
+
+std::string_view mandatoryOutputType(const ResourceRecord &record) {
+  if (record.kind != ResourceKind::operation || !record.owner_path.empty()) {
+    return {};
+  }
+  const auto found = std::ranges::find_if(
+      kMandatoryOperations,
+      [&record](const auto &mandatory) { return mandatory.first == record.name; });
+  return found == kMandatoryOperations.end() ? std::string_view{}
+                                             : found->second;
+}
+
+void appendMandatorySchemaFailure(ComponentSnapshot &snapshot,
+                                  const ResourceRecord &record,
+                                  std::string reason) {
+  snapshot.diagnostics.push_back(PublicationDiagnostic{
+      PublicationDiagnosticKind::mandatory_resource, snapshot.component, {},
+      record.path, std::move(reason)});
 }
 
 void appendDiscoveryFailure(ComponentSnapshot &snapshot,
@@ -1174,7 +1270,13 @@ void appendOperationBundle(
     const std::string &component_path,
     const std::shared_ptr<ComponentState> &state,
     const std::shared_ptr<OperationDispatcher> &dispatcher) {
+  const std::string_view mandatory_type = mandatoryOutputType(record);
   if (!record.discovery_error.empty()) {
+    if (!mandatory_type.empty()) {
+      appendMandatorySchemaFailure(
+          snapshot, record, "mandatory RTT proxy operation is unavailable");
+      return;
+    }
     appendDiscoveryFailure(snapshot, record, state->component_name,
                            record.discovery_error);
     return;
@@ -1182,17 +1284,39 @@ void appendOperationBundle(
   RTT::OperationInterfacePart *operation =
       record.owner ? record.owner->getOperation(record.name) : nullptr;
   if (operation == nullptr) {
+    if (!mandatory_type.empty()) {
+      appendMandatorySchemaFailure(
+          snapshot, record, "mandatory RTT proxy operation is unavailable");
+      return;
+    }
     appendDiscoveryFailure(snapshot, record, state->component_name,
                            "RTT operation became unavailable during mapping");
     return;
   }
   OperationSchema schema = dispatcher->describe(*operation);
   if (!schema.supported) {
+    if (!mandatory_type.empty()) {
+      appendMandatorySchemaFailure(
+          snapshot, record,
+          "mandatory RTT proxy operation has an unsupported schema");
+      return;
+    }
     std::vector<UnsupportedResource> unsupported;
     appendUnsupported(unsupported, state->component_name, record.legacy_path,
                       "operation", std::move(schema.unsupported_type_name),
                       std::move(schema.unsupported_reason));
     appendMappingFailure(snapshot, record, std::move(unsupported.front()));
+    return;
+  }
+  if (!mandatory_type.empty() &&
+      (!schema.inputs.empty() || !schema.input_type_names.empty() ||
+       schema.outputs.size() != 1U || schema.output_type_names.size() != 1U ||
+       schema.output_type_names.front() != mandatory_type ||
+       schema.output_sources != std::vector<std::int32_t>{-1})) {
+    appendMandatorySchemaFailure(
+        snapshot, record,
+        "mandatory RTT proxy operation has an incompatible input/output "
+        "schema");
     return;
   }
 
@@ -1386,15 +1510,14 @@ void appendServiceBundle(ComponentSnapshot &snapshot,
 ComponentSnapshot snapshotComponent(
     const std::shared_ptr<ComponentState> &state, RTT::TaskContext &component,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
-    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
+    PublicationMode mode, const std::vector<std::string> &selectors) {
   const ComponentInventory inventory = discoverComponent(component);
+  const PublicationPlan plan =
+      buildPublicationPlan(mode, inventory, state->component_name, selectors);
   ComponentSnapshot snapshot;
   snapshot.component = state->component_name;
-  snapshot.diagnostics = inventory.fatal_diagnostics;
-  if (!snapshot.diagnostics.empty()) {
-    return snapshot;
-  }
-  appendMissingMandatoryDiagnostics(snapshot, inventory);
+  snapshot.diagnostics = plan.diagnostics;
 
   const std::string components_path = appendNodeSegment("rtt", "components");
   const std::string component_path =
@@ -1403,8 +1526,12 @@ ComponentSnapshot snapshotComponent(
              objectSpec(component_path, components_path, state->component_name,
                         component.provides()->doc()));
 
-  for (const auto &[path, record] : inventory.resources) {
-    static_cast<void>(path);
+  for (const std::string &path : plan.effective_resources) {
+    const auto found = inventory.resources.find(path);
+    if (found == inventory.resources.end()) {
+      continue;
+    }
+    const ResourceRecord &record = found->second;
     switch (record.kind) {
     case ResourceKind::operation:
       appendOperationBundle(snapshot, record, component_path, state, dispatcher);
@@ -1618,9 +1745,31 @@ public:
   bool publishComponent(
       RTT::TaskContext &component, std::string *error,
       std::vector<UnsupportedResource> *unsupported_output) {
+    return publishComponentInternal(component, PublicationMode::full, {}, error,
+                                    unsupported_output, nullptr);
+  }
+
+  bool publishComponentSelected(
+      RTT::TaskContext &component, const std::vector<std::string> &selectors,
+      std::string *error,
+      std::vector<PublicationDiagnostic> *diagnostic_output) {
+    return publishComponentInternal(component, PublicationMode::selected,
+                                    selectors, error, nullptr,
+                                    diagnostic_output);
+  }
+
+private:
+  bool publishComponentInternal(
+      RTT::TaskContext &component, PublicationMode mode,
+      const std::vector<std::string> &selectors, std::string *error,
+      std::vector<UnsupportedResource> *unsupported_output,
+      std::vector<PublicationDiagnostic> *diagnostic_output) {
     std::unique_lock<std::mutex> lock(command_mutex);
     if (unsupported_output != nullptr) {
       unsupported_output->clear();
+    }
+    if (diagnostic_output != nullptr) {
+      diagnostic_output->clear();
     }
 
     const std::string component_name = component.getName();
@@ -1638,6 +1787,9 @@ public:
           PublicationDiagnostic{PublicationDiagnosticKind::publication_conflict,
                                 component_name, {}, {}, reason}};
       publication_diagnostics.insert_or_assign(component_name, diagnostics);
+      if (diagnostic_output != nullptr) {
+        *diagnostic_output = diagnostics;
+      }
       const std::string failure =
           "RTT component name '" + component_name + "' is " + reason;
       last_error = failure;
@@ -1663,8 +1815,8 @@ public:
                         error);
     }
     auto state = std::make_shared<ComponentState>(component);
-    ComponentSnapshot snapshot =
-        snapshotComponent(state, component, dispatcher, type_registry);
+    ComponentSnapshot snapshot = snapshotComponent(
+        state, component, dispatcher, type_registry, mode, selectors);
     if (!snapshot.diagnostics.empty()) {
       failed_publications.insert_or_assign(component_name,
                                            snapshot.unsupported);
@@ -1673,10 +1825,18 @@ public:
       if (unsupported_output != nullptr) {
         *unsupported_output = snapshot.unsupported;
       }
+      if (diagnostic_output != nullptr) {
+        *diagnostic_output = snapshot.diagnostics;
+      }
       deactivate(state);
       const std::string failure =
-          "strict OPC UA publication rejected component '" + component_name +
-          "'";
+          mode == PublicationMode::full
+              ? "strict OPC UA publication rejected component '" +
+                    component_name + "'"
+              : "selective OPC UA publication rejected component '" +
+                    component_name + "' with " +
+                    std::to_string(snapshot.diagnostics.size()) +
+                    " diagnostic(s)";
       last_error = failure;
       assignError(error, failure);
       const auto diagnostics = snapshot.diagnostics;
@@ -1765,6 +1925,7 @@ public:
     return true;
   }
 
+public:
   std::uint64_t currentRevision() const noexcept { return revision.load(); }
 
   std::size_t componentCount() const noexcept {
@@ -2083,6 +2244,13 @@ bool ObjectModel::publishComponent(
     RTT::TaskContext &component, std::string *error,
     std::vector<UnsupportedResource> *unsupported) {
   return impl_->publishComponent(component, error, unsupported);
+}
+
+bool ObjectModel::publishComponentSelected(
+    RTT::TaskContext &component, const std::vector<std::string> &selectors,
+    std::string *error, std::vector<PublicationDiagnostic> *diagnostics) {
+  return impl_->publishComponentSelected(component, selectors, error,
+                                         diagnostics);
 }
 
 std::uint64_t ObjectModel::revision() const noexcept {

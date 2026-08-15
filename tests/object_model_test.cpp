@@ -49,6 +49,7 @@
 
 BOOST_TEST_DONT_PRINT_LOG_VALUE(RTT::opcua::UnsupportedResource)
 BOOST_TEST_DONT_PRINT_LOG_VALUE(RTT::opcua::PublicationDiagnostic)
+BOOST_TEST_DONT_PRINT_LOG_VALUE(RTT::opcua::PublicationDiagnosticKind)
 BOOST_TEST_DONT_PRINT_LOG_VALUE(::opcua::ValueRank)
 
 namespace {
@@ -360,8 +361,9 @@ void registerUnsupportedValueType() {
 
 class UnsupportedResourceComponent final : public RTT::TaskContext {
 public:
-  UnsupportedResourceComponent()
-      : RTT::TaskContext("unsupported-component"),
+  explicit UnsupportedResourceComponent(
+      const std::string &name = "unsupported-component")
+      : RTT::TaskContext(name),
         unsupported_service(RTT::Service::Create("unsupported")) {
     unsupported_service
         ->addOperation("consume", &UnsupportedResourceComponent::consume, this,
@@ -389,6 +391,51 @@ public:
   std::int32_t supported_property{3};
   RTT::InputPort<UnsupportedValue> input{"UnsupportedInput"};
   RTT::OutputPort<UnsupportedValue> output{"UnsupportedOutput"};
+};
+
+class SelectableResourceComponent final : public RTT::TaskContext {
+public:
+  explicit SelectableResourceComponent(
+      const std::string &name = "selectable-component")
+      : RTT::TaskContext(name),
+        nested_service(RTT::Service::Create("motion/raw*")) {
+    addOperation("echo", &SelectableResourceComponent::echo, this,
+                 RTT::ClientThread)
+        .arg("value", "Value to echo.");
+    addProperty("Gain", gain).doc("Selected gain.");
+    addAttribute("Status", status);
+    addPort(command).doc("Selected command.");
+    nested_service
+        ->addOperation("adjust", &SelectableResourceComponent::adjust, this,
+                       RTT::ClientThread)
+        .arg("value", "Value to adjust.");
+    nested_service->addProperty("NestedGain", nested_gain)
+        .doc("Nested selected gain.");
+    BOOST_REQUIRE(provides()->addService(nested_service));
+  }
+
+  void removeMandatoryOperation(std::string_view name) {
+    provides()->removeOperation(std::string(name));
+  }
+
+  void makeIsConfiguredIncompatible() {
+    provides()->removeOperation("isConfigured");
+    provides()
+        ->addOperation("isConfigured",
+                       &SelectableResourceComponent::incompatibleIsConfigured,
+                       this, RTT::ClientThread)
+        .arg("value", "Unexpected mandatory input.");
+  }
+
+  std::int32_t echo(std::int32_t value) const { return value; }
+  std::int32_t adjust(std::int32_t value) const { return value + nested_gain; }
+  bool incompatibleIsConfigured(std::int32_t value) const { return value != 0; }
+
+  std::int32_t gain{7};
+  std::string status{"idle"};
+  RTT::InputPort<std::int32_t> command{"Command"};
+  RTT::Service::shared_ptr nested_service;
+  std::int32_t nested_gain{3};
 };
 
 class CanonicalArrayComponent final : public RTT::TaskContext {
@@ -513,10 +560,10 @@ public:
 
 class CyclicServiceComponent final : public RTT::TaskContext {
 public:
-  CyclicServiceComponent()
-      : RTT::TaskContext("cyclic-services"),
-        first(RTT::Service::Create("first")),
+  explicit CyclicServiceComponent(const std::string &name = "cyclic-services")
+      : RTT::TaskContext(name), first(RTT::Service::Create("first")),
         second(RTT::Service::Create("second")) {
+    addProperty("SupportedProperty", supported_property);
     BOOST_REQUIRE(provides()->addService(first));
     BOOST_REQUIRE(first->addService(second));
     second->setOwner(nullptr);
@@ -527,11 +574,14 @@ public:
 
   RTT::Service::shared_ptr first;
   RTT::Service::shared_ptr second;
+  std::int32_t supported_property{1};
 };
 
 class DeepServiceComponent final : public RTT::TaskContext {
 public:
-  DeepServiceComponent() : RTT::TaskContext("deep-services") {
+  explicit DeepServiceComponent(const std::string &name = "deep-services")
+      : RTT::TaskContext(name) {
+    addProperty("SupportedProperty", supported_property);
     RTT::Service::shared_ptr parent = provides();
     for (std::size_t index = 0U; index < 33U; ++index) {
       auto child = RTT::Service::Create("level" + std::to_string(index));
@@ -542,6 +592,7 @@ public:
   }
 
   std::vector<RTT::Service::shared_ptr> services;
+  std::int32_t supported_property{1};
 };
 
 class ReportedProviderService final : public RTT::Service {
@@ -1842,6 +1893,593 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
   BOOST_TEST(model.lastError().empty());
 
   client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selected_supported_property_ignores_unsupported_service_resources,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  UnsupportedResourceComponent component;
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(
+          component, {"properties/SupportedProperty"}, &error, &diagnostics),
+      error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto property_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "properties", "SupportedProperty"});
+  BOOST_TEST(::opcua::services::readValue(client, property_id)
+                 .value()
+                 .to<std::int32_t>() == component.supported_property);
+  BOOST_TEST(
+      ::opcua::services::readValue(
+          client, modelNodeId(namespace_index,
+                              {"components", component.getName(), "properties",
+                               "SupportedProperty", "rttType"}))
+          .value()
+          .to<std::string>() == "Int32");
+  requireMissingNode(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "services", "unsupported"}));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selecting_exact_unsupported_service_maps_only_the_empty_service_object,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  UnsupportedResourceComponent component;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            component, {"services/unsupported"}, &error),
+                        error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto service_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "services", "unsupported"});
+  BOOST_TEST(
+      static_cast<bool>(::opcua::services::readNodeClass(client, service_id)));
+  for (const std::string_view category :
+       {"operations", "properties", "attributes", "ports", "services"}) {
+    requireMissingNode(
+        client,
+        modelNodeId(namespace_index, {"components", component.getName(),
+                                      "services", "unsupported", category}));
+  }
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    recursive_unsupported_selection_reports_only_its_nine_resource_failures,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  UnsupportedResourceComponent component;
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(
+      component, {"services/unsupported/**"}, &error, &diagnostics));
+  BOOST_TEST(error == "selective OPC UA publication rejected component '" +
+                          component.getName() + "' with 9 diagnostic(s)");
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 9U);
+  BOOST_TEST(model.unsupportedResources(component.getName()).size() == 9U);
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) == diagnostics,
+             boost::test_tools::per_element());
+  BOOST_TEST(std::ranges::is_sorted(diagnostics));
+  std::vector<std::string> paths;
+  for (const auto &diagnostic : diagnostics) {
+    BOOST_TEST(diagnostic.kind ==
+               RTT::opcua::PublicationDiagnosticKind::unsupported_resource);
+    paths.push_back(diagnostic.resource_path);
+  }
+  const std::vector<std::string> expected_paths{
+      "services/unsupported/attributes/UnsupportedAttribute",
+      "services/unsupported/operations/consume",
+      "services/unsupported/operations/produce",
+      "services/unsupported/ports/UnsupportedInput",
+      "services/unsupported/ports/UnsupportedOutput",
+      "services/unsupported/properties/UnsupportedProperty",
+      "services/unsupported/services/UnsupportedInput/operations/read",
+      "services/unsupported/services/UnsupportedOutput/operations/last",
+      "services/unsupported/services/UnsupportedOutput/operations/write",
+  };
+  BOOST_TEST(paths == expected_paths, boost::test_tools::per_element());
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(component,
+                                                       {"services/unsupported"},
+                                                       &error, &diagnostics),
+                        error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+  BOOST_TEST(model.publicationDiagnostics(component.getName()).empty());
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(component,
+                                                       {"services/unsupported"},
+                                                       &error, &diagnostics),
+                        error);
+  BOOST_TEST(diagnostics.empty());
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+  BOOST_TEST(model.publicationDiagnostics(component.getName()).empty());
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    exact_wildcard_and_canonical_selectors_map_atomic_resource_bundles,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  SelectableResourceComponent component;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            component,
+                            {"operations/echo", "attributes/*",
+                             "services/motion%2Fraw%2A/properties/NestedGain",
+                             "services/*/properties/*"},
+                            &error),
+                        error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto component_id =
+      modelNodeId(namespace_index, {"components", component.getName()});
+  const auto services_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "services"});
+  const auto echo_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "operations", "echo"});
+  BOOST_TEST(
+      static_cast<bool>(::opcua::services::readNodeClass(client, echo_id)));
+  BOOST_TEST(
+      ::opcua::services::readValue(
+          client,
+          modelNodeId(namespace_index, {"components", component.getName(),
+                                        "operations", "echo", "rttInputTypes"}))
+          .value()
+          .to<std::vector<std::string>>() == std::vector<std::string>{"Int32"});
+  BOOST_TEST(::opcua::services::readValue(
+                 client, modelNodeId(namespace_index,
+                                     {"components", component.getName(),
+                                      "operations", "echo", "rttOutputTypes"}))
+                 .value()
+                 .to<std::vector<std::string>>() ==
+             std::vector<std::string>{"Int32"});
+  BOOST_TEST(
+      ::opcua::services::readValue(
+          client, modelNodeId(namespace_index,
+                              {"components", component.getName(), "operations",
+                               "echo", "rttOutputSources"}))
+          .value()
+          .to<std::vector<std::int32_t>>() == std::vector<std::int32_t>{-1});
+
+  const auto status_id =
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "attributes", "Status"});
+  BOOST_TEST(
+      static_cast<bool>(::opcua::services::readNodeClass(client, status_id)));
+  BOOST_TEST(::opcua::services::readValue(
+                 client, modelNodeId(namespace_index,
+                                     {"components", component.getName(),
+                                      "attributes", "Status", "rttType"}))
+                 .value()
+                 .to<std::string>() == "String");
+
+  const auto nested_service_id =
+      modelNodeId(namespace_index, {"components", component.getName(),
+                                    "services", "motion/raw*"});
+  const auto nested_property_id = modelNodeId(
+      namespace_index, {"components", component.getName(), "services",
+                        "motion/raw*", "properties", "NestedGain"});
+  BOOST_TEST(hasHierarchicalReference(client, component_id, services_id,
+                                      ::opcua::BrowseDirection::Forward));
+  BOOST_TEST(hasHierarchicalReference(client, services_id, nested_service_id,
+                                      ::opcua::BrowseDirection::Forward));
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, nested_property_id)));
+  BOOST_TEST(::opcua::services::readValue(
+                 client, modelNodeId(namespace_index,
+                                     {"components", component.getName(),
+                                      "services", "motion/raw*", "properties",
+                                      "NestedGain", "rttType"}))
+                 .value()
+                 .to<std::string>() == "Int32");
+
+  requireMissingNode(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "properties", "Gain"}));
+  requireMissingNode(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "ports", "Command"}));
+  requireMissingNode(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "services", "Command"}));
+  requireMissingNode(client,
+                     modelNodeId(namespace_index,
+                                 {"components", component.getName(), "services",
+                                  "motion/raw*", "operations", "adjust"}));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    terminal_recursive_selector_maps_service_descendants_and_ancestors,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  SelectableResourceComponent component("recursive-selection");
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            component, {"services/motion%2Fraw%2A/**"}, &error),
+                        error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "services", "motion/raw*"}))));
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client, modelNodeId(namespace_index,
+                          {"components", component.getName(), "services",
+                           "motion/raw*", "operations", "adjust"}))));
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client,
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "services", "motion/raw*",
+                   "operations", "adjust", "rttInputTypes"}))));
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client,
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "services", "motion/raw*",
+                   "operations", "adjust", "rttOutputTypes"}))));
+  BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+      client,
+      modelNodeId(namespace_index,
+                  {"components", component.getName(), "services", "motion/raw*",
+                   "operations", "adjust", "rttOutputSources"}))));
+  requireMissingNode(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "properties", "Gain"}));
+  requireMissingNode(
+      client, modelNodeId(namespace_index, {"components", component.getName(),
+                                            "services", "Command"}));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    port_and_same_named_adapter_service_are_selected_independently,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  SelectableResourceComponent port_component("selected-port");
+  SelectableResourceComponent service_component("selected-port-service");
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(port_component, {"ports/Command"}, &error),
+      error);
+  BOOST_REQUIRE_MESSAGE(model.publishComponentSelected(
+                            service_component, {"services/Command/**"}, &error),
+                        error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const auto port_id =
+      modelNodeId(namespace_index,
+                  {"components", port_component.getName(), "ports", "Command"});
+  BOOST_TEST(::opcua::services::readValue(
+                 client, modelNodeId(namespace_index,
+                                     {"components", port_component.getName(),
+                                      "ports", "Command", "type"}))
+                 .value()
+                 .to<std::string>() == "Int32");
+  BOOST_TEST(::opcua::services::readValue(
+                 client, modelNodeId(namespace_index,
+                                     {"components", port_component.getName(),
+                                      "ports", "Command", "description"}))
+                 .value()
+                 .to<std::string>() == "Selected command.");
+  requirePortDirection(
+      client, port_id,
+      modelNodeId(namespace_index, {"components", port_component.getName(),
+                                    "ports", "Command", "direction"}),
+      RTT::opcua::PortDirection::input);
+  requirePortValueSchema(
+      client,
+      modelNodeId(namespace_index, {"components", port_component.getName(),
+                                    "ports", "Command", "value"}),
+      ::opcua::DataTypeId::Int32, ::opcua::ValueRank::Scalar, true, true);
+  requireMissingNode(
+      client,
+      modelNodeId(namespace_index, {"components", port_component.getName(),
+                                    "services", "Command"}));
+
+  const auto adapter_operation = modelNodeId(
+      namespace_index, {"components", service_component.getName(), "services",
+                        "Command", "operations", "read"});
+  BOOST_TEST(static_cast<bool>(
+      ::opcua::services::readNodeClass(client, adapter_operation)));
+  for (const std::string_view metadata :
+       {"rttInputTypes", "rttOutputTypes", "rttOutputSources"}) {
+    BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+        client,
+        modelNodeId(namespace_index,
+                    {"components", service_component.getName(), "services",
+                     "Command", "operations", "read", metadata}))));
+  }
+  requireMissingNode(
+      client,
+      modelNodeId(namespace_index, {"components", service_component.getName(),
+                                    "ports", "Command"}));
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    unrelated_selected_property_isolated_from_cyclic_and_deep_services,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  RTT::opcua::ObjectModel model(server);
+  CyclicServiceComponent selected_cycle("selected-cycle");
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(selected_cycle,
+                                     {"properties/SupportedProperty"}, &error),
+      error);
+  CyclicServiceComponent reached_cycle("reached-cycle");
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(
+      reached_cycle, {"services/first/services/second/services/first"}, &error,
+      &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].resource_path ==
+             "services/first/services/second/services/first");
+
+  DeepServiceComponent selected_depth("selected-depth");
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(selected_depth,
+                                     {"properties/SupportedProperty"}, &error),
+      error);
+  DeepServiceComponent reached_depth("reached-depth");
+  BOOST_TEST(!model.publishComponentSelected(
+      reached_depth, {"services/level0/**"}, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].resource_path.ends_with("services/level32"));
+  BOOST_TEST(model.componentCount() == 2U);
+  BOOST_TEST(model.revision() == 2U);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selector_errors_and_selected_resource_errors_are_sorted_and_atomic,
+    CanonicalTypesFixture) {
+  registerUnsupportedValueType();
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  UnsupportedResourceComponent component("selector-errors");
+  RTT::opcua::ObjectModel model(server);
+  const std::vector<std::string> forward{"services/unsupported/**",
+                                         "properties/Missing", "bad//selector"};
+  const std::vector<std::string> reverse{"bad//selector", "properties/Missing",
+                                         "services/unsupported/**"};
+  std::vector<RTT::opcua::PublicationDiagnostic> first;
+  std::vector<RTT::opcua::PublicationDiagnostic> second;
+  BOOST_TEST(
+      !model.publishComponentSelected(component, forward, &error, &first));
+  BOOST_TEST(error == "selective OPC UA publication rejected component '" +
+                          component.getName() + "' with 11 diagnostic(s)");
+  BOOST_REQUIRE_EQUAL(first.size(), 11U);
+  BOOST_TEST(std::ranges::count_if(first, [](const auto &diagnostic) {
+               return diagnostic.kind ==
+                      RTT::opcua::PublicationDiagnosticKind::malformed_selector;
+             }) == 1U);
+  BOOST_TEST(std::ranges::count_if(first, [](const auto &diagnostic) {
+               return diagnostic.kind ==
+                      RTT::opcua::PublicationDiagnosticKind::unmatched_selector;
+             }) == 1U);
+  BOOST_TEST(
+      std::ranges::count_if(first, [](const auto &diagnostic) {
+        return diagnostic.kind ==
+               RTT::opcua::PublicationDiagnosticKind::unsupported_resource;
+      }) == 9U);
+  BOOST_TEST(
+      !model.publishComponentSelected(component, reverse, &error, &second));
+  BOOST_TEST(first == second, boost::test_tools::per_element());
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+  BOOST_TEST(model.unsupportedResources(component.getName()).size() == 9U);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  requireMissingNode(client, modelNodeId(namespace_index,
+                                         {"components", component.getName()}));
+
+  BOOST_TEST(!model.publishComponentSelected(component, {"bad//selector"},
+                                             &error, &second));
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+  BOOST_REQUIRE_EQUAL(second.size(), 1U);
+  BOOST_TEST(second[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::malformed_selector);
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(empty_selector_array_rejects_without_publishing,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  SelectableResourceComponent component("empty-selectors");
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(
+      !model.publishComponentSelected(component, {}, &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::malformed_selector);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    selected_publication_always_includes_the_proxy_mandatory_baseline,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  const std::uint16_t namespace_index = *server.namespaceIndex();
+
+  SelectableResourceComponent component("mandatory-baseline");
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(
+      model.publishComponentSelected(component, {"properties/Gain"}, &error),
+      error);
+
+  ::opcua::Client client;
+  client.connect(server.endpointUrl());
+  const std::array<std::pair<std::string_view, std::string_view>, 8U> mandatory{
+      {
+          {"getTaskState", "TaskState"},
+          {"getTargetState", "TaskState"},
+          {"isConfigured", "Bool"},
+          {"isActive", "Bool"},
+          {"isRunning", "Bool"},
+          {"inFatalError", "Bool"},
+          {"inException", "Bool"},
+          {"inRunTimeError", "Bool"},
+      }};
+  for (const auto &[name, type] : mandatory) {
+    BOOST_TEST(static_cast<bool>(::opcua::services::readNodeClass(
+        client, modelNodeId(namespace_index, {"components", component.getName(),
+                                              "operations", name}))));
+    requireMissingNode(
+        client,
+        modelNodeId(namespace_index, {"components", component.getName(),
+                                      "operations", name, "rttInputTypes"}));
+    BOOST_TEST(::opcua::services::readValue(
+                   client, modelNodeId(namespace_index,
+                                       {"components", component.getName(),
+                                        "operations", name, "rttOutputTypes"}))
+                   .value()
+                   .to<std::vector<std::string>>() ==
+               std::vector<std::string>{std::string(type)});
+    BOOST_TEST(
+        ::opcua::services::readValue(
+            client, modelNodeId(namespace_index,
+                                {"components", component.getName(),
+                                 "operations", name, "rttOutputSources"}))
+            .value()
+            .to<std::vector<std::int32_t>>() == std::vector<std::int32_t>{-1});
+  }
+  for (const std::string_view lifecycle : {"configure", "start", "stop"}) {
+    requireMissingNode(
+        client, modelNodeId(namespace_index, {"components", component.getName(),
+                                              "operations", lifecycle}));
+  }
+
+  client.disconnect();
+  server.stop();
+}
+
+BOOST_FIXTURE_TEST_CASE(
+    missing_or_incompatible_mandatory_operation_rejects_selected_publication,
+    CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  RTT::opcua::ObjectModel model(server);
+  SelectableResourceComponent missing("selected-missing-mandatory");
+  missing.removeMandatoryOperation("getTaskState");
+  std::vector<RTT::opcua::PublicationDiagnostic> diagnostics;
+  BOOST_TEST(!model.publishComponentSelected(missing, {"properties/Gain"},
+                                             &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::mandatory_resource);
+  BOOST_TEST(diagnostics[0].resource_path == "operations/getTaskState");
+
+  SelectableResourceComponent incompatible("selected-wrong-mandatory");
+  incompatible.makeIsConfiguredIncompatible();
+  BOOST_TEST(!model.publishComponentSelected(incompatible, {"properties/Gain"},
+                                             &error, &diagnostics));
+  BOOST_REQUIRE_EQUAL(diagnostics.size(), 1U);
+  BOOST_TEST(diagnostics[0].kind ==
+             RTT::opcua::PublicationDiagnosticKind::mandatory_resource);
+  BOOST_TEST(diagnostics[0].resource_path == "operations/isConfigured");
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+
   server.stop();
 }
 
