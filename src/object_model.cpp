@@ -57,6 +57,11 @@ constexpr std::array<std::pair<std::string_view, std::string_view>, 5U>
         {"services", "Services"},
     }};
 
+constexpr std::array<std::string_view, 8U> kMandatoryOperationNames{{
+    "getTaskState", "getTargetState", "isConfigured", "isActive",
+    "isRunning",    "inFatalError",   "inException",  "inRunTimeError",
+}};
+
 std::string appendNodeSegment(std::string path, std::string_view segment) {
   path += '/';
   path += escapeNodeIdSegment(segment);
@@ -457,7 +462,27 @@ bool recordMethodArgumentNodes(::opcua::Server &native,
 struct ComponentSnapshot {
   NodeMap nodes;
   std::vector<UnsupportedResource> unsupported;
+  std::vector<PublicationDiagnostic> diagnostics;
+  std::string component;
   std::string fingerprint;
+};
+
+enum class ResourceKind { operation, property, attribute, port, service };
+
+struct ResourceRecord {
+  ResourceKind kind;
+  std::string path;
+  std::string owner_path;
+  std::string legacy_path;
+  std::string name;
+  RTT::Service::shared_ptr owner;
+  RTT::Service::shared_ptr service;
+  std::string discovery_error;
+};
+
+struct ComponentInventory {
+  std::map<std::string, ResourceRecord, std::less<>> resources;
+  std::vector<PublicationDiagnostic> fatal_diagnostics;
 };
 
 std::string appendDiagnosticSegment(std::string_view path,
@@ -500,6 +525,22 @@ void appendUnsupported(std::vector<UnsupportedResource> &unsupported,
       component, std::move(path), std::move(kind),
       type_name.empty() ? "<unknown>" : std::move(type_name),
       reason.empty() ? "is not supported by OPC UA" : std::move(reason)});
+}
+
+void appendMappingFailure(ComponentSnapshot &snapshot,
+                          const ResourceRecord &record,
+                          UnsupportedResource unsupported) {
+  snapshot.diagnostics.push_back(PublicationDiagnostic{
+      PublicationDiagnosticKind::unsupported_resource, unsupported.component,
+      {}, record.path,
+      unsupported.kind + " uses RTT type '" + unsupported.type_name +
+          "' which " + unsupported.reason});
+  snapshot.unsupported.push_back(std::move(unsupported));
+}
+
+std::string resourceNodePath(std::string_view component_path,
+                             std::string_view resource_path) {
+  return std::string(component_path) + '/' + std::string(resource_path);
 }
 
 bool addObjectNode(::opcua::Server &server, std::uint16_t namespace_index,
@@ -921,275 +962,440 @@ void insertNode(NodeMap &nodes, NodeSpec spec) {
   nodes.insert_or_assign(spec.path, std::move(spec));
 }
 
-void appendOperationNodes(
-    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
-    const RTT::Service::shared_ptr &service, const std::string &owner_path,
-    const std::string &diagnostic_path,
-    const std::shared_ptr<ComponentState> &state,
-    const std::shared_ptr<OperationDispatcher> &dispatcher) {
-  const std::string operations_path =
-      appendNodeSegment(owner_path, "operations");
-  for (const std::string &name : service->getOperationNames()) {
-    RTT::OperationInterfacePart *operation = service->getOperation(name);
-    if (operation == nullptr) {
-      continue;
-    }
-    OperationSchema schema = dispatcher->describe(*operation);
-    if (!schema.supported) {
-      appendUnsupported(unsupported, state->component_name,
-                        appendDiagnosticSegment(diagnostic_path, name),
-                        "operation", std::move(schema.unsupported_type_name),
-                        std::move(schema.unsupported_reason));
-      continue;
-    }
-    const std::string operation_path = appendNodeSegment(operations_path, name);
-    if (!schema.input_type_names.empty()) {
-      insertNode(nodes,
-                 staticArrayPropertySpec(
-                     appendNodeSegment(operation_path, "rttInputTypes"),
-                     operation_path, "rttInputTypes",
-                     "Canonical RTT input argument types.",
-                     schema.input_type_names, ::opcua::DataTypeId::String));
-    }
-    if (!schema.output_type_names.empty()) {
-      insertNode(nodes,
-                 staticArrayPropertySpec(
-                     appendNodeSegment(operation_path, "rttOutputTypes"),
-                     operation_path, "rttOutputTypes",
-                     "Canonical RTT output argument types.",
-                     schema.output_type_names, ::opcua::DataTypeId::String));
-      insertNode(
-          nodes,
-          staticArrayPropertySpec(
-              appendNodeSegment(operation_path, "rttOutputSources"),
-              operation_path, "rttOutputSources",
-              "Return value (-1) or mutable input index for each output.",
-              schema.output_sources, ::opcua::DataTypeId::Int32));
-    }
-    insertNode(nodes,
-               operationSpec(operations_path, name, operation->description(),
-                             service, *operation, state, dispatcher,
-                             std::move(schema)));
+std::string resourceCategory(ResourceKind kind) {
+  switch (kind) {
+  case ResourceKind::operation:
+    return "operations";
+  case ResourceKind::property:
+    return "properties";
+  case ResourceKind::attribute:
+    return "attributes";
+  case ResourceKind::port:
+    return "ports";
+  case ResourceKind::service:
+    return "services";
   }
+  return {};
 }
 
-void appendResourceFolders(NodeMap &nodes, const std::string &owner_path,
-                           const std::string &description) {
-  for (const auto &category : kResourceCategories) {
-    insertNode(nodes,
-               objectSpec(appendNodeSegment(owner_path, category.first),
-                          owner_path, std::string(category.second),
-                          description));
+std::string resourceKindName(ResourceKind kind) {
+  switch (kind) {
+  case ResourceKind::operation:
+    return "operation";
+  case ResourceKind::property:
+    return "property";
+  case ResourceKind::attribute:
+    return "attribute";
+  case ResourceKind::port:
+    return "port";
+  case ResourceKind::service:
+    return "service";
   }
+  return "resource";
 }
 
-void pruneEmptyResourceFolders(NodeMap &nodes,
-                               const std::string &owner_path) {
-  for (const auto &category : kResourceCategories) {
-    const std::string category_path =
-        appendNodeSegment(owner_path, category.first);
-    const bool has_direct_child = std::ranges::any_of(
-        nodes, [&category_path](const auto &entry) {
-          return entry.second.parent_path == category_path;
-        });
-    if (!has_direct_child) {
-      nodes.erase(category_path);
-    }
+std::string resourcePath(std::string_view owner_path, ResourceKind kind,
+                         std::string_view name) {
+  std::string path(owner_path);
+  if (!path.empty()) {
+    path += '/';
   }
+  path += resourceCategory(kind);
+  return appendNodeSegment(std::move(path), name);
 }
 
-void appendConfigurationNodes(
-    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
-    const RTT::Service::shared_ptr &service, const std::string &owner_path,
-    const std::string &diagnostic_path,
-    const std::shared_ptr<ComponentState> &state,
-    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
-  const std::string properties_path =
-      appendNodeSegment(owner_path, "properties");
-  for (const std::string &name : service->properties()->getPropertyNames()) {
-    RTT::base::PropertyBase *property = service->getProperty(name);
-    if (property == nullptr) {
-      continue;
-    }
-    const auto source = property->getDataSource();
-    const RTT::types::TypeInfo *type =
-        source == nullptr ? nullptr : source->getTypeInfo();
-    const TypeCodec *codec =
-        source == nullptr ? nullptr : type_registry->codecForDataSource(source);
-    if (codec == nullptr || !codec->hasValue()) {
-      appendUnsupported(unsupported, state->component_name,
-                        appendDiagnosticSegment(diagnostic_path, name),
-                        "property", type, codec);
-      continue;
-    }
-    insertNode(nodes,
-               dataSourceSpec(properties_path, name, property->getDescription(),
-                              source, state, type_registry));
-    const std::string property_path = appendNodeSegment(properties_path, name);
-    insertNode(nodes, staticStringSpec(
-                          appendNodeSegment(property_path, "rttType"),
-                          property_path, "rttType", "Canonical RTT value type.",
-                          source->getTypeInfo()->getTypeName(), true));
-  }
-
-  const std::string attributes_path =
-      appendNodeSegment(owner_path, "attributes");
-  for (const std::string &name : service->getAttributeNames()) {
-    RTT::base::AttributeBase *attribute = service->getValue(name);
-    if (attribute == nullptr) {
-      continue;
-    }
-    const auto source = attribute->getDataSource();
-    const RTT::types::TypeInfo *type =
-        source == nullptr ? nullptr : source->getTypeInfo();
-    const TypeCodec *codec =
-        source == nullptr ? nullptr : type_registry->codecForDataSource(source);
-    if (codec == nullptr || !codec->hasValue()) {
-      appendUnsupported(unsupported, state->component_name,
-                        appendDiagnosticSegment(diagnostic_path, name),
-                        "attribute", type, codec);
-      continue;
-    }
-    insertNode(nodes, dataSourceSpec(attributes_path, name, {}, source, state,
-                                     type_registry));
-    const std::string attribute_path = appendNodeSegment(attributes_path, name);
-    insertNode(nodes,
-               staticStringSpec(appendNodeSegment(attribute_path, "rttType"),
-                                attribute_path, "rttType",
-                                "Canonical RTT value type.",
-                                source->getTypeInfo()->getTypeName(), true));
-  }
-}
-
-void appendPortNodes(
-    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
-    const RTT::Service::shared_ptr &service, const std::string &owner_path,
-    const std::string &diagnostic_path,
-    const std::shared_ptr<ComponentState> &state,
-    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
-  const std::string ports_path = appendNodeSegment(owner_path, "ports");
-  for (const std::string &name : service->getPortNames()) {
-    RTT::base::PortInterface *port = service->getPort(name);
-    if (port == nullptr) {
-      continue;
-    }
-    const RTT::types::TypeInfo *type = port->getTypeInfo();
-    const TypeCodec *codec =
-        type == nullptr ? nullptr : type_registry->codecForTypeInfo(type);
-    const bool is_input =
-        dynamic_cast<RTT::base::InputPortInterface *>(port) != nullptr;
-    const bool is_output =
-        dynamic_cast<RTT::base::OutputPortInterface *>(port) != nullptr;
-    if (is_input == is_output) {
-      appendUnsupported(
-          unsupported, state->component_name,
-          appendDiagnosticSegment(diagnostic_path, name), "port",
-          typeName(type),
-          is_input ? "matches both RTT input and output interfaces"
-                   : "matches neither RTT input nor output interface");
-      continue;
-    }
-    const PortDirection direction =
-        is_input ? PortDirection::input : PortDirection::output;
-    if (codec == nullptr || !codec->hasValue()) {
-      appendUnsupported(unsupported, state->component_name,
-                        appendDiagnosticSegment(diagnostic_path, name),
-                        is_input ? "input port"
-                                 : (is_output ? "output port" : "port"),
-                        type, codec);
-      continue;
-    }
-    const std::string port_path = appendNodeSegment(ports_path, name);
-    insertNode(nodes,
-               objectSpec(port_path, ports_path, name, port->getDescription()));
-    insertNode(nodes,
-               staticStringSpec(appendNodeSegment(port_path, "type"), port_path,
-                                "type", "Canonical RTT port type.",
-                                port->getTypeInfo()->getTypeName()));
-
-    insertNode(nodes, portDirectionSpec(port_path, direction));
-    insertNode(nodes, staticStringSpec(
-                          appendNodeSegment(port_path, "description"),
-                          port_path, "description", "RTT port description.",
-                          port->getDescription()));
-
-    if (is_input) {
-      auto *input = dynamic_cast<RTT::base::InputPortInterface *>(port);
-      insertNode(nodes,
-                 inputPortValueSpec(port_path, *input, state, type_registry));
-    } else if (is_output) {
-      auto *output = dynamic_cast<RTT::base::OutputPortInterface *>(port);
-      if (output != nullptr && output->keepsLastWrittenValue()) {
-        insertNode(nodes, outputPortValueSpec(port_path, *output, state,
-                                              type_registry));
-      }
-    }
-  }
-}
-
-void appendServiceContents(
-    NodeMap &nodes, std::vector<UnsupportedResource> &unsupported,
-    const RTT::Service::shared_ptr &service, const std::string &service_path,
-    const std::string &diagnostic_path,
-    const std::shared_ptr<ComponentState> &state,
-    const std::shared_ptr<OperationDispatcher> &dispatcher,
-    const std::shared_ptr<const EndpointTypeRegistry> &type_registry,
-    std::set<const RTT::Service *> &ancestry, std::size_t depth) {
-  if (!service) {
+void addInventoryRecord(ComponentInventory &inventory,
+                        const std::string &component,
+                        ResourceRecord record) {
+  const std::string path = record.path;
+  if (inventory.resources.emplace(path, std::move(record)).second) {
     return;
   }
+  inventory.fatal_diagnostics.push_back(PublicationDiagnostic{
+      PublicationDiagnosticKind::inventory_failure, component, {}, {},
+      "duplicate canonical resource path '" + path + "'"});
+}
+
+void discoverService(ComponentInventory &inventory,
+                     const std::string &component,
+                     const RTT::Service::shared_ptr &service,
+                     const std::string &owner_path,
+                     const std::string &legacy_path,
+                     std::set<const RTT::Service *> &ancestry,
+                     std::size_t depth) {
   ancestry.insert(service.get());
 
-  appendResourceFolders(nodes, service_path, service->doc());
-  appendConfigurationNodes(nodes, unsupported, service, service_path,
-                           diagnostic_path, state, type_registry);
-  appendOperationNodes(nodes, unsupported, service, service_path,
-                       diagnostic_path, state, dispatcher);
-  appendPortNodes(nodes, unsupported, service, service_path, diagnostic_path,
-                  state, type_registry);
+  for (const std::string &name : service->getOperationNames()) {
+    addInventoryRecord(
+        inventory, component,
+        ResourceRecord{
+            ResourceKind::operation,
+            resourcePath(owner_path, ResourceKind::operation, name), owner_path,
+            appendDiagnosticSegment(legacy_path, name), name, service, {},
+            service->getOperation(name) == nullptr
+                ? "RTT operation is unavailable during inventory discovery"
+                : std::string{}});
+  }
+  for (const std::string &name : service->properties()->getPropertyNames()) {
+    addInventoryRecord(
+        inventory, component,
+        ResourceRecord{
+            ResourceKind::property,
+            resourcePath(owner_path, ResourceKind::property, name), owner_path,
+            appendDiagnosticSegment(legacy_path, name), name, service, {},
+            service->getProperty(name) == nullptr
+                ? "RTT property is unavailable during inventory discovery"
+                : std::string{}});
+  }
+  for (const std::string &name : service->getAttributeNames()) {
+    addInventoryRecord(
+        inventory, component,
+        ResourceRecord{
+            ResourceKind::attribute,
+            resourcePath(owner_path, ResourceKind::attribute, name), owner_path,
+            appendDiagnosticSegment(legacy_path, name), name, service, {},
+            service->getValue(name) == nullptr
+                ? "RTT attribute is unavailable during inventory discovery"
+                : std::string{}});
+  }
+  for (const std::string &name : service->getPortNames()) {
+    addInventoryRecord(
+        inventory, component,
+        ResourceRecord{
+            ResourceKind::port,
+            resourcePath(owner_path, ResourceKind::port, name), owner_path,
+            appendDiagnosticSegment(legacy_path, name), name, service, {},
+            service->getPort(name) == nullptr
+                ? "RTT port is unavailable during inventory discovery"
+                : std::string{}});
+  }
 
-  const std::string services_path = appendNodeSegment(service_path, "services");
   for (const std::string &name : service->getProviderNames()) {
     if (name == "this") {
       continue;
     }
     RTT::Service::shared_ptr child = service->getService(name);
+    const std::string child_path =
+        resourcePath(owner_path, ResourceKind::service, name);
+    const std::string child_legacy_path =
+        appendDiagnosticSegment(legacy_path, name);
+    std::string discovery_error;
     if (!child) {
-      continue;
+      discovery_error =
+          "RTT service is unavailable during inventory discovery";
+    } else if (ancestry.contains(child.get())) {
+      discovery_error = "forms a cycle in the RTT service graph";
+    } else if (depth >= kMaximumServiceDepth) {
+      discovery_error = "exceeds the maximum supported service depth of " +
+                        std::to_string(kMaximumServiceDepth);
     }
-    const std::string child_diagnostic_path =
-        appendDiagnosticSegment(diagnostic_path, name);
-    if (ancestry.contains(child.get())) {
-      appendUnsupported(unsupported, state->component_name,
-                        child_diagnostic_path, "service", "RTT::Service",
-                        "forms a cycle in the RTT service graph");
-      continue;
+    addInventoryRecord(
+        inventory, component,
+        ResourceRecord{ResourceKind::service, child_path, owner_path,
+                       child_legacy_path, name, service, child,
+                       discovery_error});
+    if (child && discovery_error.empty()) {
+      discoverService(inventory, component, child, child_path,
+                      child_legacy_path, ancestry, depth + 1U);
     }
-    if (depth >= kMaximumServiceDepth) {
-      appendUnsupported(
-          unsupported, state->component_name, child_diagnostic_path, "service",
-          "RTT::Service",
-          "exceeds the maximum supported service depth of " +
-              std::to_string(kMaximumServiceDepth));
-      continue;
-    }
-    const std::string child_path = appendNodeSegment(services_path, name);
-    insertNode(nodes,
-               objectSpec(child_path, services_path, name, child->doc()));
-    appendServiceContents(nodes, unsupported, child, child_path,
-                          child_diagnostic_path, state, dispatcher,
-                          type_registry, ancestry, depth + 1U);
   }
 
-  pruneEmptyResourceFolders(nodes, service_path);
   ancestry.erase(service.get());
+}
+
+ComponentInventory discoverComponent(RTT::TaskContext &component) {
+  ComponentInventory inventory;
+  const RTT::Service::shared_ptr root = component.provides();
+  if (!root) {
+    inventory.fatal_diagnostics.push_back(PublicationDiagnostic{
+        PublicationDiagnosticKind::inventory_failure, component.getName(), {},
+        {}, "RTT component root service is unavailable"});
+    return inventory;
+  }
+  std::set<const RTT::Service *> ancestry;
+  discoverService(inventory, component.getName(), root, {}, {}, ancestry, 0U);
+  std::sort(inventory.fatal_diagnostics.begin(),
+            inventory.fatal_diagnostics.end());
+  inventory.fatal_diagnostics.erase(
+      std::unique(inventory.fatal_diagnostics.begin(),
+                  inventory.fatal_diagnostics.end()),
+      inventory.fatal_diagnostics.end());
+  return inventory;
+}
+
+void appendMissingMandatoryDiagnostics(ComponentSnapshot &snapshot,
+                                       const ComponentInventory &inventory) {
+  for (const std::string_view name : kMandatoryOperationNames) {
+    const std::string path = resourcePath({}, ResourceKind::operation, name);
+    if (inventory.resources.contains(path)) {
+      continue;
+    }
+    snapshot.diagnostics.push_back(PublicationDiagnostic{
+        PublicationDiagnosticKind::mandatory_resource, snapshot.component, {},
+        path, "mandatory RTT proxy operation is unavailable"});
+  }
+}
+
+void appendDiscoveryFailure(ComponentSnapshot &snapshot,
+                            const ResourceRecord &record,
+                            const std::string &component,
+                            std::string reason) {
+  appendMappingFailure(
+      snapshot, record,
+      UnsupportedResource{component, record.legacy_path,
+                          resourceKindName(record.kind),
+                          record.kind == ResourceKind::service ? "RTT::Service"
+                                                               : "<unknown>",
+                          std::move(reason)});
+}
+
+void appendCategoryNode(ComponentSnapshot &snapshot,
+                        const ResourceRecord &record,
+                        const std::string &component_path) {
+  const std::string owner_node_path =
+      record.owner_path.empty()
+          ? component_path
+          : resourceNodePath(component_path, record.owner_path);
+  const std::string category = resourceCategory(record.kind);
+  const auto found = std::ranges::find_if(
+      kResourceCategories,
+      [&category](const auto &entry) { return entry.first == category; });
+  insertNode(snapshot.nodes,
+             objectSpec(appendNodeSegment(owner_node_path, category),
+                        owner_node_path,
+                        found == kResourceCategories.end()
+                            ? category
+                            : std::string(found->second),
+                        record.owner ? record.owner->doc() : std::string{}));
+}
+
+void appendOperationBundle(
+    ComponentSnapshot &snapshot, const ResourceRecord &record,
+    const std::string &component_path,
+    const std::shared_ptr<ComponentState> &state,
+    const std::shared_ptr<OperationDispatcher> &dispatcher) {
+  if (!record.discovery_error.empty()) {
+    appendDiscoveryFailure(snapshot, record, state->component_name,
+                           record.discovery_error);
+    return;
+  }
+  RTT::OperationInterfacePart *operation =
+      record.owner ? record.owner->getOperation(record.name) : nullptr;
+  if (operation == nullptr) {
+    appendDiscoveryFailure(snapshot, record, state->component_name,
+                           "RTT operation became unavailable during mapping");
+    return;
+  }
+  OperationSchema schema = dispatcher->describe(*operation);
+  if (!schema.supported) {
+    std::vector<UnsupportedResource> unsupported;
+    appendUnsupported(unsupported, state->component_name, record.legacy_path,
+                      "operation", std::move(schema.unsupported_type_name),
+                      std::move(schema.unsupported_reason));
+    appendMappingFailure(snapshot, record, std::move(unsupported.front()));
+    return;
+  }
+
+  appendCategoryNode(snapshot, record, component_path);
+  const std::string operations_path = resourceNodePath(
+      component_path,
+      record.owner_path.empty() ? "operations"
+                                : record.owner_path + "/operations");
+  const std::string operation_path =
+      resourceNodePath(component_path, record.path);
+  if (!schema.input_type_names.empty()) {
+    insertNode(snapshot.nodes,
+               staticArrayPropertySpec(
+                   appendNodeSegment(operation_path, "rttInputTypes"),
+                   operation_path, "rttInputTypes",
+                   "Canonical RTT input argument types.", schema.input_type_names,
+                   ::opcua::DataTypeId::String));
+  }
+  if (!schema.output_type_names.empty()) {
+    insertNode(snapshot.nodes,
+               staticArrayPropertySpec(
+                   appendNodeSegment(operation_path, "rttOutputTypes"),
+                   operation_path, "rttOutputTypes",
+                   "Canonical RTT output argument types.",
+                   schema.output_type_names, ::opcua::DataTypeId::String));
+    insertNode(snapshot.nodes,
+               staticArrayPropertySpec(
+                   appendNodeSegment(operation_path, "rttOutputSources"),
+                   operation_path, "rttOutputSources",
+                   "Return value (-1) or mutable input index for each output.",
+                   schema.output_sources, ::opcua::DataTypeId::Int32));
+  }
+  insertNode(snapshot.nodes,
+             operationSpec(operations_path, record.name,
+                           operation->description(), record.owner, *operation,
+                           state, dispatcher, std::move(schema)));
+}
+
+void appendConfigurationBundle(
+    ComponentSnapshot &snapshot, const ResourceRecord &record,
+    const std::string &component_path,
+    const std::shared_ptr<ComponentState> &state,
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
+  if (!record.discovery_error.empty()) {
+    appendDiscoveryFailure(snapshot, record, state->component_name,
+                           record.discovery_error);
+    return;
+  }
+  RTT::base::PropertyBase *property = nullptr;
+  RTT::base::AttributeBase *attribute = nullptr;
+  RTT::base::DataSourceBase::shared_ptr source;
+  std::string description;
+  if (record.kind == ResourceKind::property) {
+    property = record.owner ? record.owner->getProperty(record.name) : nullptr;
+    if (property != nullptr) {
+      source = property->getDataSource();
+      description = property->getDescription();
+    }
+  } else {
+    attribute = record.owner ? record.owner->getValue(record.name) : nullptr;
+    if (attribute != nullptr) {
+      source = attribute->getDataSource();
+    }
+  }
+  if ((record.kind == ResourceKind::property && property == nullptr) ||
+      (record.kind == ResourceKind::attribute && attribute == nullptr)) {
+    appendDiscoveryFailure(snapshot, record, state->component_name,
+                           "RTT " + resourceKindName(record.kind) +
+                               " became unavailable during mapping");
+    return;
+  }
+  const RTT::types::TypeInfo *type =
+      source == nullptr ? nullptr : source->getTypeInfo();
+  const TypeCodec *codec =
+      source == nullptr ? nullptr : type_registry->codecForDataSource(source);
+  if (codec == nullptr || !codec->hasValue()) {
+    std::vector<UnsupportedResource> unsupported;
+    appendUnsupported(unsupported, state->component_name, record.legacy_path,
+                      resourceKindName(record.kind), type, codec);
+    appendMappingFailure(snapshot, record, std::move(unsupported.front()));
+    return;
+  }
+
+  appendCategoryNode(snapshot, record, component_path);
+  const std::string category_path = resourceNodePath(
+      component_path,
+      record.owner_path.empty()
+          ? resourceCategory(record.kind)
+          : record.owner_path + "/" + resourceCategory(record.kind));
+  insertNode(snapshot.nodes, dataSourceSpec(category_path, record.name,
+                                            description, source, state,
+                                            type_registry));
+  const std::string value_path = resourceNodePath(component_path, record.path);
+  insertNode(snapshot.nodes,
+             staticStringSpec(appendNodeSegment(value_path, "rttType"),
+                              value_path, "rttType",
+                              "Canonical RTT value type.",
+                              source->getTypeInfo()->getTypeName(), true));
+}
+
+void appendPortBundle(
+    ComponentSnapshot &snapshot, const ResourceRecord &record,
+    const std::string &component_path,
+    const std::shared_ptr<ComponentState> &state,
+    const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
+  if (!record.discovery_error.empty()) {
+    appendDiscoveryFailure(snapshot, record, state->component_name,
+                           record.discovery_error);
+    return;
+  }
+  RTT::base::PortInterface *port =
+      record.owner ? record.owner->getPort(record.name) : nullptr;
+  if (port == nullptr) {
+    appendDiscoveryFailure(snapshot, record, state->component_name,
+                           "RTT port became unavailable during mapping");
+    return;
+  }
+  const RTT::types::TypeInfo *type = port->getTypeInfo();
+  const TypeCodec *codec =
+      type == nullptr ? nullptr : type_registry->codecForTypeInfo(type);
+  auto *input = dynamic_cast<RTT::base::InputPortInterface *>(port);
+  auto *output = dynamic_cast<RTT::base::OutputPortInterface *>(port);
+  const bool is_input = input != nullptr;
+  const bool is_output = output != nullptr;
+  if (is_input == is_output) {
+    appendMappingFailure(
+        snapshot, record,
+        UnsupportedResource{
+            state->component_name, record.legacy_path, "port", typeName(type),
+            is_input ? "matches both RTT input and output interfaces"
+                     : "matches neither RTT input nor output interface"});
+    return;
+  }
+  if (codec == nullptr || !codec->hasValue()) {
+    std::vector<UnsupportedResource> unsupported;
+    appendUnsupported(unsupported, state->component_name, record.legacy_path,
+                      is_input ? "input port" : "output port", type, codec);
+    appendMappingFailure(snapshot, record, std::move(unsupported.front()));
+    return;
+  }
+
+  appendCategoryNode(snapshot, record, component_path);
+  const std::string ports_path = resourceNodePath(
+      component_path,
+      record.owner_path.empty() ? "ports" : record.owner_path + "/ports");
+  const std::string port_path = resourceNodePath(component_path, record.path);
+  insertNode(snapshot.nodes,
+             objectSpec(port_path, ports_path, record.name,
+                        port->getDescription()));
+  insertNode(snapshot.nodes,
+             staticStringSpec(appendNodeSegment(port_path, "type"), port_path,
+                              "type", "Canonical RTT port type.",
+                              port->getTypeInfo()->getTypeName()));
+  insertNode(snapshot.nodes,
+             portDirectionSpec(port_path, is_input ? PortDirection::input
+                                                   : PortDirection::output));
+  insertNode(snapshot.nodes,
+             staticStringSpec(appendNodeSegment(port_path, "description"),
+                              port_path, "description", "RTT port description.",
+                              port->getDescription()));
+  if (input != nullptr) {
+    insertNode(snapshot.nodes,
+               inputPortValueSpec(port_path, *input, state, type_registry));
+  } else if (output->keepsLastWrittenValue()) {
+    insertNode(snapshot.nodes,
+               outputPortValueSpec(port_path, *output, state, type_registry));
+  }
+}
+
+void appendServiceBundle(ComponentSnapshot &snapshot,
+                         const ResourceRecord &record,
+                         const std::string &component_path) {
+  if (!record.discovery_error.empty() || !record.owner || !record.service) {
+    appendDiscoveryFailure(
+        snapshot, record, snapshot.component,
+        !record.discovery_error.empty()
+            ? record.discovery_error
+            : "RTT service became unavailable during mapping");
+    return;
+  }
+  appendCategoryNode(snapshot, record, component_path);
+  const std::string services_path = resourceNodePath(
+      component_path,
+      record.owner_path.empty() ? "services"
+                                : record.owner_path + "/services");
+  insertNode(snapshot.nodes,
+             objectSpec(resourceNodePath(component_path, record.path),
+                        services_path, record.name, record.service->doc()));
 }
 
 ComponentSnapshot snapshotComponent(
     const std::shared_ptr<ComponentState> &state, RTT::TaskContext &component,
     const std::shared_ptr<OperationDispatcher> &dispatcher,
     const std::shared_ptr<const EndpointTypeRegistry> &type_registry) {
+  const ComponentInventory inventory = discoverComponent(component);
   ComponentSnapshot snapshot;
+  snapshot.component = state->component_name;
+  snapshot.diagnostics = inventory.fatal_diagnostics;
+  if (!snapshot.diagnostics.empty()) {
+    return snapshot;
+  }
+  appendMissingMandatoryDiagnostics(snapshot, inventory);
+
   const std::string components_path = appendNodeSegment("rtt", "components");
   const std::string component_path =
       appendNodeSegment(components_path, state->component_name);
@@ -1197,14 +1403,33 @@ ComponentSnapshot snapshotComponent(
              objectSpec(component_path, components_path, state->component_name,
                         component.provides()->doc()));
 
-  std::set<const RTT::Service *> ancestry;
-  appendServiceContents(snapshot.nodes, snapshot.unsupported,
-                        component.provides(), component_path, {}, state,
-                        dispatcher, type_registry, ancestry, 0U);
+  for (const auto &[path, record] : inventory.resources) {
+    static_cast<void>(path);
+    switch (record.kind) {
+    case ResourceKind::operation:
+      appendOperationBundle(snapshot, record, component_path, state, dispatcher);
+      break;
+    case ResourceKind::property:
+    case ResourceKind::attribute:
+      appendConfigurationBundle(snapshot, record, component_path, state,
+                                type_registry);
+      break;
+    case ResourceKind::port:
+      appendPortBundle(snapshot, record, component_path, state, type_registry);
+      break;
+    case ResourceKind::service:
+      appendServiceBundle(snapshot, record, component_path);
+      break;
+    }
+  }
   std::sort(snapshot.unsupported.begin(), snapshot.unsupported.end());
   snapshot.unsupported.erase(
       std::unique(snapshot.unsupported.begin(), snapshot.unsupported.end()),
       snapshot.unsupported.end());
+  std::sort(snapshot.diagnostics.begin(), snapshot.diagnostics.end());
+  snapshot.diagnostics.erase(
+      std::unique(snapshot.diagnostics.begin(), snapshot.diagnostics.end()),
+      snapshot.diagnostics.end());
   std::ostringstream fingerprint;
   for (const auto &[path, spec] : snapshot.nodes) {
     fingerprint << path.size() << ':' << path << spec.fingerprint.size() << ':'
@@ -1403,13 +1628,23 @@ public:
     if (existing != components.end()) {
       if (existing->second.component == &component) {
         failed_publications.erase(component_name);
+        publication_diagnostics.erase(component_name);
         setSuccess(error);
         return true;
       }
-      return setFailure(
-          "RTT component name '" + component_name +
-              "' is already published by a different RTT component instance",
-          error);
+      const std::string reason =
+          "already published by a different RTT component instance";
+      std::vector<PublicationDiagnostic> diagnostics{
+          PublicationDiagnostic{PublicationDiagnosticKind::publication_conflict,
+                                component_name, {}, {}, reason}};
+      publication_diagnostics.insert_or_assign(component_name, diagnostics);
+      const std::string failure =
+          "RTT component name '" + component_name + "' is " + reason;
+      last_error = failure;
+      assignError(error, failure);
+      lock.unlock();
+      emitDiagnostics(diagnostics);
+      return false;
     }
 
     if (shutdown_started.load()) {
@@ -1430,9 +1665,11 @@ public:
     auto state = std::make_shared<ComponentState>(component);
     ComponentSnapshot snapshot =
         snapshotComponent(state, component, dispatcher, type_registry);
-    if (!snapshot.unsupported.empty()) {
+    if (!snapshot.diagnostics.empty()) {
       failed_publications.insert_or_assign(component_name,
                                            snapshot.unsupported);
+      publication_diagnostics.insert_or_assign(component_name,
+                                               snapshot.diagnostics);
       if (unsupported_output != nullptr) {
         *unsupported_output = snapshot.unsupported;
       }
@@ -1442,7 +1679,7 @@ public:
           "'";
       last_error = failure;
       assignError(error, failure);
-      const auto diagnostics = snapshot.unsupported;
+      const auto diagnostics = snapshot.diagnostics;
       lock.unlock();
       emitDiagnostics(diagnostics);
       return false;
@@ -1523,6 +1760,7 @@ public:
     }
 
     failed_publications.erase(component_name);
+    publication_diagnostics.erase(component_name);
     setSuccess(error);
     return true;
   }
@@ -1544,6 +1782,15 @@ public:
     const auto found = failed_publications.find(component_name);
     return found == failed_publications.end()
                ? std::vector<UnsupportedResource>{}
+               : found->second;
+  }
+
+  std::vector<PublicationDiagnostic>
+  publicationDiagnostics(std::string_view component_name) const {
+    std::lock_guard<std::mutex> lock(command_mutex);
+    const auto found = publication_diagnostics.find(component_name);
+    return found == publication_diagnostics.end()
+               ? std::vector<PublicationDiagnostic>{}
                : found->second;
   }
 
@@ -1570,6 +1817,7 @@ public:
     components.clear();
     abandoned.clear();
     failed_publications.clear();
+    publication_diagnostics.clear();
   }
 
 private:
@@ -1585,9 +1833,9 @@ private:
   }
 
   void emitDiagnostics(
-      const std::vector<UnsupportedResource> &diagnostics) const noexcept {
-    for (const UnsupportedResource &resource : diagnostics) {
-      const std::string message = resource.message();
+      const std::vector<PublicationDiagnostic> &diagnostics) const noexcept {
+    for (const PublicationDiagnostic &diagnostic : diagnostics) {
+      const std::string message = diagnostic.message();
       if (options.warning_sink) {
         try {
           options.warning_sink(message);
@@ -1779,6 +2027,8 @@ private:
   std::vector<AbandonedResources> abandoned;
   std::map<std::string, std::vector<UnsupportedResource>, std::less<>>
       failed_publications;
+  std::map<std::string, std::vector<PublicationDiagnostic>, std::less<>>
+      publication_diagnostics;
   bool roots_ready{false};
   std::atomic<std::uint64_t> revision{0U};
   std::string last_error;
@@ -1790,6 +2040,37 @@ private:
 std::string UnsupportedResource::message() const {
   return "OPC UA: component '" + component + "' rejected " + kind + " '" +
          path + "' because RTT type '" + type_name + "' " + reason + ".";
+}
+
+std::string PublicationDiagnostic::message() const {
+  std::string stable_reason = reason;
+  while (stable_reason.ends_with('.')) {
+    stable_reason.pop_back();
+  }
+  switch (kind) {
+  case PublicationDiagnosticKind::malformed_selector:
+    return "OPC UA publication: component '" + component +
+           "' rejected selector '" + selector + "': " + stable_reason + ".";
+  case PublicationDiagnosticKind::unmatched_selector:
+    return "OPC UA publication: component '" + component + "' selector '" +
+           selector + "' matched no RTT resource.";
+  case PublicationDiagnosticKind::inventory_failure:
+    return "OPC UA publication: component '" + component +
+           "' inventory failed: " + stable_reason + ".";
+  case PublicationDiagnosticKind::unsupported_resource:
+    return "OPC UA publication: component '" + component +
+           "' rejected resource '" + resource_path + "': " + stable_reason +
+           ".";
+  case PublicationDiagnosticKind::mandatory_resource:
+    return "OPC UA publication: component '" + component +
+           "' requires resource '" + resource_path + "': " + stable_reason +
+           ".";
+  case PublicationDiagnosticKind::publication_conflict:
+    return "OPC UA publication: component '" + component +
+           "' conflicts with its existing publication: " + stable_reason +
+           ".";
+  }
+  return {};
 }
 
 ObjectModel::ObjectModel(Server &server, ObjectModelOptions options)
@@ -1819,6 +2100,11 @@ std::size_t ObjectModel::pendingOperationCount() const noexcept {
 std::vector<UnsupportedResource>
 ObjectModel::unsupportedResources(std::string_view component) const {
   return impl_->unsupportedResources(component);
+}
+
+std::vector<PublicationDiagnostic>
+ObjectModel::publicationDiagnostics(std::string_view component) const {
+  return impl_->publicationDiagnostics(component);
 }
 
 std::string ObjectModel::lastError() const { return impl_->lastError(); }

@@ -33,6 +33,26 @@ struct UnsupportedResource {
   auto operator<=>(const UnsupportedResource &) const = default;
 };
 
+enum class PublicationDiagnosticKind {
+  malformed_selector,
+  unmatched_selector,
+  inventory_failure,
+  unsupported_resource,
+  mandatory_resource,
+  publication_conflict,
+};
+
+struct PublicationDiagnostic {
+  PublicationDiagnosticKind kind;
+  std::string component;
+  std::string selector;
+  std::string resource_path;
+  std::string reason;
+
+  std::string message() const;
+  auto operator<=>(const PublicationDiagnostic &) const = default;
+};
+
 struct ObjectModelOptions {
   std::chrono::milliseconds operation_timeout{std::chrono::seconds(5)};
   std::function<void(const std::string &)> warning_sink;
@@ -57,6 +77,8 @@ public:
   std::size_t pendingOperationCount() const noexcept;
   std::vector<UnsupportedResource>
   unsupportedResources(std::string_view component) const;
+  std::vector<PublicationDiagnostic>
+  publicationDiagnostics(std::string_view component) const;
   std::string lastError() const;
 
 private:

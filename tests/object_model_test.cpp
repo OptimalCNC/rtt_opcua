@@ -47,6 +47,7 @@
 #include <vector>
 
 BOOST_TEST_DONT_PRINT_LOG_VALUE(RTT::opcua::UnsupportedResource)
+BOOST_TEST_DONT_PRINT_LOG_VALUE(RTT::opcua::PublicationDiagnostic)
 BOOST_TEST_DONT_PRINT_LOG_VALUE(::opcua::ValueRank)
 
 namespace {
@@ -1459,6 +1460,36 @@ BOOST_FIXTURE_TEST_CASE(service_depth_overflow_rejects_the_whole_component,
   server.stop();
 }
 
+BOOST_FIXTURE_TEST_CASE(missing_mandatory_operation_rejects_the_whole_component,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  RTT::TaskContext component("missing-mandatory-operation");
+  component.provides()->removeOperation("getTaskState");
+  RTT::opcua::ObjectModel model(server);
+  std::vector<RTT::opcua::UnsupportedResource> unsupported;
+  BOOST_TEST(!model.publishComponent(component, &error, &unsupported));
+  BOOST_TEST(error.starts_with("strict OPC UA publication rejected component"));
+  BOOST_TEST(model.lastError() == error);
+  BOOST_TEST(model.componentCount() == 0U);
+  BOOST_TEST(model.revision() == 0U);
+  BOOST_TEST(unsupported.empty());
+  BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+
+  const std::vector<RTT::opcua::PublicationDiagnostic> expected{
+      {RTT::opcua::PublicationDiagnosticKind::mandatory_resource,
+       component.getName(), {}, "operations/getTaskState",
+       "mandatory RTT proxy operation is unavailable"}};
+  BOOST_TEST(model.publicationDiagnostics(component.getName()) == expected,
+             boost::test_tools::per_element());
+
+  server.stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(publish_component_is_idempotent_for_the_same_instance,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -1555,7 +1586,6 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
   BOOST_TEST(model.unsupportedResources(component.getName()) == diagnostics,
              boost::test_tools::per_element());
   BOOST_TEST(std::ranges::is_sorted(diagnostics));
-  BOOST_TEST(messages.size() == diagnostics.size());
   BOOST_TEST(error.starts_with("strict OPC UA publication rejected component"));
   BOOST_TEST(model.lastError() == error);
 
@@ -1570,6 +1600,60 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
       {"unsupported.consume", "operation"},
       {"unsupported.produce", "operation"},
   };
+  const std::vector<RTT::opcua::PublicationDiagnostic>
+      expected_publication_diagnostics{
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/attributes/UnsupportedAttribute",
+           "attribute uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/operations/consume",
+           "operation uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/operations/produce",
+           "operation uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/ports/UnsupportedInput",
+           "input port uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/ports/UnsupportedOutput",
+           "output port uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/properties/UnsupportedProperty",
+           "property uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/services/UnsupportedInput/operations/read",
+           "operation uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/services/UnsupportedOutput/operations/last",
+           "operation uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+          {RTT::opcua::PublicationDiagnosticKind::unsupported_resource,
+           component.getName(), {},
+           "services/unsupported/services/UnsupportedOutput/operations/write",
+           "operation uses RTT type '/test/UnsupportedValue' which has no "
+           "registered OPC UA protocol"},
+      };
+  const auto publication_diagnostics =
+      model.publicationDiagnostics(component.getName());
+  BOOST_TEST(publication_diagnostics == expected_publication_diagnostics,
+             boost::test_tools::per_element());
+  BOOST_TEST(std::ranges::is_sorted(publication_diagnostics));
+  BOOST_TEST(messages.size() == publication_diagnostics.size());
   for (std::size_t index = 0U; index < diagnostics.size(); ++index) {
     const auto &diagnostic = diagnostics[index];
     BOOST_TEST(diagnostic.component == component.getName());
@@ -1579,7 +1663,7 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
     BOOST_TEST(diagnostic.reason == kMissingProtocolReason);
     BOOST_TEST(diagnostic.message().find(" rejected ") != std::string::npos);
     BOOST_TEST(diagnostic.message().find(" skipped ") == std::string::npos);
-    BOOST_TEST(messages[index] == diagnostic.message());
+    BOOST_TEST(messages[index] == publication_diagnostics[index].message());
   }
 
   ::opcua::Client client;
@@ -1598,6 +1682,7 @@ BOOST_FIXTURE_TEST_CASE(unsupported_resource_rejects_the_whole_component,
   BOOST_TEST(model.componentCount() == 1U);
   BOOST_TEST(model.revision() == 1U);
   BOOST_TEST(model.unsupportedResources(component.getName()).empty());
+  BOOST_TEST(model.publicationDiagnostics(component.getName()).empty());
   BOOST_TEST(model.lastError().empty());
 
   client.disconnect();
