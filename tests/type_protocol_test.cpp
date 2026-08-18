@@ -14,7 +14,9 @@
 #include <rtt/base/TaskCore.hpp>
 #include <rtt/internal/DataSource.hpp>
 #include <rtt/internal/DataSources.hpp>
+#ifdef OS_RT_MALLOC
 #include <rtt/rt_string.hpp>
+#endif
 #include <rtt/typekit/RealTimeTypekit.hpp>
 #include <rtt/types/Types.hpp>
 
@@ -420,6 +422,7 @@ BOOST_AUTO_TEST_CASE(canonical_array_protocols_round_trip_all_surfaces) {
                                   {"one", "two"}, {"three", "four"});
 }
 
+#ifdef OS_RT_MALLOC
 BOOST_AUTO_TEST_CASE(rt_string_protocol_round_trips_all_surfaces) {
   const auto registry = makeRegistry();
   const RTT::opcua::TypeCodec *codec = registry->codecForTypeName("RtString");
@@ -477,6 +480,7 @@ BOOST_AUTO_TEST_CASE(rt_string_protocol_round_trips_all_surfaces) {
               RTT::opcua::PortValueStatus::value);
   BOOST_TEST(port_value.to<std::string>() == "port");
 }
+#endif
 
 BOOST_AUTO_TEST_CASE(conn_policy_protocol_round_trips_every_public_field) {
   RTT::ConnPolicy expected;

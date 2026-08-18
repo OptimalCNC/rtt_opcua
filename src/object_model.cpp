@@ -1736,6 +1736,16 @@ struct PublishedComponent {
 static_assert(std::is_nothrow_move_constructible_v<PublishedComponent>);
 
 struct AbandonedResources {
+  AbandonedResources(std::shared_ptr<ComponentState> closed,
+                     NodeMap abandoned_nodes, std::string fingerprint)
+      : closed_state(std::move(closed)), nodes(std::move(abandoned_nodes)),
+        snapshot_fingerprint(std::move(fingerprint)) {}
+
+  AbandonedResources(AbandonedResources &&) noexcept = default;
+  AbandonedResources &operator=(AbandonedResources &&) = delete;
+  AbandonedResources(const AbandonedResources &) = delete;
+  AbandonedResources &operator=(const AbandonedResources &) = delete;
+
   std::shared_ptr<ComponentState> closed_state;
   NodeMap nodes;
   std::string snapshot_fingerprint;

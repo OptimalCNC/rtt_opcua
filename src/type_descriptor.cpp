@@ -2,6 +2,8 @@
 
 #include <open62541pp/ua/nodeids.hpp>
 
+#include <rtt/rtt-config.h>
+
 #include <algorithm>
 #include <type_traits>
 
@@ -29,7 +31,9 @@ const std::vector<TypeDescriptor>& canonicalTypeDescriptors() {
       {"Float64Array", ::opcua::DataTypeId::Double, true},
       {"Int32Array", ::opcua::DataTypeId::Int32, true},
       {"StringArray", ::opcua::DataTypeId::String, true},
+#ifdef OS_RT_MALLOC
       {"RtString", ::opcua::DataTypeId::String, true},
+#endif
       {"FlowStatus", ::opcua::DataTypeId::Int32, true},
       {"WriteStatus", ::opcua::DataTypeId::Int32, true},
       {"TaskState", ::opcua::DataTypeId::Int32, true},
