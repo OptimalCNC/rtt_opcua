@@ -634,7 +634,10 @@ public:
     if (!port_thread.joinable()) {
       return;
     }
-    port_thread.request_stop();
+    {
+      const std::lock_guard<std::mutex> lock(port_mutex);
+      port_thread.request_stop();
+    }
     port_condition.notify_all();
     port_thread.join();
   }
