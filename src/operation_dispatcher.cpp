@@ -216,8 +216,8 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex);
       draining = true;
+      reaper.request_stop();
     }
-    reaper.request_stop();
     wake.notify_all();
     if (reaper.joinable()) {
       reaper.join();
