@@ -1793,6 +1793,10 @@ private:
       diagnostic_output->clear();
     }
 
+    if (admission_closed->load()) {
+      return setFailure("OPC UA object model is shutting down", error);
+    }
+
     const std::string component_name = component.getName();
     const auto existing = components.find(component_name);
     if (existing != components.end()) {
@@ -1849,9 +1853,6 @@ private:
       return true;
     }
 
-    if (shutdown_started.load()) {
-      return setFailure("OPC UA object model is shutting down", error);
-    }
     if (!server.isRunning()) {
       return setFailure(
           "OPC UA server must be running before components are published",
@@ -1864,7 +1865,7 @@ private:
       return setFailure("object model operation timeout must be positive",
                         error);
     }
-    auto state = std::make_shared<ComponentState>(component);
+    auto state = std::make_shared<ComponentState>(component, admission_closed);
     ComponentSnapshot snapshot = snapshotComponent(
         state, component, dispatcher, type_registry, mode, selectors);
     if (!snapshot.diagnostics.empty()) {
@@ -2011,25 +2012,31 @@ public:
     return last_error;
   }
 
-  void shutdown() noexcept {
-    std::unique_lock<std::mutex> lock(command_mutex);
-    bool expected = false;
-    if (!shutdown_started.compare_exchange_strong(expected, true)) {
-      return;
-    }
+  void beginShutdown() noexcept { admission_closed->store(true); }
 
-    dispatcher->drainPending();
-    for (auto &[name, publication] : components) {
-      static_cast<void>(name);
-      deactivate(publication.state);
-    }
-    for (auto &resources : abandoned) {
-      deactivate(resources.closed_state);
-    }
-    components.clear();
-    abandoned.clear();
-    failed_publications.clear();
-    publication_diagnostics.clear();
+  void shutdown() noexcept {
+    beginShutdown();
+    std::call_once(shutdown_once, [this] {
+      // Pending application operations may query this model while draining.
+      // Detach the inventory under its lock, then wait without holding it.
+      decltype(components) closing_components;
+      decltype(abandoned) closing_abandoned;
+      {
+        std::lock_guard<std::mutex> lock(command_mutex);
+        closing_components.swap(components);
+        closing_abandoned.swap(abandoned);
+        failed_publications.clear();
+        publication_diagnostics.clear();
+      }
+      dispatcher->drainPending();
+      for (auto &[name, publication] : closing_components) {
+        static_cast<void>(name);
+        deactivate(publication.state);
+      }
+      for (auto &resources : closing_abandoned) {
+        deactivate(resources.closed_state);
+      }
+    });
   }
 
 private:
@@ -2266,7 +2273,9 @@ private:
   bool roots_ready{false};
   std::atomic<std::uint64_t> revision{0U};
   std::string last_error;
-  std::atomic_bool shutdown_started{false};
+  const std::shared_ptr<std::atomic_bool> admission_closed{
+      std::make_shared<std::atomic_bool>(false)};
+  std::once_flag shutdown_once;
 };
 
 } // namespace detail
@@ -2312,6 +2321,8 @@ ObjectModel::ObjectModel(Server &server, ObjectModelOptions options)
                                                       std::move(options))) {}
 
 ObjectModel::~ObjectModel() { impl_->shutdown(); }
+
+void ObjectModel::beginShutdown() noexcept { impl_->beginShutdown(); }
 
 bool ObjectModel::publishComponent(
     RTT::TaskContext &component, std::string *error,

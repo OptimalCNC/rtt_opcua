@@ -68,6 +68,10 @@ public:
   ObjectModel(ObjectModel &&) = delete;
   ObjectModel &operator=(ObjectModel &&) = delete;
 
+  // Close callback/publication admission without waiting for existing leases.
+  // Destruction still drains admitted operations before releasing components.
+  void beginShutdown() noexcept;
+
   bool publishComponent(
       RTT::TaskContext &component, std::string *error = nullptr,
       std::vector<UnsupportedResource> *unsupported = nullptr);

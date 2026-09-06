@@ -226,6 +226,59 @@ BOOST_AUTO_TEST_CASE(concurrent_start_calls_share_one_startup) {
   BOOST_TEST(running_after_both_calls);
 }
 
+BOOST_AUTO_TEST_CASE(stop_request_does_not_join_active_callback) {
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::promise<void> release;
+  auto release_future = release.get_future();
+  BOOST_REQUIRE(server.post([&](::opcua::Server &) {
+    entered.set_value();
+    release_future.wait();
+  }));
+  const auto entered_status = entered_future.wait_for(std::chrono::seconds(2));
+  auto request = std::async(std::launch::async, [&] { server.requestStop(); });
+  const auto request_status = request.wait_for(std::chrono::seconds(1));
+  const bool rejected_new_work = !server.post([](::opcua::Server &) {});
+  auto finish = std::async(std::launch::async, [&] { server.stop(); });
+  const auto finish_status = finish.wait_for(std::chrono::milliseconds(30));
+  release.set_value();
+  request.get();
+  finish.get();
+
+  BOOST_CHECK(entered_status == std::future_status::ready);
+  BOOST_CHECK(request_status == std::future_status::ready);
+  BOOST_TEST(rejected_new_work);
+  BOOST_CHECK(finish_status == std::future_status::timeout);
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+  server.stop();
+}
+
+BOOST_AUTO_TEST_CASE(stop_request_during_startup_does_not_restore_running) {
+  RTT::opcua::ServerOptions options;
+  options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(options);
+  StartupGate &gate = startupGate();
+  gate.arm();
+  auto start = std::async(std::launch::async, [&] { return server.start(); });
+  const bool entered = gate.waitUntilEntered(std::chrono::seconds(1));
+  auto request = std::async(std::launch::async, [&] { server.requestStop(); });
+  const auto request_status = request.wait_for(std::chrono::seconds(1));
+  gate.release();
+  request.get();
+  const bool started = start.get();
+  server.stop();
+  BOOST_TEST(entered);
+  BOOST_CHECK(request_status == std::future_status::ready);
+  BOOST_TEST(!started);
+  BOOST_REQUIRE(server.start());
+  server.stop();
+}
+
 BOOST_AUTO_TEST_CASE(loopback_server_exposes_namespace_and_serialized_tasks) {
   RTT::opcua::ServerOptions options;
   options.port = unusedLoopbackPort();

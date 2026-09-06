@@ -2,6 +2,7 @@
 
 #include <rtt/TaskContext.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
@@ -12,13 +13,16 @@
 namespace RTT::opcua::detail {
 
 struct ComponentState {
-  explicit ComponentState(RTT::TaskContext &value)
-      : component(&value), component_name(value.getName()) {}
+  ComponentState(RTT::TaskContext &value,
+                 std::shared_ptr<std::atomic_bool> model_closed)
+      : component(&value), component_name(value.getName()),
+        admission_closed(std::move(model_closed)) {}
 
   mutable std::mutex mutex;
   std::condition_variable condition;
   RTT::TaskContext *component;
   const std::string component_name;
+  const std::shared_ptr<std::atomic_bool> admission_closed;
   bool is_active{true};
   std::size_t users{0U};
 };
@@ -31,7 +35,8 @@ public:
       return;
     }
     std::lock_guard<std::mutex> lock(state_->mutex);
-    if (!state_->is_active || state_->component == nullptr) {
+    if (state_->admission_closed->load() || !state_->is_active ||
+        state_->component == nullptr) {
       state_.reset();
       return;
     }
@@ -94,7 +99,8 @@ inline bool isActive(const std::shared_ptr<ComponentState> &state) noexcept {
     return false;
   }
   std::lock_guard<std::mutex> lock(state->mutex);
-  return state->is_active && state->component != nullptr;
+  return !state->admission_closed->load() && state->is_active &&
+         state->component != nullptr;
 }
 
 } // namespace RTT::opcua::detail
