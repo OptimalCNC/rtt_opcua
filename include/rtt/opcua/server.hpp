@@ -37,6 +37,8 @@ public:
   Server &operator=(Server &&) = delete;
 
   bool start(std::string *error = nullptr);
+  // Request shutdown without joining; stop() completes the shutdown.
+  void requestStop() noexcept;
   void stop() noexcept;
 
   ServerState state() const noexcept;

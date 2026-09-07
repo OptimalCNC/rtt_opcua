@@ -3564,6 +3564,16 @@ BOOST_FIXTURE_TEST_CASE(shutdown_after_timeout_waits_for_operation_completion,
   BOOST_TEST(component.invocationCount() == 1U);
   BOOST_TEST(model->pendingOperationCount() == 1U);
 
+  model->beginShutdown();
+  model->beginShutdown();
+  BOOST_TEST(model->pendingOperationCount() == 1U);
+  BOOST_TEST(!model->publishComponent(component, &error));
+  BOOST_TEST(error == "OPC UA object model is shutting down");
+  const auto rejected =
+      ::opcua::services::call(client, operations_id, operation_id, {});
+  BOOST_TEST(rejected.statusCode() == UA_STATUSCODE_BADNOTCONNECTED);
+  BOOST_TEST(component.invocationCount() == 1U);
+
   client.disconnect();
   server.stop();
 

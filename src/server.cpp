@@ -168,8 +168,19 @@ public:
     return running;
   }
 
+  void requestStop() noexcept {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex);
+    stop_requested.store(true);
+    const auto before = current_state.load();
+    if (before == ServerState::running || before == ServerState::starting) {
+      current_state.store(ServerState::stopping);
+    }
+    lifecycle_condition.notify_all();
+  }
+
   void stop() noexcept {
     std::lock_guard<std::mutex> transition_lock(transition_mutex);
+    requestStop();
     std::thread thread_to_join;
     {
       std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -351,7 +362,9 @@ private:
 
       {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
-        current_state.store(ServerState::running);
+        if (!stop_requested.load()) {
+          current_state.store(ServerState::running);
+        }
       }
       lifecycle_condition.notify_all();
 
@@ -474,6 +487,8 @@ Server::Server(ServerOptions options)
 Server::~Server() = default;
 
 bool Server::start(std::string *error) { return impl_->start(error); }
+
+void Server::requestStop() noexcept { impl_->requestStop(); }
 
 void Server::stop() noexcept { impl_->stop(); }
 
