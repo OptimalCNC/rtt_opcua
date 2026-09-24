@@ -1,5 +1,8 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_task_context_proxy
 #include <boost/test/included/unit_test.hpp>
+
+#include <rtt/os/main.h>
 
 #include "custom_datatype_test_support.hpp"
 
@@ -1798,4 +1801,8 @@ BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_input_port_without_a_value_variable,
                         "Variable") != std::string::npos);
 
   server.stop();
+}
+
+int ORO_main(int argc, char **argv) {
+  return boost::unit_test::unit_test_main(&init_unit_test_suite, argc, argv);
 }

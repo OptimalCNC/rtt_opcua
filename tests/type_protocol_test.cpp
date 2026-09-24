@@ -1,5 +1,8 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_type_protocol
 #include <boost/test/included/unit_test.hpp>
+
+#include <rtt/os/main.h>
 
 #include <rtt/opcua/type_descriptor.hpp>
 #include <rtt/opcua/endpoint_type_registry.hpp>
@@ -566,3 +569,7 @@ BOOST_AUTO_TEST_CASE(conn_policy_protocol_round_trips_every_public_field) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+int ORO_main(int argc, char **argv) {
+  return boost::unit_test::unit_test_main(&init_unit_test_suite, argc, argv);
+}
