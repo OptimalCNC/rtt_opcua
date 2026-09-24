@@ -4,6 +4,7 @@
 #include "client_session.hpp"
 #include "remote_operation.hpp"
 #include "remote_port.hpp"
+#include "rtt_thread_context.hpp"
 
 #include <open62541pp/ua/nodeids.hpp>
 
@@ -773,6 +774,7 @@ TaskContextProxy::create(std::string endpoint_url, std::string component_name,
   }
 
   try {
+    detail::initializeRttThreadContext();
     std::unique_ptr<TaskContextProxy> proxy(new TaskContextProxy(
         std::move(endpoint_url), std::move(component_name), options));
     if (!proxy->impl_->session->connect(error) || !proxy->synchronize(error)) {
@@ -788,6 +790,13 @@ TaskContextProxy::create(std::string endpoint_url, std::string component_name,
 
 bool TaskContextProxy::synchronize(std::string *error) {
   const std::lock_guard<std::mutex> synchronize_lock(impl_->synchronize_mutex);
+  try {
+    // Staging ports allocates RTT semaphores on the calling thread.
+    detail::initializeRttThreadContext();
+  } catch (const std::exception &exception) {
+    assignError(error, exception.what());
+    return false;
+  }
   impl_->session->setInterfaceAccessEnabled(false);
   impl_->pausePortPump();
   ScopeExit resume_pump([this] { impl_->resumePortPump(); });
