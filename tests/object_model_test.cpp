@@ -1,5 +1,8 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_object_model
 #include <boost/test/included/unit_test.hpp>
+
+#include <rtt/os/main.h>
 
 #include <rtt/opcua/node_id.hpp>
 #include <rtt/opcua/object_model.hpp>
@@ -3591,4 +3594,8 @@ BOOST_FIXTURE_TEST_CASE(shutdown_after_timeout_waits_for_operation_completion,
   BOOST_TEST(destruction_elapsed < std::chrono::seconds(2));
   BOOST_TEST(component.invocationCount() == 1U);
   BOOST_TEST(component.completionCount() == 1U);
+}
+
+int ORO_main(int argc, char **argv) {
+  return boost::unit_test::unit_test_main(&init_unit_test_suite, argc, argv);
 }

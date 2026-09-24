@@ -1,5 +1,8 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_task_context_proxy
 #include <boost/test/included/unit_test.hpp>
+
+#include <rtt/os/main.h>
 
 #include "custom_datatype_test_support.hpp"
 
@@ -812,6 +815,30 @@ BOOST_FIXTURE_TEST_CASE(proxy_ready_marks_server_loss_stale,
              RTT::opcua::ProxyConnectionState::stale);
 }
 
+BOOST_FIXTURE_TEST_CASE(proxy_can_be_created_on_a_worker_thread,
+                        CanonicalTypesFixture) {
+  RTT::opcua::ServerOptions server_options;
+  server_options.port = unusedLoopbackPort();
+  RTT::opcua::Server server(server_options);
+  std::string error;
+  BOOST_REQUIRE_MESSAGE(server.start(&error), error);
+
+  ProxyTarget target;
+  RTT::opcua::ObjectModel model(server);
+  BOOST_REQUIRE_MESSAGE(model.publishComponent(target, &error), error);
+
+  bool ready = false;
+  std::jthread worker([&] {
+    auto proxy = RTT::opcua::TaskContextProxy::create(
+        server.endpointUrl(), target.getName(), {}, &error);
+    ready = proxy && proxy->synchronize(&error) && proxy->ready() &&
+            proxy->ports()->getPort("Feedback") != nullptr &&
+            proxy->ports()->getPort("Command") != nullptr;
+  });
+  worker.join();
+  BOOST_TEST(ready, error);
+}
+
 BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
                         CanonicalTypesFixture) {
   RTT::opcua::ServerOptions server_options;
@@ -990,8 +1017,11 @@ BOOST_FIXTURE_TEST_CASE(proxy_calls_remote_operations_synchronously_and_async,
   BOOST_REQUIRE(remote_feedback->createConnection(
       feedback_sink, RTT::ConnPolicy::data(RTT::ConnPolicy::LOCK_FREE, false)));
   BOOST_TEST(target.feedback.write(std::int32_t{42}) == RTT::WriteSuccess);
-  BOOST_REQUIRE(waitUntil(
-      [&] { return feedback_sink.read(feedback_value) == RTT::NewData; }));
+  // A new subscription may first deliver the retained value from before 42.
+  BOOST_REQUIRE(waitUntil([&] {
+    return feedback_sink.read(feedback_value) == RTT::NewData &&
+           feedback_value == 42;
+  }));
   BOOST_TEST(feedback_value == 42);
 
   remote_command = dynamic_cast<RTT::base::InputPortInterface *>(
@@ -1798,4 +1828,8 @@ BOOST_FIXTURE_TEST_CASE(proxy_rejects_an_input_port_without_a_value_variable,
                         "Variable") != std::string::npos);
 
   server.stop();
+}
+
+int ORO_main(int argc, char **argv) {
+  return boost::unit_test::unit_test_main(&init_unit_test_suite, argc, argv);
 }

@@ -29,6 +29,9 @@ struct TaskContextProxyOptions {
 
 class TaskContextProxy final : public RTT::TaskContext {
 public:
+  // On Xenomai, create and synchronize initialize an Alchemy context on an
+  // ordinary calling thread at priority zero. Existing RTT contexts are kept.
+  // The process must already have initialized RTT (for example via ORO_main).
   static std::unique_ptr<TaskContextProxy>
   create(std::string endpoint_url, std::string component_name,
          TaskContextProxyOptions options = {}, std::string *error = nullptr);
