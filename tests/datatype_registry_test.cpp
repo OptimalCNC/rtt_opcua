@@ -1,5 +1,8 @@
+#define BOOST_TEST_NO_MAIN
 #define BOOST_TEST_MODULE rtt_opcua_datatype_registry
 #include <boost/test/included/unit_test.hpp>
+
+#include <rtt/os/main.h>
 
 #include <rtt/opcua/datatype_registry.hpp>
 #include <rtt/opcua/endpoint_type_registry.hpp>
@@ -157,4 +160,8 @@ BOOST_AUTO_TEST_CASE(endpoint_binding) {
   BOOST_CHECK(type_nine->typeId() == ::opcua::NodeId(9, "BoundValue"));
   BOOST_CHECK(type_nine->binaryEncodingId() ==
               ::opcua::NodeId(9, "BoundValueBinary"));
+}
+
+int ORO_main(int argc, char **argv) {
+  return boost::unit_test::unit_test_main(&init_unit_test_suite, argc, argv);
 }
